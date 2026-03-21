@@ -1,5 +1,9 @@
 import Foundation
 
+/// A purely in-memory filesystem implementation.
+///
+/// This implementation is useful for tests, previews, and transient workspaces where no host disk
+/// interaction should occur.
 public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     private final class Node {
         enum Kind {
@@ -62,25 +66,30 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
 
     private var root: Node
 
+    /// Creates an empty in-memory filesystem rooted at `/`.
     public init() {
         root = Node(kind: .directory([:]), permissions: 0o755)
     }
 
+    /// See ``WorkspaceFilesystem/configure(rootDirectory:)``.
     public func configure(rootDirectory: URL) throws {
         _ = rootDirectory
         reset()
     }
 
+    /// Clears the filesystem and recreates an empty root directory.
     public func reset() {
         root = Node(kind: .directory([:]), permissions: 0o755)
     }
 
+    /// See ``WorkspaceFilesystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
         let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: false)
         return fileInfo(for: node, path: normalized)
     }
 
+    /// See ``WorkspaceFilesystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: true)
@@ -98,6 +107,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         }
     }
 
+    /// See ``WorkspaceFilesystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
         let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: true)
@@ -109,6 +119,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         return data
     }
 
+    /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         guard !normalized.isRoot else {
@@ -139,6 +150,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         parent.modificationDate = Date()
     }
 
+    /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         if normalized.isRoot {
@@ -176,6 +188,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         }
     }
 
+    /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         if normalized.isRoot {
@@ -196,6 +209,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         parent.modificationDate = Date()
     }
 
+    /// See ``WorkspaceFilesystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         let source = WorkspacePath(normalizing: sourcePath.string)
         let destination = WorkspacePath(normalizing: destinationPath.string)
@@ -242,6 +256,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         destinationParent.modificationDate = Date()
     }
 
+    /// See ``WorkspaceFilesystem/copy(from:to:recursive:)``.
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
@@ -264,6 +279,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         destinationParent.modificationDate = Date()
     }
 
+    /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
         try WorkspacePath.validate(target)
         let normalized = WorkspacePath(normalizing: path.string)
@@ -282,6 +298,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         parent.modificationDate = Date()
     }
 
+    /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         guard !normalized.isRoot else {
@@ -305,6 +322,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         parent.modificationDate = Date()
     }
 
+    /// See ``WorkspaceFilesystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
         let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: false)
@@ -316,6 +334,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         return target
     }
 
+    /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: false)
@@ -323,6 +342,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         node.modificationDate = Date()
     }
 
+    /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         return try resolvePath(
             path: WorkspacePath(normalizing: path.string),
@@ -331,6 +351,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         )
     }
 
+    /// See ``WorkspaceFilesystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
         do {
             let normalized = WorkspacePath(normalizing: path.string)
@@ -341,6 +362,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         }
     }
 
+    /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try PathUtils.validate(pattern)
         let normalizedPattern = PathUtils.normalize(path: pattern, currentDirectory: currentDirectory.string)

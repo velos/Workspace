@@ -1,19 +1,26 @@
 import Foundation
 
+/// A disk-backed filesystem rooted at a concrete directory on the host filesystem.
+///
+/// Paths are resolved relative to the configured root and constrained so callers cannot escape that root
+/// through traversal or symlink resolution.
 public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     private let fileManager: FileManager
     private var rootURL: URL?
     private var resolvedRootPath: String?
 
+    /// Creates an unconfigured disk-backed filesystem.
     public init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
     }
 
+    /// Creates and configures a disk-backed filesystem rooted at `rootDirectory`.
     public convenience init(rootDirectory: URL, fileManager: FileManager = .default) throws {
         self.init(fileManager: fileManager)
         try configure(rootDirectory: rootDirectory)
     }
 
+    /// See ``WorkspaceFilesystem/configure(rootDirectory:)``.
     public func configure(rootDirectory: URL) throws {
         let standardized = rootDirectory.standardizedFileURL
         try fileManager.createDirectory(at: standardized, withIntermediateDirectories: true)
@@ -22,6 +29,7 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         resolvedRootPath = resolved.path
     }
 
+    /// See ``WorkspaceFilesystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
@@ -44,6 +52,7 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         )
     }
 
+    /// See ``WorkspaceFilesystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
@@ -63,12 +72,14 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         return entries
     }
 
+    /// See ``WorkspaceFilesystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         return try Data(contentsOf: url)
     }
 
+    /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try creationURL(for: normalized)
@@ -86,12 +97,14 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         }
     }
 
+    /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try creationURL(for: normalized)
         try fileManager.createDirectory(at: url, withIntermediateDirectories: recursive)
     }
 
+    /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
@@ -110,6 +123,7 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try fileManager.removeItem(at: url)
     }
 
+    /// See ``WorkspaceFilesystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         let sourcePath = WorkspacePath(normalizing: sourcePath.string)
         let destinationPath = WorkspacePath(normalizing: destinationPath.string)
@@ -120,6 +134,7 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try fileManager.moveItem(at: source, to: destination)
     }
 
+    /// See ``WorkspaceFilesystem/copy(from:to:recursive:)``.
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
@@ -145,6 +160,7 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         }
     }
 
+    /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
         try WorkspacePath.validate(target)
         let normalized = WorkspacePath(normalizing: path.string)
@@ -154,6 +170,7 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try fileManager.createSymbolicLink(atPath: url.path, withDestinationPath: target)
     }
 
+    /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         let normalizedLink = WorkspacePath(normalizing: path.string)
         let normalizedTarget = WorkspacePath(normalizing: target.string)
@@ -165,18 +182,21 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try fileManager.linkItem(at: targetURL, to: linkURL)
     }
 
+    /// See ``WorkspaceFilesystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         return try fileManager.destinationOfSymbolicLink(atPath: url.path)
     }
 
+    /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
     }
 
+    /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
@@ -185,6 +205,7 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         return virtualPath(from: resolved)
     }
 
+    /// See ``WorkspaceFilesystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
         do {
             let normalized = WorkspacePath(normalizing: path.string)
@@ -195,6 +216,7 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         }
     }
 
+    /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try PathUtils.validate(pattern)
         let normalizedPattern = PathUtils.normalize(path: pattern, currentDirectory: currentDirectory.string)
