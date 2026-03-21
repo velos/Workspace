@@ -7,7 +7,7 @@ public enum WorkspaceTreeNodeKind: String, Sendable, Codable {
 }
 
 public struct WorkspaceTreeNode: Sendable {
-    public var path: String
+    public var path: WorkspacePath
     public var kind: WorkspaceTreeNodeKind
     public var size: UInt64
     public var permissions: Int
@@ -15,7 +15,7 @@ public struct WorkspaceTreeNode: Sendable {
     public var children: [WorkspaceTreeNode]?
 
     public init(
-        path: String,
+        path: WorkspacePath,
         kind: WorkspaceTreeNodeKind,
         size: UInt64,
         permissions: Int,
@@ -29,24 +29,46 @@ public struct WorkspaceTreeNode: Sendable {
         self.modificationDate = modificationDate
         self.children = children
     }
+
+    public init(
+        path: String,
+        kind: WorkspaceTreeNodeKind,
+        size: UInt64,
+        permissions: Int,
+        modificationDate: Date?,
+        children: [WorkspaceTreeNode]? = nil
+    ) {
+        self.init(
+            path: WorkspacePath(normalizing: path),
+            kind: kind,
+            size: size,
+            permissions: permissions,
+            modificationDate: modificationDate,
+            children: children
+        )
+    }
 }
 
 public struct WorkspaceTreeSummaryEntry: Sendable {
-    public var path: String
+    public var path: WorkspacePath
     public var kind: WorkspaceTreeNodeKind
     public var size: UInt64
     public var permissions: Int
 
-    public init(path: String, kind: WorkspaceTreeNodeKind, size: UInt64, permissions: Int) {
+    public init(path: WorkspacePath, kind: WorkspaceTreeNodeKind, size: UInt64, permissions: Int) {
         self.path = path
         self.kind = kind
         self.size = size
         self.permissions = permissions
     }
+
+    public init(path: String, kind: WorkspaceTreeNodeKind, size: UInt64, permissions: Int) {
+        self.init(path: WorkspacePath(normalizing: path), kind: kind, size: size, permissions: permissions)
+    }
 }
 
 public struct WorkspaceTreeSummary: Sendable {
-    public var path: String
+    public var path: WorkspacePath
     public var fileCount: Int
     public var directoryCount: Int
     public var symlinkCount: Int
@@ -54,7 +76,7 @@ public struct WorkspaceTreeSummary: Sendable {
     public var children: [WorkspaceTreeSummaryEntry]
 
     public init(
-        path: String,
+        path: WorkspacePath,
         fileCount: Int,
         directoryCount: Int,
         symlinkCount: Int,
@@ -68,29 +90,61 @@ public struct WorkspaceTreeSummary: Sendable {
         self.totalBytes = totalBytes
         self.children = children
     }
+
+    public init(
+        path: String,
+        fileCount: Int,
+        directoryCount: Int,
+        symlinkCount: Int,
+        totalBytes: UInt64,
+        children: [WorkspaceTreeSummaryEntry]
+    ) {
+        self.init(
+            path: WorkspacePath(normalizing: path),
+            fileCount: fileCount,
+            directoryCount: directoryCount,
+            symlinkCount: symlinkCount,
+            totalBytes: totalBytes,
+            children: children
+        )
+    }
 }
 
 public struct WorkspaceTextChange: Sendable {
-    public var path: String
+    public var path: WorkspacePath
     public var replacements: Int
     public var originalContent: String
     public var updatedContent: String
 
-    public init(path: String, replacements: Int, originalContent: String, updatedContent: String) {
+    public init(path: WorkspacePath, replacements: Int, originalContent: String, updatedContent: String) {
         self.path = path
         self.replacements = replacements
         self.originalContent = originalContent
         self.updatedContent = updatedContent
     }
+
+    public init(path: String, replacements: Int, originalContent: String, updatedContent: String) {
+        self.init(
+            path: WorkspacePath(normalizing: path),
+            replacements: replacements,
+            originalContent: originalContent,
+            updatedContent: updatedContent
+        )
+    }
 }
 
 public struct WorkspaceReplaceResult: Sendable {
     public var dryRun: Bool
-    public var touchedPaths: [String]
+    public var touchedPaths: [WorkspacePath]
     public var changes: [WorkspaceTextChange]
     public var rolledBack: Bool
 
-    public init(dryRun: Bool, touchedPaths: [String], changes: [WorkspaceTextChange], rolledBack: Bool) {
+    public init(
+        dryRun: Bool,
+        touchedPaths: [WorkspacePath],
+        changes: [WorkspaceTextChange],
+        rolledBack: Bool
+    ) {
         self.dryRun = dryRun
         self.touchedPaths = touchedPaths
         self.changes = changes
@@ -99,23 +153,23 @@ public struct WorkspaceReplaceResult: Sendable {
 }
 
 public enum WorkspaceEdit: Sendable {
-    case writeFile(path: String, content: String)
-    case appendFile(path: String, content: String)
-    case delete(path: String, recursive: Bool = true)
-    case createDirectory(path: String, recursive: Bool = true)
-    case move(from: String, to: String)
-    case copy(from: String, to: String, recursive: Bool = true)
+    case writeFile(path: WorkspacePath, content: String)
+    case appendFile(path: WorkspacePath, content: String)
+    case delete(path: WorkspacePath, recursive: Bool = true)
+    case createDirectory(path: WorkspacePath, recursive: Bool = true)
+    case move(from: WorkspacePath, to: WorkspacePath)
+    case copy(from: WorkspacePath, to: WorkspacePath, recursive: Bool = true)
 }
 
 public struct WorkspaceBatchEditEntry: Sendable {
     public var operation: String
-    public var touchedPaths: [String]
+    public var touchedPaths: [WorkspacePath]
     public var originalContent: String?
     public var updatedContent: String?
 
     public init(
         operation: String,
-        touchedPaths: [String],
+        touchedPaths: [WorkspacePath],
         originalContent: String? = nil,
         updatedContent: String? = nil
     ) {
@@ -128,11 +182,16 @@ public struct WorkspaceBatchEditEntry: Sendable {
 
 public struct WorkspaceBatchEditResult: Sendable {
     public var dryRun: Bool
-    public var touchedPaths: [String]
+    public var touchedPaths: [WorkspacePath]
     public var edits: [WorkspaceBatchEditEntry]
     public var rolledBack: Bool
 
-    public init(dryRun: Bool, touchedPaths: [String], edits: [WorkspaceBatchEditEntry], rolledBack: Bool) {
+    public init(
+        dryRun: Bool,
+        touchedPaths: [WorkspacePath],
+        edits: [WorkspaceBatchEditEntry],
+        rolledBack: Bool
+    ) {
         self.dryRun = dryRun
         self.touchedPaths = touchedPaths
         self.edits = edits
@@ -147,7 +206,7 @@ public actor Workspace {
         self.filesystem = filesystem
     }
 
-    public func readFile(_ path: String) async throws -> String {
+    public func readFile(_ path: WorkspacePath) async throws -> String {
         let data = try await filesystem.readFile(path: normalize(path))
         guard let string = String(data: data, encoding: .utf8) else {
             throw WorkspaceError.unsupported("file is not valid UTF-8: \(normalize(path))")
@@ -155,16 +214,28 @@ public actor Workspace {
         return string
     }
 
-    public func writeFile(_ path: String, content: String) async throws {
+    public func readFile(_ path: String) async throws -> String {
+        try await readFile(WorkspacePath(validating: path))
+    }
+
+    public func writeFile(_ path: WorkspacePath, content: String) async throws {
         try await filesystem.writeFile(path: normalize(path), data: Data(content.utf8), append: false)
     }
 
-    public func appendFile(_ path: String, content: String) async throws {
+    public func writeFile(_ path: String, content: String) async throws {
+        try await writeFile(WorkspacePath(validating: path), content: content)
+    }
+
+    public func appendFile(_ path: WorkspacePath, content: String) async throws {
         try await filesystem.writeFile(path: normalize(path), data: Data(content.utf8), append: true)
     }
 
+    public func appendFile(_ path: String, content: String) async throws {
+        try await appendFile(WorkspacePath(validating: path), content: content)
+    }
+
     public func readJson<T: Decodable>(
-        _ path: String,
+        _ path: WorkspacePath,
         as type: T.Type = T.self
     ) async throws -> T {
         let data = try await filesystem.readFile(path: normalize(path))
@@ -175,8 +246,15 @@ public actor Workspace {
         }
     }
 
-    public func writeJson<T: Encodable>(
+    public func readJson<T: Decodable>(
         _ path: String,
+        as type: T.Type = T.self
+    ) async throws -> T {
+        try await readJson(WorkspacePath(validating: path), as: type)
+    }
+
+    public func writeJson<T: Encodable>(
+        _ path: WorkspacePath,
         value: T,
         prettyPrinted: Bool = true
     ) async throws {
@@ -189,34 +267,71 @@ public actor Workspace {
         try await filesystem.writeFile(path: normalize(path), data: data, append: false)
     }
 
-    public func exists(_ path: String) async -> Bool {
+    public func writeJson<T: Encodable>(
+        _ path: String,
+        value: T,
+        prettyPrinted: Bool = true
+    ) async throws {
+        try await writeJson(WorkspacePath(validating: path), value: value, prettyPrinted: prettyPrinted)
+    }
+
+    public func exists(_ path: WorkspacePath) async -> Bool {
         await filesystem.exists(path: normalize(path))
     }
 
-    public func stat(_ path: String) async throws -> FileInfo {
+    public func exists(_ path: String) async -> Bool {
+        guard let path = WorkspacePath(path) else {
+            return false
+        }
+        return await exists(path)
+    }
+
+    public func stat(_ path: WorkspacePath) async throws -> FileInfo {
         try await filesystem.stat(path: normalize(path))
     }
 
-    public func readdir(_ path: String) async throws -> [DirectoryEntry] {
+    public func stat(_ path: String) async throws -> FileInfo {
+        try await stat(WorkspacePath(validating: path))
+    }
+
+    public func readdir(_ path: WorkspacePath) async throws -> [DirectoryEntry] {
         try await filesystem.listDirectory(path: normalize(path))
     }
 
-    public func glob(_ pattern: String, currentDirectory: String = "/") async throws -> [String] {
+    public func readdir(_ path: String) async throws -> [DirectoryEntry] {
+        try await readdir(WorkspacePath(validating: path))
+    }
+
+    public func glob(_ pattern: String, currentDirectory: WorkspacePath = .root) async throws -> [WorkspacePath] {
         try await filesystem.glob(
             pattern: pattern,
             currentDirectory: normalize(currentDirectory)
         )
     }
 
-    public func mkdir(_ path: String, recursive: Bool = true) async throws {
+    public func glob(_ pattern: String, currentDirectory: String) async throws -> [WorkspacePath] {
+        try await glob(pattern, currentDirectory: WorkspacePath(validating: currentDirectory))
+    }
+
+    public func mkdir(_ path: WorkspacePath, recursive: Bool = true) async throws {
         try await filesystem.createDirectory(path: normalize(path), recursive: recursive)
     }
 
-    public func rm(_ path: String, recursive: Bool = true) async throws {
+    public func mkdir(_ path: String, recursive: Bool = true) async throws {
+        try await mkdir(WorkspacePath(validating: path), recursive: recursive)
+    }
+
+    public func rm(_ path: WorkspacePath, recursive: Bool = true) async throws {
         try await filesystem.remove(path: normalize(path), recursive: recursive)
     }
 
-    public func cp(_ sourcePath: String, _ destinationPath: String, recursive: Bool = true) async throws {
+    public func rm(_ path: String, recursive: Bool = true) async throws {
+        try await rm(WorkspacePath(validating: path), recursive: recursive)
+    }
+
+    public func cp(_ sourcePath: WorkspacePath, _ destinationPath: WorkspacePath, recursive: Bool = true)
+        async throws
+    {
         try await filesystem.copy(
             from: normalize(sourcePath),
             to: normalize(destinationPath),
@@ -224,19 +339,39 @@ public actor Workspace {
         )
     }
 
-    public func mv(_ sourcePath: String, _ destinationPath: String) async throws {
+    public func cp(_ sourcePath: String, _ destinationPath: String, recursive: Bool = true) async throws {
+        try await cp(
+            WorkspacePath(validating: sourcePath),
+            WorkspacePath(validating: destinationPath),
+            recursive: recursive
+        )
+    }
+
+    public func mv(_ sourcePath: WorkspacePath, _ destinationPath: WorkspacePath) async throws {
         try await filesystem.move(
             from: normalize(sourcePath),
             to: normalize(destinationPath)
         )
     }
 
-    public func walkTree(_ path: String, maxDepth: Int? = nil) async throws -> WorkspaceTreeNode {
+    public func mv(_ sourcePath: String, _ destinationPath: String) async throws {
+        try await mv(WorkspacePath(validating: sourcePath), WorkspacePath(validating: destinationPath))
+    }
+
+    public func walkTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> WorkspaceTreeNode {
         try await buildTree(path: normalize(path), depth: 0, maxDepth: maxDepth)
     }
 
-    public func summarizeTree(_ path: String, maxDepth: Int? = nil) async throws -> WorkspaceTreeSummary {
+    public func walkTree(_ path: String, maxDepth: Int? = nil) async throws -> WorkspaceTreeNode {
+        try await walkTree(WorkspacePath(validating: path), maxDepth: maxDepth)
+    }
+
+    public func summarizeTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> WorkspaceTreeSummary {
         try await buildSummary(path: normalize(path), depth: 0, maxDepth: maxDepth)
+    }
+
+    public func summarizeTree(_ path: String, maxDepth: Int? = nil) async throws -> WorkspaceTreeSummary {
+        try await summarizeTree(WorkspacePath(validating: path), maxDepth: maxDepth)
     }
 
     public func replaceInFiles(
@@ -352,11 +487,11 @@ public actor Workspace {
         }
     }
 
-    private func normalize(_ path: String) -> String {
-        WorkspacePath.normalize(path: path, currentDirectory: "/")
+    private func normalize(_ path: WorkspacePath) -> WorkspacePath {
+        WorkspacePath(normalizing: path.string)
     }
 
-    private func readUTF8IfPresent(_ path: String) async throws -> String? {
+    private func readUTF8IfPresent(_ path: WorkspacePath) async throws -> String? {
         guard await filesystem.exists(path: path) else {
             return nil
         }
@@ -367,7 +502,7 @@ public actor Workspace {
         return string
     }
 
-    private func buildTree(path: String, depth: Int, maxDepth: Int?) async throws -> WorkspaceTreeNode {
+    private func buildTree(path: WorkspacePath, depth: Int, maxDepth: Int?) async throws -> WorkspaceTreeNode {
         let info = try await filesystem.stat(path: path)
         let kind = treeKind(for: info)
         let children: [WorkspaceTreeNode]?
@@ -378,7 +513,7 @@ public actor Workspace {
                 .sorted { $0.name < $1.name }
                 .asyncMap { [self] entry in
                     try await self.buildTree(
-                        path: WorkspacePath.join(path, entry.name),
+                        path: path.appending(entry.name),
                         depth: depth + 1,
                         maxDepth: maxDepth
                     )
@@ -397,7 +532,7 @@ public actor Workspace {
         )
     }
 
-    private func buildSummary(path: String, depth: Int, maxDepth: Int?) async throws -> WorkspaceTreeSummary {
+    private func buildSummary(path: WorkspacePath, depth: Int, maxDepth: Int?) async throws -> WorkspaceTreeSummary {
         let info = try await filesystem.stat(path: path)
         var fileCount = info.isDirectory ? 0 : 1
         var directoryCount = info.isDirectory ? 1 : 0
@@ -408,7 +543,7 @@ public actor Workspace {
         if info.isDirectory, maxDepth.map({ depth < $0 }) ?? true {
             let entries = try await filesystem.listDirectory(path: path)
             for entry in entries.sorted(by: { $0.name < $1.name }) {
-                let childPath = WorkspacePath.join(path, entry.name)
+                let childPath = path.appending(entry.name)
                 let childSummary = try await buildSummary(path: childPath, depth: depth + 1, maxDepth: maxDepth)
                 fileCount += childSummary.fileCount
                 directoryCount += childSummary.directoryCount
@@ -462,7 +597,7 @@ public actor Workspace {
         }
     }
 
-    private func touchedPaths(for edit: WorkspaceEdit) -> [String] {
+    private func touchedPaths(for edit: WorkspaceEdit) -> [WorkspacePath] {
         switch edit {
         case let .writeFile(path, _):
             return [path]
@@ -479,11 +614,11 @@ public actor Workspace {
         }
     }
 
-    private func canonicalizedTouchedPaths(for edits: [WorkspaceEdit]) -> [String] {
+    private func canonicalizedTouchedPaths(for edits: [WorkspaceEdit]) -> [WorkspacePath] {
         let paths = Set(edits.flatMap(touchedPaths(for:)))
         return paths.sorted().filter { candidate in
             !paths.contains { other in
-                other != candidate && candidate.hasPrefix(other + "/")
+                other != candidate && candidate.string.hasPrefix(other.string + "/")
             }
         }
     }
@@ -542,19 +677,19 @@ public actor Workspace {
     }
 
     private enum SnapshotEntry: Sendable {
-        case missing(path: String)
-        case file(path: String, data: Data, permissions: Int)
-        case directory(path: String, permissions: Int, children: [SnapshotEntry])
-        case symlink(path: String, target: String, permissions: Int)
+        case missing(path: WorkspacePath)
+        case file(path: WorkspacePath, data: Data, permissions: Int)
+        case directory(path: WorkspacePath, permissions: Int, children: [SnapshotEntry])
+        case symlink(path: WorkspacePath, target: String, permissions: Int)
     }
 
-    private func snapshotPaths(_ paths: [String]) async throws -> [SnapshotEntry] {
+    private func snapshotPaths(_ paths: [WorkspacePath]) async throws -> [SnapshotEntry] {
         try await paths.asyncMap { [self] path in
             try await self.snapshot(path: path)
         }
     }
 
-    private func snapshot(path: String) async throws -> SnapshotEntry {
+    private func snapshot(path: WorkspacePath) async throws -> SnapshotEntry {
         guard await filesystem.exists(path: path) else {
             return .missing(path: path)
         }
@@ -565,7 +700,7 @@ public actor Workspace {
             let children = try await entries
                 .sorted { $0.name < $1.name }
                 .asyncMap { [self] entry in
-                    try await self.snapshot(path: WorkspacePath.join(path, entry.name))
+                    try await self.snapshot(path: path.appending(entry.name))
                 }
             return .directory(path: path, permissions: info.permissions, children: children)
         }
@@ -583,7 +718,7 @@ public actor Workspace {
     }
 
     private func rollback(_ snapshots: [SnapshotEntry]) async throws {
-        for snapshot in snapshots.sorted(by: { path(of: $0).count < path(of: $1).count }) {
+        for snapshot in snapshots.sorted(by: { path(of: $0).string.count < path(of: $1).string.count }) {
             try await restore(snapshot)
         }
     }
@@ -618,7 +753,7 @@ public actor Workspace {
         }
     }
 
-    private func path(of snapshot: SnapshotEntry) -> String {
+    private func path(of snapshot: SnapshotEntry) -> WorkspacePath {
         switch snapshot {
         case let .missing(path),
              let .file(path, _, _),

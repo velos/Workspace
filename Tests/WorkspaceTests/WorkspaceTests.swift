@@ -17,10 +17,10 @@ private enum WorkspaceTestSupport {
 
 private final class FailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     private let base: any WorkspaceFilesystem
-    private let failingWritePaths: Set<String>
-    private var failedWritePaths: Set<String> = []
+    private let failingWritePaths: Set<WorkspacePath>
+    private var failedWritePaths: Set<WorkspacePath> = []
 
-    init(base: any WorkspaceFilesystem, failingWritePaths: Set<String>) {
+    init(base: any WorkspaceFilesystem, failingWritePaths: Set<WorkspacePath>) {
         self.base = base
         self.failingWritePaths = failingWritePaths
     }
@@ -29,19 +29,19 @@ private final class FailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try base.configure(rootDirectory: rootDirectory)
     }
 
-    func stat(path: String) async throws -> FileInfo {
+    func stat(path: WorkspacePath) async throws -> FileInfo {
         try await base.stat(path: path)
     }
 
-    func listDirectory(path: String) async throws -> [DirectoryEntry] {
+    func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         try await base.listDirectory(path: path)
     }
 
-    func readFile(path: String) async throws -> Data {
+    func readFile(path: WorkspacePath) async throws -> Data {
         try await base.readFile(path: path)
     }
 
-    func writeFile(path: String, data: Data, append: Bool) async throws {
+    func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         if failingWritePaths.contains(path), !failedWritePaths.contains(path) {
             failedWritePaths.insert(path)
             throw WorkspaceError.unsupported("forced write failure")
@@ -49,47 +49,47 @@ private final class FailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try await base.writeFile(path: path, data: data, append: append)
     }
 
-    func createDirectory(path: String, recursive: Bool) async throws {
+    func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
         try await base.createDirectory(path: path, recursive: recursive)
     }
 
-    func remove(path: String, recursive: Bool) async throws {
+    func remove(path: WorkspacePath, recursive: Bool) async throws {
         try await base.remove(path: path, recursive: recursive)
     }
 
-    func move(from sourcePath: String, to destinationPath: String) async throws {
+    func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         try await base.move(from: sourcePath, to: destinationPath)
     }
 
-    func copy(from sourcePath: String, to destinationPath: String, recursive: Bool) async throws {
+    func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws {
         try await base.copy(from: sourcePath, to: destinationPath, recursive: recursive)
     }
 
-    func createSymlink(path: String, target: String) async throws {
+    func createSymlink(path: WorkspacePath, target: String) async throws {
         try await base.createSymlink(path: path, target: target)
     }
 
-    func createHardLink(path: String, target: String) async throws {
+    func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         try await base.createHardLink(path: path, target: target)
     }
 
-    func readSymlink(path: String) async throws -> String {
+    func readSymlink(path: WorkspacePath) async throws -> String {
         try await base.readSymlink(path: path)
     }
 
-    func setPermissions(path: String, permissions: Int) async throws {
+    func setPermissions(path: WorkspacePath, permissions: Int) async throws {
         try await base.setPermissions(path: path, permissions: permissions)
     }
 
-    func resolveRealPath(path: String) async throws -> String {
+    func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await base.resolveRealPath(path: path)
     }
 
-    func exists(path: String) async -> Bool {
+    func exists(path: WorkspacePath) async -> Bool {
         await base.exists(path: path)
     }
 
-    func glob(pattern: String, currentDirectory: String) async throws -> [String] {
+    func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try await base.glob(pattern: pattern, currentDirectory: currentDirectory)
     }
 }

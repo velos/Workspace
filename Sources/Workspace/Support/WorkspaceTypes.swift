@@ -20,7 +20,7 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
 public typealias ShellError = WorkspaceError
 
 public struct FileInfo: Sendable {
-    public var path: String
+    public var path: WorkspacePath
     public var isDirectory: Bool
     public var isSymbolicLink: Bool
     public var size: UInt64
@@ -28,7 +28,7 @@ public struct FileInfo: Sendable {
     public var modificationDate: Date?
 
     public init(
-        path: String,
+        path: WorkspacePath,
         isDirectory: Bool,
         isSymbolicLink: Bool,
         size: UInt64,
@@ -41,6 +41,24 @@ public struct FileInfo: Sendable {
         self.size = size
         self.permissions = permissions
         self.modificationDate = modificationDate
+    }
+
+    public init(
+        path: String,
+        isDirectory: Bool,
+        isSymbolicLink: Bool,
+        size: UInt64,
+        permissions: Int,
+        modificationDate: Date?
+    ) {
+        self.init(
+            path: WorkspacePath(normalizing: path),
+            isDirectory: isDirectory,
+            isSymbolicLink: isSymbolicLink,
+            size: size,
+            permissions: permissions,
+            modificationDate: modificationDate
+        )
     }
 }
 

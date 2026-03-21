@@ -22,9 +22,8 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         resolvedRootPath = resolved.path
     }
 
-    public func stat(path: String) async throws -> FileInfo {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func stat(path: WorkspacePath) async throws -> FileInfo {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
 
@@ -45,9 +44,8 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         )
     }
 
-    public func listDirectory(path: String) async throws -> [DirectoryEntry] {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -58,23 +56,21 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         var entries: [DirectoryEntry] = []
         entries.reserveCapacity(names.count)
         for name in names {
-            let childPath = PathUtils.join(normalized, name)
+            let childPath = normalized.appending(name)
             let info = try await stat(path: childPath)
             entries.append(DirectoryEntry(name: name, info: info))
         }
         return entries
     }
 
-    public func readFile(path: String) async throws -> Data {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func readFile(path: WorkspacePath) async throws -> Data {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         return try Data(contentsOf: url)
     }
 
-    public func writeFile(path: String, data: Data, append: Bool) async throws {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try creationURL(for: normalized)
 
         let parent = url.deletingLastPathComponent()
@@ -90,16 +86,14 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         }
     }
 
-    public func createDirectory(path: String, recursive: Bool) async throws {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try creationURL(for: normalized)
         try fileManager.createDirectory(at: url, withIntermediateDirectories: recursive)
     }
 
-    public func remove(path: String, recursive: Bool) async throws {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func remove(path: WorkspacePath, recursive: Bool) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
 
         var isDirectory: ObjCBool = false
@@ -116,22 +110,22 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try fileManager.removeItem(at: url)
     }
 
-    public func move(from sourcePath: String, to destinationPath: String) async throws {
-        try PathUtils.validate(sourcePath)
-        try PathUtils.validate(destinationPath)
-        let source = try existingURL(for: PathUtils.normalize(path: sourcePath, currentDirectory: "/"))
-        let destination = try creationURL(for: PathUtils.normalize(path: destinationPath, currentDirectory: "/"))
+    public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
+        let sourcePath = WorkspacePath(normalizing: sourcePath.string)
+        let destinationPath = WorkspacePath(normalizing: destinationPath.string)
+        let source = try existingURL(for: sourcePath)
+        let destination = try creationURL(for: destinationPath)
         let parent = destination.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
         try fileManager.moveItem(at: source, to: destination)
     }
 
-    public func copy(from sourcePath: String, to destinationPath: String, recursive: Bool) async throws {
-        try PathUtils.validate(sourcePath)
-        try PathUtils.validate(destinationPath)
-        let sourceVirtual = PathUtils.normalize(path: sourcePath, currentDirectory: "/")
+    public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
+        async throws
+    {
+        let sourceVirtual = WorkspacePath(normalizing: sourcePath.string)
         let source = try existingURL(for: sourceVirtual)
-        let destination = try creationURL(for: PathUtils.normalize(path: destinationPath, currentDirectory: "/"))
+        let destination = try creationURL(for: WorkspacePath(normalizing: destinationPath.string))
 
         let sourceInfo = try await stat(path: sourceVirtual)
         if sourceInfo.isDirectory, !recursive {
@@ -151,21 +145,18 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         }
     }
 
-    public func createSymlink(path: String, target: String) async throws {
-        try PathUtils.validate(path)
-        try PathUtils.validate(target)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func createSymlink(path: WorkspacePath, target: String) async throws {
+        try WorkspacePath.validate(target)
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try creationURL(for: normalized)
         let parent = url.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
         try fileManager.createSymbolicLink(atPath: url.path, withDestinationPath: target)
     }
 
-    public func createHardLink(path: String, target: String) async throws {
-        try PathUtils.validate(path)
-        try PathUtils.validate(target)
-        let normalizedLink = PathUtils.normalize(path: path, currentDirectory: "/")
-        let normalizedTarget = PathUtils.normalize(path: target, currentDirectory: "/")
+    public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
+        let normalizedLink = WorkspacePath(normalizing: path.string)
+        let normalizedTarget = WorkspacePath(normalizing: target.string)
         let linkURL = try creationURL(for: normalizedLink)
         let targetURL = try existingURL(for: normalizedTarget)
 
@@ -174,33 +165,29 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try fileManager.linkItem(at: targetURL, to: linkURL)
     }
 
-    public func readSymlink(path: String) async throws -> String {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func readSymlink(path: WorkspacePath) async throws -> String {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         return try fileManager.destinationOfSymbolicLink(atPath: url.path)
     }
 
-    public func setPermissions(path: String, permissions: Int) async throws {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
     }
 
-    public func resolveRealPath(path: String) async throws -> String {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
+        let normalized = WorkspacePath(normalizing: path.string)
         let url = try existingURL(for: normalized)
         let resolved = url.resolvingSymlinksInPath().standardizedFileURL
         try ensureInsideRoot(resolved)
         return virtualPath(from: resolved)
     }
 
-    public func exists(path: String) async -> Bool {
+    public func exists(path: WorkspacePath) async -> Bool {
         do {
-            try PathUtils.validate(path)
-            let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+            let normalized = WorkspacePath(normalizing: path.string)
             let url = try existingOrPotentialURL(for: normalized)
             return fileManager.fileExists(atPath: url.path)
         } catch {
@@ -208,28 +195,28 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         }
     }
 
-    public func glob(pattern: String, currentDirectory: String) async throws -> [String] {
+    public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try PathUtils.validate(pattern)
-        try PathUtils.validate(currentDirectory)
-        let normalizedPattern = PathUtils.normalize(path: pattern, currentDirectory: currentDirectory)
+        let normalizedPattern = PathUtils.normalize(path: pattern, currentDirectory: currentDirectory.string)
         if !PathUtils.containsGlob(normalizedPattern) {
-            return await exists(path: normalizedPattern) ? [normalizedPattern] : []
+            let normalizedPath = WorkspacePath(normalizing: normalizedPattern)
+            return await exists(path: normalizedPath) ? [normalizedPath] : []
         }
 
         let regex = try NSRegularExpression(pattern: PathUtils.globToRegex(normalizedPattern))
         let allPaths = try allVirtualPaths()
 
         let matches = allPaths.filter { path in
-            let range = NSRange(path.startIndex..<path.endIndex, in: path)
-            return regex.firstMatch(in: path, range: range) != nil
+            let range = NSRange(path.string.startIndex..<path.string.endIndex, in: path.string)
+            return regex.firstMatch(in: path.string, range: range) != nil
         }
 
         return matches.sorted()
     }
 
-    private func allVirtualPaths() throws -> [String] {
+    private func allVirtualPaths() throws -> [WorkspacePath] {
         let root = try requireRoot()
-        var paths = ["/"]
+        var paths: [WorkspacePath] = [.root]
 
         guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: nil) else {
             return paths
@@ -242,24 +229,23 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
         return paths
     }
 
-    private func existingOrPotentialURL(for virtualPath: String) throws -> URL {
+    private func existingOrPotentialURL(for virtualPath: WorkspacePath) throws -> URL {
         let root = try requireRoot()
-        let absolute = virtualPath.hasPrefix("/") ? virtualPath : "/\(virtualPath)"
-        if absolute == "/" {
+        if virtualPath.isRoot {
             return root
         }
 
-        let relative = String(absolute.dropFirst())
+        let relative = String(virtualPath.string.dropFirst())
         return root.appendingPathComponent(relative)
     }
 
-    private func existingURL(for virtualPath: String) throws -> URL {
+    private func existingURL(for virtualPath: WorkspacePath) throws -> URL {
         let url = try existingOrPotentialURL(for: virtualPath)
         try ensureInsideRoot(url)
         return url
     }
 
-    private func creationURL(for virtualPath: String) throws -> URL {
+    private func creationURL(for virtualPath: WorkspacePath) throws -> URL {
         let url = try existingOrPotentialURL(for: virtualPath)
         let parent = url.deletingLastPathComponent()
         try ensureInsideRoot(parent)
@@ -272,32 +258,32 @@ public final class ReadWriteFilesystem: WorkspaceFilesystem, @unchecked Sendable
             throw ShellError.unsupported("filesystem is not configured")
         }
         guard resolved == root || resolved.hasPrefix(root + "/") else {
-            throw ShellError.invalidPath(virtualPath(from: url))
+            throw ShellError.invalidPath(virtualPath(from: url).description)
         }
     }
 
-    private func virtualPath(from physicalURL: URL) -> String {
+    private func virtualPath(from physicalURL: URL) -> WorkspacePath {
         guard let root = try? requireRoot() else {
-            return "/"
+            return .root
         }
 
         let rootPath = root.path
         let path = physicalURL.standardizedFileURL.path
 
         if path == rootPath {
-            return "/"
+            return .root
         }
 
         guard path.hasPrefix(rootPath) else {
-            return "/"
+            return .root
         }
 
         let start = path.index(path.startIndex, offsetBy: rootPath.count)
         let suffix = String(path[start...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         if suffix.isEmpty {
-            return "/"
+            return .root
         }
-        return "/" + suffix
+        return WorkspacePath(unchecked: "/" + suffix)
     }
 
     private func requireRoot() throws -> URL {

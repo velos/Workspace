@@ -75,16 +75,14 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         root = Node(kind: .directory([:]), permissions: 0o755)
     }
 
-    public func stat(path: String) async throws -> FileInfo {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func stat(path: WorkspacePath) async throws -> FileInfo {
+        let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: false)
         return fileInfo(for: node, path: normalized)
     }
 
-    public func listDirectory(path: String) async throws -> [DirectoryEntry] {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
+        let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: true)
 
         guard case let .directory(children) = node.kind else {
@@ -95,14 +93,13 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
             guard let child = children[name] else {
                 return nil
             }
-            let childPath = PathUtils.join(normalized, name)
+            let childPath = normalized.appending(name)
             return DirectoryEntry(name: name, info: fileInfo(for: child, path: childPath))
         }
     }
 
-    public func readFile(path: String) async throws -> Data {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func readFile(path: WorkspacePath) async throws -> Data {
+        let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: true)
 
         guard case let .file(data) = node.kind else {
@@ -112,15 +109,14 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         return data
     }
 
-    public func writeFile(path: String, data: Data, append: Bool) async throws {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
-        guard normalized != "/" else {
+    public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
+        guard !normalized.isRoot else {
             throw posixError(EISDIR)
         }
 
         if let symlinkTarget = try symlinkTargetIfPresent(at: normalized) {
-            let targetPath = PathUtils.normalize(path: symlinkTarget, currentDirectory: PathUtils.dirname(normalized))
+            let targetPath = WorkspacePath.normalized(symlinkTarget, relativeTo: normalized.dirname)
             try await writeFile(path: targetPath, data: data, append: append)
             return
         }
@@ -143,14 +139,13 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         parent.modificationDate = Date()
     }
 
-    public func createDirectory(path: String, recursive: Bool) async throws {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
-        if normalized == "/" {
+    public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
+        if normalized.isRoot {
             return
         }
 
-        let components = PathUtils.splitComponents(normalized)
+        let components = normalized.components
         var current = root
 
         for (index, component) in components.enumerated() {
@@ -181,10 +176,9 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         }
     }
 
-    public func remove(path: String, recursive: Bool) async throws {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
-        if normalized == "/" {
+    public func remove(path: WorkspacePath, recursive: Bool) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
+        if normalized.isRoot {
             throw posixError(EPERM)
         }
 
@@ -202,11 +196,9 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         parent.modificationDate = Date()
     }
 
-    public func move(from sourcePath: String, to destinationPath: String) async throws {
-        try PathUtils.validate(sourcePath)
-        try PathUtils.validate(destinationPath)
-        let source = PathUtils.normalize(path: sourcePath, currentDirectory: "/")
-        let destination = PathUtils.normalize(path: destinationPath, currentDirectory: "/")
+    public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
+        let source = WorkspacePath(normalizing: sourcePath.string)
+        let destination = WorkspacePath(normalizing: destinationPath.string)
 
         if source == destination {
             return
@@ -217,7 +209,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         }
 
         if sourceNode.isDirectory,
-           (destination == source || destination.hasPrefix(source + "/")) {
+           (destination == source || destination.string.hasPrefix(source.string + "/")) {
             throw posixError(EINVAL)
         }
 
@@ -250,11 +242,11 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         destinationParent.modificationDate = Date()
     }
 
-    public func copy(from sourcePath: String, to destinationPath: String, recursive: Bool) async throws {
-        try PathUtils.validate(sourcePath)
-        try PathUtils.validate(destinationPath)
-        let source = PathUtils.normalize(path: sourcePath, currentDirectory: "/")
-        let destination = PathUtils.normalize(path: destinationPath, currentDirectory: "/")
+    public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
+        async throws
+    {
+        let source = WorkspacePath(normalizing: sourcePath.string)
+        let destination = WorkspacePath(normalizing: destinationPath.string)
 
         let sourceNode = try node(at: source, followFinalSymlink: false)
         if sourceNode.isDirectory, !recursive {
@@ -272,11 +264,10 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         destinationParent.modificationDate = Date()
     }
 
-    public func createSymlink(path: String, target: String) async throws {
-        try PathUtils.validate(path)
-        try PathUtils.validate(target)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
-        guard normalized != "/" else {
+    public func createSymlink(path: WorkspacePath, target: String) async throws {
+        try WorkspacePath.validate(target)
+        let normalized = WorkspacePath(normalizing: path.string)
+        guard !normalized.isRoot else {
             throw posixError(EEXIST)
         }
 
@@ -291,15 +282,13 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         parent.modificationDate = Date()
     }
 
-    public func createHardLink(path: String, target: String) async throws {
-        try PathUtils.validate(path)
-        try PathUtils.validate(target)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
-        guard normalized != "/" else {
+    public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
+        guard !normalized.isRoot else {
             throw posixError(EEXIST)
         }
 
-        let source = PathUtils.normalize(path: target, currentDirectory: "/")
+        let source = WorkspacePath(normalizing: target.string)
         let sourceNode = try node(at: source, followFinalSymlink: false)
         if sourceNode.isDirectory {
             throw posixError(EPERM)
@@ -316,9 +305,8 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         parent.modificationDate = Date()
     }
 
-    public func readSymlink(path: String) async throws -> String {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func readSymlink(path: WorkspacePath) async throws -> String {
+        let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: false)
 
         guard case let .symlink(target) = node.kind else {
@@ -328,27 +316,24 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         return target
     }
 
-    public func setPermissions(path: String, permissions: Int) async throws {
-        try PathUtils.validate(path)
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+    public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
+        let normalized = WorkspacePath(normalizing: path.string)
         let node = try node(at: normalized, followFinalSymlink: false)
         node.permissions = permissions
         node.modificationDate = Date()
     }
 
-    public func resolveRealPath(path: String) async throws -> String {
-        try PathUtils.validate(path)
+    public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         return try resolvePath(
-            path: PathUtils.normalize(path: path, currentDirectory: "/"),
+            path: WorkspacePath(normalizing: path.string),
             followFinalSymlink: true,
             symlinkDepth: 0
         )
     }
 
-    public func exists(path: String) async -> Bool {
+    public func exists(path: WorkspacePath) async -> Bool {
         do {
-            try PathUtils.validate(path)
-            let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
+            let normalized = WorkspacePath(normalizing: path.string)
             _ = try node(at: normalized, followFinalSymlink: true)
             return true
         } catch {
@@ -356,44 +341,44 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         }
     }
 
-    public func glob(pattern: String, currentDirectory: String) async throws -> [String] {
+    public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try PathUtils.validate(pattern)
-        try PathUtils.validate(currentDirectory)
-        let normalizedPattern = PathUtils.normalize(path: pattern, currentDirectory: currentDirectory)
+        let normalizedPattern = PathUtils.normalize(path: pattern, currentDirectory: currentDirectory.string)
         if !PathUtils.containsGlob(normalizedPattern) {
-            return await exists(path: normalizedPattern) ? [normalizedPattern] : []
+            let normalizedPath = WorkspacePath(normalizing: normalizedPattern)
+            return await exists(path: normalizedPath) ? [normalizedPath] : []
         }
 
         let regex = try NSRegularExpression(pattern: PathUtils.globToRegex(normalizedPattern))
         let paths = allVirtualPaths()
 
         let matches = paths.filter { path in
-            let range = NSRange(path.startIndex..<path.endIndex, in: path)
-            return regex.firstMatch(in: path, range: range) != nil
+            let range = NSRange(path.string.startIndex..<path.string.endIndex, in: path.string)
+            return regex.firstMatch(in: path.string, range: range) != nil
         }
 
         return matches.sorted()
     }
 
-    private func allVirtualPaths() -> [String] {
-        var paths = ["/"]
-        collectPaths(node: root, currentPath: "/", into: &paths)
+    private func allVirtualPaths() -> [WorkspacePath] {
+        var paths: [WorkspacePath] = [.root]
+        collectPaths(node: root, currentPath: .root, into: &paths)
         return paths
     }
 
-    private func collectPaths(node: Node, currentPath: String, into paths: inout [String]) {
+    private func collectPaths(node: Node, currentPath: WorkspacePath, into paths: inout [WorkspacePath]) {
         guard case let .directory(children) = node.kind else {
             return
         }
 
         for (name, child) in children.sorted(by: { $0.key < $1.key }) {
-            let childPath = PathUtils.join(currentPath, name)
+            let childPath = currentPath.appending(name)
             paths.append(childPath)
             collectPaths(node: child, currentPath: childPath, into: &paths)
         }
     }
 
-    private func fileInfo(for node: Node, path: String) -> FileInfo {
+    private func fileInfo(for node: Node, path: WorkspacePath) -> FileInfo {
         FileInfo(
             path: path,
             isDirectory: node.isDirectory,
@@ -411,19 +396,19 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         return children
     }
 
-    private func parentDirectoryAndName(for path: String) throws -> (Node, String) {
-        guard path != "/" else {
+    private func parentDirectoryAndName(for path: WorkspacePath) throws -> (Node, String) {
+        guard !path.isRoot else {
             throw posixError(EPERM)
         }
 
-        let parentPath = PathUtils.dirname(path)
-        let name = PathUtils.basename(path)
+        let parentPath = path.dirname
+        let name = path.basename
         let parent = try node(at: parentPath, followFinalSymlink: true)
         _ = try directoryChildren(of: parent)
         return (parent, name)
     }
 
-    private func parentDirectoryEntryIfPresent(for path: String) throws -> (Node, String, Node)? {
+    private func parentDirectoryEntryIfPresent(for path: WorkspacePath) throws -> (Node, String, Node)? {
         let (parent, name) = try parentDirectoryAndName(for: path)
         let children = try directoryChildren(of: parent)
         guard let entry = children[name] else {
@@ -432,7 +417,7 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         return (parent, name, entry)
     }
 
-    private func symlinkTargetIfPresent(at path: String) throws -> String? {
+    private func symlinkTargetIfPresent(at path: WorkspacePath) throws -> String? {
         guard let (_, _, entry) = try parentDirectoryEntryIfPresent(for: path) else {
             return nil
         }
@@ -444,19 +429,19 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
         return nil
     }
 
-    private func node(at path: String, followFinalSymlink: Bool, symlinkDepth: Int = 0) throws -> Node {
+    private func node(at path: WorkspacePath, followFinalSymlink: Bool, symlinkDepth: Int = 0) throws -> Node {
         if symlinkDepth > 64 {
             throw posixError(ELOOP)
         }
 
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
-        if normalized == "/" {
+        let normalized = WorkspacePath(normalizing: path.string)
+        if normalized.isRoot {
             return root
         }
 
-        let components = PathUtils.splitComponents(normalized)
+        let components = normalized.components
         var current = root
-        var currentPath = "/"
+        var currentPath = WorkspacePath.root
 
         for (index, component) in components.enumerated() {
             guard case let .directory(children) = current.kind else {
@@ -471,32 +456,32 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
             if case let .symlink(target) = child.kind,
                (!isFinal || followFinalSymlink) {
                 let base = currentPath
-                let targetPath = PathUtils.normalize(path: target, currentDirectory: base)
+                let targetPath = WorkspacePath.normalized(target, relativeTo: base)
                 let remaining = components.suffix(from: index + 1).joined(separator: "/")
-                let combined = remaining.isEmpty ? targetPath : PathUtils.join(targetPath, remaining)
+                let combined = remaining.isEmpty ? targetPath : targetPath.appending(remaining)
                 return try node(at: combined, followFinalSymlink: followFinalSymlink, symlinkDepth: symlinkDepth + 1)
             }
 
             current = child
-            currentPath = PathUtils.join(currentPath, component)
+            currentPath = currentPath.appending(component)
         }
 
         return current
     }
 
-    private func resolvePath(path: String, followFinalSymlink: Bool, symlinkDepth: Int) throws -> String {
+    private func resolvePath(path: WorkspacePath, followFinalSymlink: Bool, symlinkDepth: Int) throws -> WorkspacePath {
         if symlinkDepth > 64 {
             throw posixError(ELOOP)
         }
 
-        let normalized = PathUtils.normalize(path: path, currentDirectory: "/")
-        if normalized == "/" {
-            return "/"
+        let normalized = WorkspacePath(normalizing: path.string)
+        if normalized.isRoot {
+            return .root
         }
 
-        let components = PathUtils.splitComponents(normalized)
+        let components = normalized.components
         var current = root
-        var resolvedPath = "/"
+        var resolvedPath = WorkspacePath.root
 
         for (index, component) in components.enumerated() {
             guard case let .directory(children) = current.kind else {
@@ -510,14 +495,14 @@ public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable 
             let isFinal = index == components.count - 1
             if case let .symlink(target) = child.kind,
                (!isFinal || followFinalSymlink) {
-                let targetPath = PathUtils.normalize(path: target, currentDirectory: resolvedPath)
+                let targetPath = WorkspacePath.normalized(target, relativeTo: resolvedPath)
                 let remaining = components.suffix(from: index + 1).joined(separator: "/")
-                let combined = remaining.isEmpty ? targetPath : PathUtils.join(targetPath, remaining)
+                let combined = remaining.isEmpty ? targetPath : targetPath.appending(remaining)
                 return try resolvePath(path: combined, followFinalSymlink: followFinalSymlink, symlinkDepth: symlinkDepth + 1)
             }
 
             current = child
-            resolvedPath = PathUtils.join(resolvedPath, component)
+            resolvedPath = resolvedPath.appending(component)
         }
 
         return resolvedPath
