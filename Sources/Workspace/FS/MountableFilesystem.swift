@@ -20,7 +20,7 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
 
         /// Creates a mount description from a typed workspace path.
         public init(mountPoint: WorkspacePath, filesystem: any WorkspaceFilesystem) {
-            self.mountPoint = WorkspacePath(normalizing: mountPoint.string)
+            self.mountPoint = mountPoint
             self.filesystem = filesystem
         }
 
@@ -61,16 +61,15 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
 
     /// See ``WorkspaceFilesystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
-        let normalized = WorkspacePath(normalizing: path.string)
-        if let resolved = resolveMounted(path: normalized) {
+        if let resolved = resolveMounted(path: path) {
             var info = try await resolved.filesystem.stat(path: resolved.relativePath)
-            info.path = normalized
+            info.path = path
             return info
         }
 
-        if hasSyntheticDirectory(at: normalized) {
+        if hasSyntheticDirectory(at: path) {
             return FileInfo(
-                path: normalized,
+                path: path,
                 isDirectory: true,
                 isSymbolicLink: false,
                 size: 0,
@@ -79,19 +78,18 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
             )
         }
 
-        return try await base.stat(path: normalized)
+        return try await base.stat(path: path)
     }
 
     /// See ``WorkspaceFilesystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
-        let normalized = WorkspacePath(normalizing: path.string)
-        if let resolved = resolveMounted(path: normalized) {
+        if let resolved = resolveMounted(path: path) {
             let entries = try await resolved.filesystem.listDirectory(path: resolved.relativePath)
             return entries.map { entry in
                 DirectoryEntry(
                     name: entry.name,
                     info: FileInfo(
-                        path: normalized.appending(entry.name),
+                        path: path.appending(entry.name),
                         isDirectory: entry.info.isDirectory,
                         isSymbolicLink: entry.info.isSymbolicLink,
                         size: entry.info.size,
@@ -103,20 +101,20 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
         }
 
         var merged: [String: DirectoryEntry] = [:]
-        let baseHasPath = normalized.isRoot ? true : await base.exists(path: normalized)
+        let baseHasPath = path.isRoot ? true : await base.exists(path: path)
         if baseHasPath {
-            if let baseEntries = try? await base.listDirectory(path: normalized) {
+            if let baseEntries = try? await base.listDirectory(path: path) {
                 for entry in baseEntries {
                     merged[entry.name] = entry
                 }
             }
         }
 
-        for syntheticName in syntheticChildMountNames(under: normalized) {
+        for syntheticName in syntheticChildMountNames(under: path) {
             merged[syntheticName] = DirectoryEntry(
                 name: syntheticName,
                 info: FileInfo(
-                    path: normalized.appending(syntheticName),
+                    path: path.appending(syntheticName),
                     isDirectory: true,
                     isSymbolicLink: false,
                     size: 0,
@@ -126,7 +124,7 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
             )
         }
 
-        if merged.isEmpty, !hasSyntheticDirectory(at: normalized) {
+        if merged.isEmpty, !hasSyntheticDirectory(at: path) {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
         }
 
@@ -135,38 +133,34 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
 
     /// See ``WorkspaceFilesystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
-        let normalized = WorkspacePath(normalizing: path.string)
-        if let resolved = resolveMounted(path: normalized) {
+        if let resolved = resolveMounted(path: path) {
             return try await resolved.filesystem.readFile(path: resolved.relativePath)
         }
-        return try await base.readFile(path: normalized)
+        return try await base.readFile(path: path)
     }
 
     /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
-        let normalized = WorkspacePath(normalizing: path.string)
-        let resolved = resolveWritable(path: normalized)
+        let resolved = resolveWritable(path: path)
         try await resolved.filesystem.writeFile(path: resolved.relativePath, data: data, append: append)
     }
 
     /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
-        let normalized = WorkspacePath(normalizing: path.string)
-        let resolved = resolveWritable(path: normalized)
+        let resolved = resolveWritable(path: path)
         try await resolved.filesystem.createDirectory(path: resolved.relativePath, recursive: recursive)
     }
 
     /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
-        let normalized = WorkspacePath(normalizing: path.string)
-        let resolved = resolveWritable(path: normalized)
+        let resolved = resolveWritable(path: path)
         try await resolved.filesystem.remove(path: resolved.relativePath, recursive: recursive)
     }
 
     /// See ``WorkspaceFilesystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
-        let source = resolveWritable(path: WorkspacePath(normalizing: sourcePath.string))
-        let destination = resolveWritable(path: WorkspacePath(normalizing: destinationPath.string))
+        let source = resolveWritable(path: sourcePath)
+        let destination = resolveWritable(path: destinationPath)
         if source.mountPoint == destination.mountPoint {
             try await source.filesystem.move(from: source.relativePath, to: destination.relativePath)
             return
@@ -185,8 +179,8 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
-        let source = resolveWritable(path: WorkspacePath(normalizing: sourcePath.string))
-        let destination = resolveWritable(path: WorkspacePath(normalizing: destinationPath.string))
+        let source = resolveWritable(path: sourcePath)
+        let destination = resolveWritable(path: destinationPath)
         if source.mountPoint == destination.mountPoint {
             try await source.filesystem.copy(
                 from: source.relativePath,
@@ -210,14 +204,14 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
 
     /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
-        let resolved = resolveWritable(path: WorkspacePath(normalizing: path.string))
+        let resolved = resolveWritable(path: path)
         try await resolved.filesystem.createSymlink(path: resolved.relativePath, target: target)
     }
 
     /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
-        let link = resolveWritable(path: WorkspacePath(normalizing: path.string))
-        let targetResolved = resolveWritable(path: WorkspacePath(normalizing: target.string))
+        let link = resolveWritable(path: path)
+        let targetResolved = resolveWritable(path: target)
         if link.mountPoint != targetResolved.mountPoint {
             throw ShellError.unsupported("hard links across mounts are not supported")
         }
@@ -226,45 +220,42 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
 
     /// See ``WorkspaceFilesystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
-        let resolved = resolveWritable(path: WorkspacePath(normalizing: path.string))
+        let resolved = resolveWritable(path: path)
         return try await resolved.filesystem.readSymlink(path: resolved.relativePath)
     }
 
     /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
-        let resolved = resolveWritable(path: WorkspacePath(normalizing: path.string))
+        let resolved = resolveWritable(path: path)
         try await resolved.filesystem.setPermissions(path: resolved.relativePath, permissions: permissions)
     }
 
     /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
-        let normalized = WorkspacePath(normalizing: path.string)
-        let resolved = resolveWritable(path: normalized)
+        let resolved = resolveWritable(path: path)
         let real = try await resolved.filesystem.resolveRealPath(path: resolved.relativePath)
         return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, String(real.string.dropFirst()))
     }
 
     /// See ``WorkspaceFilesystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
-        let normalized = WorkspacePath(normalizing: path.string)
-        if let resolved = resolveMounted(path: normalized) {
+        if let resolved = resolveMounted(path: path) {
             return await resolved.filesystem.exists(path: resolved.relativePath)
         }
-        if hasSyntheticDirectory(at: normalized) {
+        if hasSyntheticDirectory(at: path) {
             return true
         }
-        return await base.exists(path: normalized)
+        return await base.exists(path: path)
     }
 
     /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
-        let normalizedPattern = WorkspacePath.normalize(path: pattern, currentDirectory: currentDirectory.string)
-        if !WorkspacePath.containsGlob(normalizedPattern) {
-            let normalizedPath = WorkspacePath(normalizing: normalizedPattern)
-            return await exists(path: normalizedPath) ? [normalizedPath] : []
+        let normalizedPattern = try WorkspacePath(validating: pattern, relativeTo: currentDirectory)
+        if !WorkspacePath.containsGlob(normalizedPattern.string) {
+            return await exists(path: normalizedPattern) ? [normalizedPattern] : []
         }
 
-        let regex = try NSRegularExpression(pattern: WorkspacePath.globToRegex(normalizedPattern))
+        let regex = try NSRegularExpression(pattern: WorkspacePath.globToRegex(normalizedPattern.string))
         let paths = try await allPaths()
         return paths.filter { path in
             let range = NSRange(path.string.startIndex..<path.string.endIndex, in: path.string)

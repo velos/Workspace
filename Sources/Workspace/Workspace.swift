@@ -436,9 +436,9 @@ public actor Workspace {
 
     /// Reads a UTF-8 file from the workspace.
     public func readFile(_ path: WorkspacePath) async throws -> String {
-        let data = try await filesystem.readFile(path: normalize(path))
+        let data = try await filesystem.readFile(path: path)
         guard let string = String(data: data, encoding: .utf8) else {
-            throw WorkspaceError.unsupported("file is not valid UTF-8: \(normalize(path))")
+            throw WorkspaceError.unsupported("file is not valid UTF-8: \(path)")
         }
         return string
     }
@@ -450,7 +450,7 @@ public actor Workspace {
 
     /// Writes UTF-8 text to a file, replacing any existing contents.
     public func writeFile(_ path: WorkspacePath, content: String) async throws {
-        try await filesystem.writeFile(path: normalize(path), data: Data(content.utf8), append: false)
+        try await filesystem.writeFile(path: path, data: Data(content.utf8), append: false)
     }
 
     /// Convenience overload for ``Workspace/writeFile(_:content:)`` that accepts a string path.
@@ -460,7 +460,7 @@ public actor Workspace {
 
     /// Appends UTF-8 text to a file.
     public func appendFile(_ path: WorkspacePath, content: String) async throws {
-        try await filesystem.writeFile(path: normalize(path), data: Data(content.utf8), append: true)
+        try await filesystem.writeFile(path: path, data: Data(content.utf8), append: true)
     }
 
     /// Convenience overload for ``Workspace/appendFile(_:content:)`` that accepts a string path.
@@ -473,11 +473,11 @@ public actor Workspace {
         _ path: WorkspacePath,
         as type: T.Type = T.self
     ) async throws -> T {
-        let data = try await filesystem.readFile(path: normalize(path))
+        let data = try await filesystem.readFile(path: path)
         do {
             return try JSONDecoder().decode(type, from: data)
         } catch {
-            throw WorkspaceError.unsupported("invalid JSON: \(normalize(path))")
+            throw WorkspaceError.unsupported("invalid JSON: \(path)")
         }
     }
 
@@ -501,7 +501,7 @@ public actor Workspace {
         }
         var data = try encoder.encode(value)
         data.append(Data("\n".utf8))
-        try await filesystem.writeFile(path: normalize(path), data: data, append: false)
+        try await filesystem.writeFile(path: path, data: data, append: false)
     }
 
     /// Convenience overload for ``Workspace/writeJson(_:value:prettyPrinted:)`` that accepts a string path.
@@ -515,7 +515,7 @@ public actor Workspace {
 
     /// Returns whether an entry exists at `path`.
     public func exists(_ path: WorkspacePath) async -> Bool {
-        await filesystem.exists(path: normalize(path))
+        await filesystem.exists(path: path)
     }
 
     /// Convenience overload for ``Workspace/exists(_:)`` that accepts a string path.
@@ -528,7 +528,7 @@ public actor Workspace {
 
     /// Returns metadata for the entry at `path`.
     public func stat(_ path: WorkspacePath) async throws -> FileInfo {
-        try await filesystem.stat(path: normalize(path))
+        try await filesystem.stat(path: path)
     }
 
     /// Convenience overload for ``Workspace/stat(_:)`` that accepts a string path.
@@ -538,7 +538,7 @@ public actor Workspace {
 
     /// Lists the direct children of the directory at `path`.
     public func readdir(_ path: WorkspacePath) async throws -> [DirectoryEntry] {
-        try await filesystem.listDirectory(path: normalize(path))
+        try await filesystem.listDirectory(path: path)
     }
 
     /// Convenience overload for ``Workspace/readdir(_:)`` that accepts a string path.
@@ -550,7 +550,7 @@ public actor Workspace {
     public func glob(_ pattern: String, currentDirectory: WorkspacePath = .root) async throws -> [WorkspacePath] {
         try await filesystem.glob(
             pattern: pattern,
-            currentDirectory: normalize(currentDirectory)
+            currentDirectory: currentDirectory
         )
     }
 
@@ -561,7 +561,7 @@ public actor Workspace {
 
     /// Creates a directory at `path`.
     public func mkdir(_ path: WorkspacePath, recursive: Bool = true) async throws {
-        try await filesystem.createDirectory(path: normalize(path), recursive: recursive)
+        try await filesystem.createDirectory(path: path, recursive: recursive)
     }
 
     /// Convenience overload for ``Workspace/mkdir(_:recursive:)`` that accepts a string path.
@@ -571,7 +571,7 @@ public actor Workspace {
 
     /// Removes the entry at `path`.
     public func rm(_ path: WorkspacePath, recursive: Bool = true) async throws {
-        try await filesystem.remove(path: normalize(path), recursive: recursive)
+        try await filesystem.remove(path: path, recursive: recursive)
     }
 
     /// Convenience overload for ``Workspace/rm(_:recursive:)`` that accepts a string path.
@@ -584,8 +584,8 @@ public actor Workspace {
         async throws
     {
         try await filesystem.copy(
-            from: normalize(sourcePath),
-            to: normalize(destinationPath),
+            from: sourcePath,
+            to: destinationPath,
             recursive: recursive
         )
     }
@@ -602,8 +602,8 @@ public actor Workspace {
     /// Moves or renames an entry from `sourcePath` to `destinationPath`.
     public func mv(_ sourcePath: WorkspacePath, _ destinationPath: WorkspacePath) async throws {
         try await filesystem.move(
-            from: normalize(sourcePath),
-            to: normalize(destinationPath)
+            from: sourcePath,
+            to: destinationPath
         )
     }
 
@@ -614,7 +614,7 @@ public actor Workspace {
 
     /// Builds a recursive tree representation for the entry at `path`.
     public func walkTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> WorkspaceTreeNode {
-        try await buildTree(path: normalize(path), depth: 0, maxDepth: maxDepth)
+        try await buildTree(path: path, depth: 0, maxDepth: maxDepth)
     }
 
     /// Convenience overload for ``Workspace/walkTree(_:maxDepth:)`` that accepts a string path.
@@ -624,7 +624,7 @@ public actor Workspace {
 
     /// Summarizes the subtree rooted at `path`.
     public func summarizeTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> WorkspaceTreeSummary {
-        try await buildSummary(path: normalize(path), depth: 0, maxDepth: maxDepth)
+        try await buildSummary(path: path, depth: 0, maxDepth: maxDepth)
     }
 
     /// Convenience overload for ``Workspace/summarizeTree(_:maxDepth:)`` that accepts a string path.
@@ -634,8 +634,7 @@ public actor Workspace {
 
     /// Returns a preview of a replacement request without mutating the workspace.
     public func previewReplacement(_ request: WorkspaceReplaceRequest) async throws -> WorkspaceReplaceResult {
-        let normalizedRequest = normalize(request: request)
-        let changes = try await replacementChanges(for: normalizedRequest)
+        let changes = try await replacementChanges(for: request)
         return WorkspaceReplaceResult(
             mode: .preview,
             touchedPaths: canonicalizedTouchedPaths(for: changes),
@@ -653,8 +652,7 @@ public actor Workspace {
         _ request: WorkspaceReplaceRequest,
         failurePolicy: WorkspaceMutationFailurePolicy = .rollback
     ) async throws -> WorkspaceReplaceResult {
-        let normalizedRequest = normalize(request: request)
-        let changes = try await replacementChanges(for: normalizedRequest)
+        let changes = try await replacementChanges(for: request)
         let touchedPaths = canonicalizedTouchedPaths(for: changes)
 
         guard !changes.isEmpty else {
@@ -703,11 +701,10 @@ public actor Workspace {
 
     /// Returns a preview of a batch edit request without mutating the workspace.
     public func previewEdits(_ edits: [WorkspaceEdit]) async throws -> WorkspaceBatchEditResult {
-        let normalizedEdits = edits.map(normalize(edit:))
         return WorkspaceBatchEditResult(
             mode: .preview,
-            touchedPaths: canonicalizedTouchedPaths(for: normalizedEdits),
-            edits: try await previewEntries(for: normalizedEdits),
+            touchedPaths: canonicalizedTouchedPaths(for: edits),
+            edits: try await previewEntries(for: edits),
             rolledBack: false
         )
     }
@@ -721,11 +718,10 @@ public actor Workspace {
         _ edits: [WorkspaceEdit],
         failurePolicy: WorkspaceMutationFailurePolicy = .rollback
     ) async throws -> WorkspaceBatchEditResult {
-        let normalizedEdits = edits.map(normalize(edit:))
-        let touchedPaths = canonicalizedTouchedPaths(for: normalizedEdits)
-        let previewEntries = try await previewEntries(for: normalizedEdits)
+        let touchedPaths = canonicalizedTouchedPaths(for: edits)
+        let previewEntries = try await previewEntries(for: edits)
 
-        guard !normalizedEdits.isEmpty else {
+        guard !edits.isEmpty else {
             return WorkspaceBatchEditResult(
                 mode: .execution,
                 touchedPaths: touchedPaths,
@@ -737,7 +733,7 @@ public actor Workspace {
         let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
         var failures: [WorkspaceBatchEditFailure] = []
 
-        for (index, edit) in normalizedEdits.enumerated() {
+        for (index, edit) in edits.enumerated() {
             do {
                 try await apply(edit)
             } catch {
@@ -770,20 +766,6 @@ public actor Workspace {
             edits: previewEntries,
             failures: failures,
             rolledBack: false
-        )
-    }
-
-    private func normalize(_ path: WorkspacePath) -> WorkspacePath {
-        WorkspacePath(normalizing: path.string)
-    }
-
-    private func normalize(request: WorkspaceReplaceRequest) -> WorkspaceReplaceRequest {
-        WorkspaceReplaceRequest(
-            scope: normalize(request.scope),
-            include: request.include,
-            exclude: request.exclude,
-            search: request.search,
-            replacement: request.replacement
         )
     }
 
@@ -880,22 +862,6 @@ public actor Workspace {
         return .file
     }
 
-    private func normalize(edit: WorkspaceEdit) -> WorkspaceEdit {
-        switch edit {
-        case let .writeFile(path, content):
-            return .writeFile(path: normalize(path), content: content)
-        case let .appendFile(path, content):
-            return .appendFile(path: normalize(path), content: content)
-        case let .delete(path, recursive):
-            return .delete(path: normalize(path), recursive: recursive)
-        case let .createDirectory(path, recursive):
-            return .createDirectory(path: normalize(path), recursive: recursive)
-        case let .move(from, to):
-            return .move(from: normalize(from), to: normalize(to))
-        case let .copy(from, to, recursive):
-            return .copy(from: normalize(from), to: normalize(to), recursive: recursive)
-        }
-    }
 
     private func touchedPaths(for edit: WorkspaceEdit) -> [WorkspacePath] {
         switch edit {

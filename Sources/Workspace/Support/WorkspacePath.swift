@@ -27,7 +27,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     /// Creates a normalized absolute path from a string, resolving it relative to `currentDirectory`
     /// when the input is not already absolute.
     public init(normalizing path: some StringProtocol, relativeTo currentDirectory: WorkspacePath = .root) {
-        storage = Self.normalize(path: String(path), currentDirectory: currentDirectory.storage)
+        storage = Self.normalizedString(path: String(path), currentDirectory: currentDirectory.storage)
     }
 
     /// Creates a validated and normalized absolute path from a string.
@@ -38,7 +38,9 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     /// - Throws: ``ShellError/invalidPath(_:)`` when the input contains unsupported characters.
     public init(validating path: some StringProtocol, relativeTo currentDirectory: WorkspacePath = .root) throws {
         let string = String(path)
-        try Self.validate(string)
+        if string.contains("\u{0}") {
+            throw ShellError.invalidPath(string)
+        }
         self.init(normalizing: string, relativeTo: currentDirectory)
     }
 
@@ -99,29 +101,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
         try container.encode(storage)
     }
 
-    /// Validates raw path text before normalization.
-    ///
-    /// - Throws: ``ShellError/invalidPath(_:)`` when the input contains a null byte.
-    public static func validate(_ path: some StringProtocol) throws {
-        let string = String(path)
-        if string.contains("\u{0}") {
-            throw ShellError.invalidPath(string)
-        }
-    }
-
-    /// Returns a normalized absolute path from a string.
-    public static func normalized(
-        _ path: some StringProtocol,
-        relativeTo currentDirectory: WorkspacePath = .root
-    ) -> WorkspacePath {
-        WorkspacePath(normalizing: path, relativeTo: currentDirectory)
-    }
-
-    /// Normalizes raw path text into an absolute path string.
-    ///
-    /// Relative inputs are resolved against `currentDirectory`, repeated separators are collapsed,
-    /// and `.` and `..` components are interpreted using shell-style rules.
-    public static func normalize(path: String, currentDirectory: String) -> String {
+    private static func normalizedString(path: String, currentDirectory: String) -> String {
         if path.isEmpty {
             return currentDirectory
         }
@@ -167,7 +147,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
 
     /// Returns the parent directory of `path`.
     public static func dirname(_ path: some StringProtocol) -> WorkspacePath {
-        let normalized = normalize(path: String(path), currentDirectory: "/")
+        let normalized = normalizedString(path: String(path), currentDirectory: "/")
         if normalized == "/" {
             return .root
         }
@@ -185,11 +165,11 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
         let left = String(lhs)
         let right = String(rhs)
         if right.hasPrefix("/") {
-            return normalize(path: right, currentDirectory: "/")
+            return normalizedString(path: right, currentDirectory: "/")
         }
 
         let separator = left.hasSuffix("/") ? "" : "/"
-        return normalize(path: left + separator + right, currentDirectory: "/")
+        return normalizedString(path: left + separator + right, currentDirectory: "/")
     }
 
     /// Joins a base path and a path fragment, returning a normalized ``WorkspacePath``.

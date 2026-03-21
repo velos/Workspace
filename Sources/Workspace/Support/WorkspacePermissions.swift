@@ -133,113 +133,95 @@ public final class PermissionedWorkspaceFilesystem: WorkspaceFilesystem, @unchec
 
     /// See ``WorkspaceFilesystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .stat, path: normalized))
-        return try await base.stat(path: normalized)
+        try await authorize(.init(operation: .stat, path: path))
+        return try await base.stat(path: path)
     }
 
     /// See ``WorkspaceFilesystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .listDirectory, path: normalized))
-        return try await base.listDirectory(path: normalized)
+        try await authorize(.init(operation: .listDirectory, path: path))
+        return try await base.listDirectory(path: path)
     }
 
     /// See ``WorkspaceFilesystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .readFile, path: normalized))
-        return try await base.readFile(path: normalized)
+        try await authorize(.init(operation: .readFile, path: path))
+        return try await base.readFile(path: path)
     }
 
     /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .writeFile, path: normalized, append: append))
-        try await base.writeFile(path: normalized, data: data, append: append)
+        try await authorize(.init(operation: .writeFile, path: path, append: append))
+        try await base.writeFile(path: path, data: data, append: append)
     }
 
     /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .createDirectory, path: normalized, recursive: recursive))
-        try await base.createDirectory(path: normalized, recursive: recursive)
+        try await authorize(.init(operation: .createDirectory, path: path, recursive: recursive))
+        try await base.createDirectory(path: path, recursive: recursive)
     }
 
     /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .remove, path: normalized, recursive: recursive))
-        try await base.remove(path: normalized, recursive: recursive)
+        try await authorize(.init(operation: .remove, path: path, recursive: recursive))
+        try await base.remove(path: path, recursive: recursive)
     }
 
     /// See ``WorkspaceFilesystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
-        let source = normalizedPath(sourcePath)
-        let destination = normalizedPath(destinationPath)
-        try await authorize(.init(operation: .move, sourcePath: source, destinationPath: destination))
-        try await base.move(from: source, to: destination)
+        try await authorize(.init(operation: .move, sourcePath: sourcePath, destinationPath: destinationPath))
+        try await base.move(from: sourcePath, to: destinationPath)
     }
 
     /// See ``WorkspaceFilesystem/copy(from:to:recursive:)``.
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
-        let source = normalizedPath(sourcePath)
-        let destination = normalizedPath(destinationPath)
         try await authorize(
-            .init(operation: .copy, sourcePath: source, destinationPath: destination, recursive: recursive)
+            .init(operation: .copy, sourcePath: sourcePath, destinationPath: destinationPath, recursive: recursive)
         )
-        try await base.copy(from: source, to: destination, recursive: recursive)
+        try await base.copy(from: sourcePath, to: destinationPath, recursive: recursive)
     }
 
     /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
-        let normalized = normalizedPath(path)
-        try WorkspacePath.validate(target)
-        let normalizedTarget = WorkspacePath.normalized(
-            target,
-            relativeTo: normalized.dirname
+        let normalizedTarget = try WorkspacePath(
+            validating: target,
+            relativeTo: path.dirname
         )
-        try await authorize(.init(operation: .createSymlink, path: normalized, destinationPath: normalizedTarget))
-        try await base.createSymlink(path: normalized, target: target)
+        try await authorize(.init(operation: .createSymlink, path: path, destinationPath: normalizedTarget))
+        try await base.createSymlink(path: path, target: target)
     }
 
     /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
-        let normalized = normalizedPath(path)
-        let normalizedTarget = normalizedPath(target)
-        try await authorize(.init(operation: .createHardLink, path: normalized, destinationPath: normalizedTarget))
-        try await base.createHardLink(path: normalized, target: normalizedTarget)
+        try await authorize(.init(operation: .createHardLink, path: path, destinationPath: target))
+        try await base.createHardLink(path: path, target: target)
     }
 
     /// See ``WorkspaceFilesystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .readSymlink, path: normalized))
-        return try await base.readSymlink(path: normalized)
+        try await authorize(.init(operation: .readSymlink, path: path))
+        return try await base.readSymlink(path: path)
     }
 
     /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .setPermissions, path: normalized))
-        try await base.setPermissions(path: normalized, permissions: permissions)
+        try await authorize(.init(operation: .setPermissions, path: path))
+        try await base.setPermissions(path: path, permissions: permissions)
     }
 
     /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
-        let normalized = normalizedPath(path)
-        try await authorize(.init(operation: .resolveRealPath, path: normalized))
-        return try await base.resolveRealPath(path: normalized)
+        try await authorize(.init(operation: .resolveRealPath, path: path))
+        return try await base.resolveRealPath(path: path)
     }
 
     /// See ``WorkspaceFilesystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
         do {
-            let normalized = normalizedPath(path)
-            try await authorize(.init(operation: .exists, path: normalized))
-            return await base.exists(path: normalized)
+            try await authorize(.init(operation: .exists, path: path))
+            return await base.exists(path: path)
         } catch {
             return false
         }
@@ -247,20 +229,14 @@ public final class PermissionedWorkspaceFilesystem: WorkspaceFilesystem, @unchec
 
     /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
-        try WorkspacePath.validate(pattern)
-        let normalizedCurrentDirectory = normalizedPath(currentDirectory)
-        let normalizedPattern = WorkspacePath.normalized(
-            pattern,
-            relativeTo: normalizedCurrentDirectory
+        let normalizedPattern = try WorkspacePath(
+            validating: pattern,
+            relativeTo: currentDirectory
         )
         try await authorize(
-            .init(operation: .glob, path: normalizedPattern, destinationPath: normalizedCurrentDirectory)
+            .init(operation: .glob, path: normalizedPattern, destinationPath: currentDirectory)
         )
-        return try await base.glob(pattern: normalizedPattern.description, currentDirectory: normalizedCurrentDirectory)
-    }
-
-    private func normalizedPath(_ path: WorkspacePath) -> WorkspacePath {
-        WorkspacePath(normalizing: path.string)
+        return try await base.glob(pattern: normalizedPattern.description, currentDirectory: currentDirectory)
     }
 
     private func authorize(_ request: WorkspacePermissionRequest) async throws {
