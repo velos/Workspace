@@ -7,13 +7,10 @@ struct WorkspaceMountingTests {
     @Test("multiple isolated mounts can share a memory workspace")
     func multipleIsolatedMountsCanShareAMemoryWorkspace() async throws {
         let workspaceA = InMemoryFilesystem()
-        try workspaceA.configureForSession()
 
         let workspaceB = InMemoryFilesystem()
-        try workspaceB.configureForSession()
 
         let memory = InMemoryFilesystem()
-        try memory.configureForSession()
 
         let mountable = MountableFilesystem(
             base: InMemoryFilesystem(),
@@ -23,7 +20,6 @@ struct WorkspaceMountingTests {
                 .init(mountPoint: "/memory", filesystem: memory),
             ]
         )
-        try mountable.configureForSession()
 
         let workspace = Workspace(filesystem: mountable)
         try await workspace.writeFile("/memory/shared.txt", content: "memo")
@@ -37,10 +33,8 @@ struct WorkspaceMountingTests {
     @Test("dry run batch edits preview mounted changes without mutating")
     func dryRunBatchEditsPreviewMountedChangesWithoutMutating() async throws {
         let memory = InMemoryFilesystem()
-        try memory.configureForSession()
 
         let workspaceRoot = InMemoryFilesystem()
-        try workspaceRoot.configureForSession()
 
         let mountable = MountableFilesystem(
             base: InMemoryFilesystem(),
@@ -49,7 +43,6 @@ struct WorkspaceMountingTests {
                 .init(mountPoint: "/memory", filesystem: memory),
             ]
         )
-        try mountable.configureForSession()
         try await memory.writeFile(path: "/shared.txt", data: Data("memo".utf8), append: false)
 
         let workspace = Workspace(filesystem: mountable)
@@ -70,7 +63,6 @@ struct WorkspaceMountingTests {
     @Test("walkTree maxDepth stops recursion at nested directories")
     func walkTreeMaxDepthStopsRecursionAtNestedDirectories() async throws {
         let filesystem = InMemoryFilesystem()
-        try filesystem.configureForSession()
         try await filesystem.createDirectory(path: "/workspace/src/nested", recursive: true)
         try await filesystem.writeFile(path: "/workspace/src/nested/deep.txt", data: Data("deep".utf8), append: false)
 
@@ -86,10 +78,8 @@ struct WorkspaceMountingTests {
     @Test("copy and move operations work across mounted roots")
     func copyAndMoveOperationsWorkAcrossMountedRoots() async throws {
         let docs = InMemoryFilesystem()
-        try docs.configureForSession()
 
         let workspaceFiles = InMemoryFilesystem()
-        try workspaceFiles.configureForSession()
 
         let mountable = MountableFilesystem(
             base: InMemoryFilesystem(),
@@ -98,7 +88,6 @@ struct WorkspaceMountingTests {
                 .init(mountPoint: "/workspace", filesystem: workspaceFiles),
             ]
         )
-        try mountable.configureForSession()
         try await docs.writeFile(path: "/guide.txt", data: Data("guide".utf8), append: false)
 
         let workspace = Workspace(filesystem: mountable)

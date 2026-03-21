@@ -1,13 +1,12 @@
 import Foundation
 
-public final class SecurityScopedFilesystem: SessionConfigurableFilesystem, @unchecked Sendable {
+public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     public enum AccessMode: Sendable {
         case readOnly
         case readWrite
     }
 
     private let mode: AccessMode
-    private let fileManager: FileManager
     private let backing: ReadWriteFilesystem
 
     private var scopedURL: URL
@@ -16,10 +15,10 @@ public final class SecurityScopedFilesystem: SessionConfigurableFilesystem, @unc
 
     public init(url: URL, mode: AccessMode = .readWrite, fileManager: FileManager = .default) throws {
         self.mode = mode
-        self.fileManager = fileManager
         backing = ReadWriteFilesystem(fileManager: fileManager)
         scopedURL = url.standardizedFileURL
         cachedBookmarkData = nil
+        try configureBackingForCurrentURL()
     }
 
     public init(bookmarkData: Data, mode: AccessMode = .readWrite, fileManager: FileManager = .default) throws {
@@ -27,7 +26,6 @@ public final class SecurityScopedFilesystem: SessionConfigurableFilesystem, @unc
         throw ShellError.unsupported("security-scoped URLs not supported on this platform")
         #else
         self.mode = mode
-        self.fileManager = fileManager
         backing = ReadWriteFilesystem(fileManager: fileManager)
 
         var isStale = false
@@ -48,6 +46,8 @@ public final class SecurityScopedFilesystem: SessionConfigurableFilesystem, @unc
         } else {
             cachedBookmarkData = bookmarkData
         }
+
+        try configureBackingForCurrentURL()
         #endif
     }
 
@@ -94,28 +94,11 @@ public final class SecurityScopedFilesystem: SessionConfigurableFilesystem, @unc
         return try SecurityScopedFilesystem(bookmarkData: data, mode: mode, fileManager: fileManager)
     }
 
-    public func configureForSession() throws {
-        #if os(tvOS) || os(watchOS)
-        throw ShellError.unsupported("security-scoped URLs not supported on this platform")
-        #elseif os(iOS)
-        if !didStartSecurityScope {
-            guard scopedURL.startAccessingSecurityScopedResource() else {
-                throw ShellError.unsupported("could not start security-scoped access")
-            }
-            didStartSecurityScope = true
-        }
-        #elseif os(macOS)
-        if !didStartSecurityScope {
-            didStartSecurityScope = scopedURL.startAccessingSecurityScopedResource()
-        }
-        #endif
-
-        try backing.configure(rootDirectory: scopedURL)
-    }
-
     public func configure(rootDirectory: URL) throws {
+        stopAccessingSecurityScopeIfNeeded()
         scopedURL = rootDirectory.standardizedFileURL
-        try backing.configure(rootDirectory: scopedURL)
+        cachedBookmarkData = nil
+        try configureBackingForCurrentURL()
     }
 
     public func stat(path: String) async throws -> FileInfo {
@@ -190,6 +173,37 @@ public final class SecurityScopedFilesystem: SessionConfigurableFilesystem, @unc
         guard mode == .readWrite else {
             throw ShellError.unsupported("filesystem is read-only")
         }
+    }
+
+    private func configureBackingForCurrentURL() throws {
+        try beginAccessingSecurityScopeIfNeeded()
+        try backing.configure(rootDirectory: scopedURL)
+    }
+
+    private func beginAccessingSecurityScopeIfNeeded() throws {
+        #if os(tvOS) || os(watchOS)
+        throw ShellError.unsupported("security-scoped URLs not supported on this platform")
+        #elseif os(iOS)
+        if !didStartSecurityScope {
+            guard scopedURL.startAccessingSecurityScopedResource() else {
+                throw ShellError.unsupported("could not start security-scoped access")
+            }
+            didStartSecurityScope = true
+        }
+        #elseif os(macOS)
+        if !didStartSecurityScope {
+            didStartSecurityScope = scopedURL.startAccessingSecurityScopedResource()
+        }
+        #endif
+    }
+
+    private func stopAccessingSecurityScopeIfNeeded() {
+        #if os(iOS) || os(macOS)
+        if didStartSecurityScope {
+            scopedURL.stopAccessingSecurityScopedResource()
+            didStartSecurityScope = false
+        }
+        #endif
     }
 
     #if os(macOS) || targetEnvironment(macCatalyst)

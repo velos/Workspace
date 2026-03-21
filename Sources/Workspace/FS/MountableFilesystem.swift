@@ -6,7 +6,7 @@ import Darwin
 import Glibc
 #endif
 
-public final class MountableFilesystem: SessionConfigurableFilesystem, @unchecked Sendable {
+public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     public struct Mount: Sendable {
         public var mountPoint: String
         public var filesystem: any WorkspaceFilesystem
@@ -36,23 +36,6 @@ public final class MountableFilesystem: SessionConfigurableFilesystem, @unchecke
 
     public func configure(rootDirectory: URL) throws {
         try base.configure(rootDirectory: rootDirectory)
-        for mount in mounts {
-            if let configurable = mount.filesystem as? any SessionConfigurableFilesystem {
-                try configurable.configureForSession()
-            }
-        }
-    }
-
-    public func configureForSession() throws {
-        guard let configurableBase = base as? any SessionConfigurableFilesystem else {
-            throw ShellError.unsupported("filesystem requires rootDirectory initializer")
-        }
-        try configurableBase.configureForSession()
-        for mount in mounts {
-            if let configurable = mount.filesystem as? any SessionConfigurableFilesystem {
-                try configurable.configureForSession()
-            }
-        }
     }
 
     public func stat(path: String) async throws -> FileInfo {

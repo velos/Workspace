@@ -1,6 +1,6 @@
 import Foundation
 
-public final class SandboxFilesystem: SessionConfigurableFilesystem, @unchecked Sendable {
+public final class SandboxFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     public enum Root: Sendable {
         case documents
         case caches
@@ -9,18 +9,11 @@ public final class SandboxFilesystem: SessionConfigurableFilesystem, @unchecked 
         case url(URL)
     }
 
-    private let root: Root
-    private let fileManager: FileManager
     private let backing: ReadWriteFilesystem
 
-    public init(root: Root, fileManager: FileManager = .default) {
-        self.root = root
-        self.fileManager = fileManager
+    public init(root: Root, fileManager: FileManager = .default) throws {
         backing = ReadWriteFilesystem(fileManager: fileManager)
-    }
-
-    public func configureForSession() throws {
-        let resolvedRoot = try resolveRootURL()
+        let resolvedRoot = try Self.resolveRootURL(root, fileManager: fileManager)
         try backing.configure(rootDirectory: resolvedRoot)
     }
 
@@ -88,7 +81,7 @@ public final class SandboxFilesystem: SessionConfigurableFilesystem, @unchecked 
         try await backing.glob(pattern: pattern, currentDirectory: currentDirectory)
     }
 
-    private func resolveRootURL() throws -> URL {
+    private static func resolveRootURL(_ root: Root, fileManager: FileManager) throws -> URL {
         switch root {
         case .temporary:
             return fileManager.temporaryDirectory

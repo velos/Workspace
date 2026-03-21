@@ -32,7 +32,6 @@ struct WorkspaceFilesystemTests {
     @Test("permissioned filesystem normalizes paths and blocks denied writes")
     func permissionedFilesystemNormalizesPathsAndBlocksDeniedWrites() async throws {
         let base = InMemoryFilesystem()
-        try base.configureForSession()
 
         let recorder = PermissionRecorder()
         let authorizer = WorkspacePermissionAuthorizer { request in
@@ -61,7 +60,6 @@ struct WorkspaceFilesystemTests {
     @Test("permissioned filesystem caches allow-for-session decisions")
     func permissionedFilesystemCachesAllowForSessionDecisions() async throws {
         let base = InMemoryFilesystem()
-        try base.configureForSession()
         try await base.writeFile(path: "/doc.txt", data: Data("hello".utf8), append: false)
 
         let recorder = PermissionRecorder()
@@ -82,7 +80,6 @@ struct WorkspaceFilesystemTests {
     @Test("permissioned mountable filesystem sees mounted virtual paths")
     func permissionedMountableFilesystemSeesMountedVirtualPaths() async throws {
         let docs = InMemoryFilesystem()
-        try docs.configureForSession()
         try await docs.writeFile(path: "/guide.txt", data: Data("guide".utf8), append: false)
 
         let mountable = MountableFilesystem(
@@ -127,5 +124,36 @@ struct WorkspaceFilesystemTests {
         } catch let error as WorkspaceError {
             #expect(error.description.contains("invalid path"))
         }
+    }
+
+    @Test("in-memory filesystem reset clears prior contents")
+    func inMemoryFilesystemResetClearsPriorContents() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
+
+        #expect(await filesystem.exists(path: "/note.txt"))
+
+        filesystem.reset()
+
+        #expect(await filesystem.exists(path: "/"))
+        #expect(!(await filesystem.exists(path: "/note.txt")))
+    }
+
+    @Test("overlay reload restores source snapshot")
+    func overlayReloadRestoresSourceSnapshot() async throws {
+        let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayRoot")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
+
+        let fileURL = root.appendingPathComponent("note.txt")
+        try Data("disk".utf8).write(to: fileURL)
+
+        let filesystem = try OverlayFilesystem(rootDirectory: root)
+        try await filesystem.writeFile(path: "/note.txt", data: Data("overlay".utf8), append: false)
+        #expect(try await filesystem.readFile(path: "/note.txt") == Data("overlay".utf8))
+
+        try Data("disk-updated".utf8).write(to: fileURL)
+        try filesystem.reload()
+
+        #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk-updated".utf8))
     }
 }

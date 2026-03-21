@@ -1,6 +1,6 @@
 import Foundation
 
-public final class InMemoryFilesystem: SessionConfigurableFilesystem, @unchecked Sendable {
+public final class InMemoryFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     private final class Node {
         enum Kind {
             case file(Data)
@@ -71,11 +71,7 @@ public final class InMemoryFilesystem: SessionConfigurableFilesystem, @unchecked
         reset()
     }
 
-    public func configureForSession() throws {
-        reset()
-    }
-
-    private func reset() {
+    public func reset() {
         root = Node(kind: .directory([:]), permissions: 0o755)
     }
 

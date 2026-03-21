@@ -104,9 +104,6 @@ struct WorkspaceTests {
     @Test("workspace module reexports core filesystem primitives")
     func workspaceModuleReexportsCoreFilesystemPrimitives() async throws {
         let workspaceFilesystem: any WorkspaceFilesystem = InMemoryFilesystem()
-        if let configurable = workspaceFilesystem as? any SessionConfigurableFilesystem {
-            try configurable.configureForSession()
-        }
         let mount = MountableFilesystem.Mount(mountPoint: "/memory", filesystem: InMemoryFilesystem())
         let permission = WorkspacePermissionRequest(operation: .readFile, path: "/memory/note.txt")
         let error = WorkspaceError.unsupported("workspace shim check")
@@ -120,7 +117,6 @@ struct WorkspaceTests {
     @Test("readJson and writeJson roundtrip")
     func readJsonAndWriteJsonRoundtrip() async throws {
         let fs = InMemoryFilesystem()
-        try fs.configureForSession()
         let state = Workspace(filesystem: fs)
 
         try await state.writeJson("/config.json", value: DemoConfig(name: "demo", enabled: true))
@@ -131,7 +127,6 @@ struct WorkspaceTests {
     @Test("readJson rejects invalid JSON")
     func readJsonRejectsInvalidJSON() async throws {
         let fs = InMemoryFilesystem()
-        try fs.configureForSession()
         try await fs.writeFile(path: "/broken.json", data: Data("{ nope".utf8), append: false)
         let state = Workspace(filesystem: fs)
 
@@ -146,7 +141,6 @@ struct WorkspaceTests {
     @Test("walkTree and summarizeTree preserve stable ordering")
     func walkTreeAndSummarizeTreePreserveStableOrdering() async throws {
         let fs = InMemoryFilesystem()
-        try fs.configureForSession()
         try await fs.createDirectory(path: "/src", recursive: true)
         try await fs.writeFile(path: "/src/b.txt", data: Data("b".utf8), append: false)
         try await fs.writeFile(path: "/src/a.txt", data: Data("aa".utf8), append: false)
@@ -165,7 +159,6 @@ struct WorkspaceTests {
     @Test("replaceInFiles dry run previews without mutating files")
     func replaceInFilesDryRunPreviewsWithoutMutatingFiles() async throws {
         let fs = InMemoryFilesystem()
-        try fs.configureForSession()
         try await fs.createDirectory(path: "/src", recursive: true)
         try await fs.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
         try await fs.writeFile(path: "/src/b.txt", data: Data("foo bar".utf8), append: false)
@@ -181,7 +174,6 @@ struct WorkspaceTests {
     @Test("replaceInFiles rolls back on write failure")
     func replaceInFilesRollsBackOnWriteFailure() async throws {
         let base = InMemoryFilesystem()
-        try base.configureForSession()
         try await base.createDirectory(path: "/src", recursive: true)
         try await base.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
         try await base.writeFile(path: "/src/b.txt", data: Data("foo".utf8), append: false)
@@ -199,7 +191,6 @@ struct WorkspaceTests {
     @Test("applyEdits succeeds across multiple files")
     func applyEditsSucceedsAcrossMultipleFiles() async throws {
         let fs = InMemoryFilesystem()
-        try fs.configureForSession()
         let state = Workspace(filesystem: fs)
 
         let result = try await state.applyEdits([
@@ -219,7 +210,6 @@ struct WorkspaceTests {
     @Test("applyEdits rolls back on failure")
     func applyEditsRollsBackOnFailure() async throws {
         let base = InMemoryFilesystem()
-        try base.configureForSession()
         try await base.writeFile(path: "/a.txt", data: Data("old".utf8), append: false)
         let state = Workspace(
             filesystem: FailOnceFilesystem(base: base, failingWritePaths: ["/b.txt"])
@@ -252,7 +242,6 @@ struct WorkspaceTests {
                 .init(mountPoint: "/docs", filesystem: try OverlayFilesystem(rootDirectory: docsRoot)),
             ]
         )
-        try mountable.configureForSession()
 
         let state = Workspace(filesystem: mountable)
         let result = try await state.applyEdits([

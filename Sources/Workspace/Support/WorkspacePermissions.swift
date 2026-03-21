@@ -78,7 +78,7 @@ public actor WorkspacePermissionAuthorizer: WorkspacePermissionAuthorizing {
     }
 }
 
-public final class PermissionedWorkspaceFilesystem: SessionConfigurableFilesystem, @unchecked Sendable {
+public final class PermissionedWorkspaceFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     private let base: any WorkspaceFilesystem
     private let authorizer: any WorkspacePermissionAuthorizing
 
@@ -92,13 +92,6 @@ public final class PermissionedWorkspaceFilesystem: SessionConfigurableFilesyste
 
     public func configure(rootDirectory: URL) throws {
         try base.configure(rootDirectory: rootDirectory)
-    }
-
-    public func configureForSession() throws {
-        guard let configurable = base as? any SessionConfigurableFilesystem else {
-            throw WorkspaceError.unsupported("filesystem requires rootDirectory initializer")
-        }
-        try configurable.configureForSession()
     }
 
     public func stat(path: String) async throws -> FileInfo {

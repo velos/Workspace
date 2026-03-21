@@ -59,7 +59,6 @@ Until this package is published to a remote, use it as a local SwiftPM dependenc
 import Workspace
 
 let filesystem = InMemoryFilesystem()
-try filesystem.configureForSession()
 
 let workspace = Workspace(filesystem: filesystem)
 try await workspace.writeFile("/notes/todo.txt", content: "ship it")
@@ -79,7 +78,6 @@ struct Config: Codable {
 }
 
 let filesystem = InMemoryFilesystem()
-try filesystem.configureForSession()
 
 let workspace = Workspace(filesystem: filesystem)
 try await workspace.writeJson("/config.json", value: Config(name: "demo", enabled: true))
@@ -130,13 +128,10 @@ Use `MountableFilesystem` to combine isolated roots and shared state in one virt
 import Workspace
 
 let workspaceA = InMemoryFilesystem()
-try workspaceA.configureForSession()
 
 let workspaceB = InMemoryFilesystem()
-try workspaceB.configureForSession()
 
 let sharedMemory = InMemoryFilesystem()
-try sharedMemory.configureForSession()
 
 let mounted = MountableFilesystem(
     base: InMemoryFilesystem(),
@@ -146,7 +141,6 @@ let mounted = MountableFilesystem(
         .init(mountPoint: "/memory", filesystem: sharedMemory),
     ]
 )
-try mounted.configureForSession()
 
 let workspace = Workspace(filesystem: mounted)
 try await workspace.writeFile("/memory/plan.txt", content: "shared notes")
@@ -161,7 +155,6 @@ Use `PermissionedWorkspaceFilesystem` when the host should decide which operatio
 import Workspace
 
 let base = InMemoryFilesystem()
-try base.configureForSession()
 
 let filesystem = PermissionedWorkspaceFilesystem(
     base: base,
@@ -204,7 +197,8 @@ let preview = try await workspace.replaceInFiles(
 
 ## Important Behavior
 
-- Session-configurable filesystems like `InMemoryFilesystem` and `MountableFilesystem` should be prepared with `configureForSession()` before use.
+- `InMemoryFilesystem` is ready to use immediately after initialization. Call `reset()` when you explicitly want to clear it.
+- `OverlayFilesystem` snapshots a real root into memory. Call `reload()` when you explicitly want to discard overlay edits and rebuild from disk.
 - `ReadWriteFilesystem` and `OverlayFilesystem` normalize paths and enforce a rooted/jail model.
 - `PermissionedWorkspaceFilesystem` sees normalized virtual paths, not raw user input paths.
 - `walkTree` and `summarizeTree` return stable path ordering, which is useful for deterministic tool output.

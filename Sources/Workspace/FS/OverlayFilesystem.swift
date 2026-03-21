@@ -1,6 +1,6 @@
 import Foundation
 
-public final class OverlayFilesystem: SessionConfigurableFilesystem, @unchecked Sendable {
+public final class OverlayFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     private let fileManager: FileManager
     private let overlay: InMemoryFilesystem
     private var rootURL: URL?
@@ -17,10 +17,10 @@ public final class OverlayFilesystem: SessionConfigurableFilesystem, @unchecked 
 
     public func configure(rootDirectory: URL) throws {
         rootURL = rootDirectory.standardizedFileURL
-        try rebuildOverlay()
+        try reload()
     }
 
-    public func configureForSession() throws {
+    public func reload() throws {
         guard rootURL != nil else {
             throw ShellError.unsupported("overlay filesystem requires rootDirectory")
         }
@@ -88,7 +88,7 @@ public final class OverlayFilesystem: SessionConfigurableFilesystem, @unchecked 
     }
 
     private func rebuildOverlay() throws {
-        try overlay.configureForSession()
+        overlay.reset()
 
         guard let rootURL else {
             return
