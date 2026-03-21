@@ -1,83 +1,109 @@
 import Foundation
 
+/// A disk-backed filesystem rooted in a standard app sandbox location.
 public final class SandboxFilesystem: WorkspaceFilesystem, @unchecked Sendable {
+    /// Supported strategies for choosing the sandbox root.
     public enum Root: Sendable {
+        /// The user's documents directory.
         case documents
+        /// The user's caches directory.
         case caches
+        /// The process temporary directory.
         case temporary
+        /// An app group container identified by its group identifier.
         case appGroup(String)
+        /// A caller-supplied URL inside the app sandbox.
         case url(URL)
     }
 
     private let backing: ReadWriteFilesystem
 
+    /// Creates a sandbox filesystem rooted according to `root`.
     public init(root: Root, fileManager: FileManager = .default) throws {
         backing = ReadWriteFilesystem(fileManager: fileManager)
         let resolvedRoot = try Self.resolveRootURL(root, fileManager: fileManager)
         try backing.configure(rootDirectory: resolvedRoot)
     }
 
+    /// See ``WorkspaceFilesystem/configure(rootDirectory:)``.
     public func configure(rootDirectory: URL) throws {
         try backing.configure(rootDirectory: rootDirectory)
     }
 
-    public func stat(path: String) async throws -> FileInfo {
+    /// See ``WorkspaceFilesystem/stat(path:)``.
+    public func stat(path: WorkspacePath) async throws -> FileInfo {
         try await backing.stat(path: path)
     }
 
-    public func listDirectory(path: String) async throws -> [DirectoryEntry] {
+    /// See ``WorkspaceFilesystem/listDirectory(path:)``.
+    public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         try await backing.listDirectory(path: path)
     }
 
-    public func readFile(path: String) async throws -> Data {
+    /// See ``WorkspaceFilesystem/readFile(path:)``.
+    public func readFile(path: WorkspacePath) async throws -> Data {
         try await backing.readFile(path: path)
     }
 
-    public func writeFile(path: String, data: Data, append: Bool) async throws {
+    /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
+    public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         try await backing.writeFile(path: path, data: data, append: append)
     }
 
-    public func createDirectory(path: String, recursive: Bool) async throws {
+    /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
+    public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
         try await backing.createDirectory(path: path, recursive: recursive)
     }
 
-    public func remove(path: String, recursive: Bool) async throws {
+    /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
+    public func remove(path: WorkspacePath, recursive: Bool) async throws {
         try await backing.remove(path: path, recursive: recursive)
     }
 
-    public func move(from sourcePath: String, to destinationPath: String) async throws {
+    /// See ``WorkspaceFilesystem/move(from:to:)``.
+    public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         try await backing.move(from: sourcePath, to: destinationPath)
     }
 
-    public func copy(from sourcePath: String, to destinationPath: String, recursive: Bool) async throws {
+    /// See ``WorkspaceFilesystem/copy(from:to:recursive:)``.
+    public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
+        async throws
+    {
         try await backing.copy(from: sourcePath, to: destinationPath, recursive: recursive)
     }
 
-    public func createSymlink(path: String, target: String) async throws {
+    /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
+    public func createSymlink(path: WorkspacePath, target: String) async throws {
         try await backing.createSymlink(path: path, target: target)
     }
 
-    public func createHardLink(path: String, target: String) async throws {
+    /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
+    public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         try await backing.createHardLink(path: path, target: target)
     }
 
-    public func readSymlink(path: String) async throws -> String {
+    /// See ``WorkspaceFilesystem/readSymlink(path:)``.
+    public func readSymlink(path: WorkspacePath) async throws -> String {
         try await backing.readSymlink(path: path)
     }
 
-    public func setPermissions(path: String, permissions: Int) async throws {
+    /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
+    public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
         try await backing.setPermissions(path: path, permissions: permissions)
     }
 
-    public func resolveRealPath(path: String) async throws -> String {
+    /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
+    public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await backing.resolveRealPath(path: path)
     }
 
-    public func exists(path: String) async -> Bool {
+    /// See ``WorkspaceFilesystem/exists(path:)``.
+    public func exists(path: WorkspacePath) async -> Bool {
         await backing.exists(path: path)
     }
 
-    public func glob(pattern: String, currentDirectory: String) async throws -> [String] {
+    /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
+    public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try await backing.glob(pattern: pattern, currentDirectory: currentDirectory)
     }
 

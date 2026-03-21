@@ -1,8 +1,15 @@
 import Foundation
 
+/// A disk-backed filesystem rooted at a security-scoped URL.
+///
+/// This adapter is intended for iOS and macOS workflows where filesystem access must be granted through
+/// a bookmark or document picker URL.
 public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sendable {
+    /// The permitted mutability for the scoped filesystem.
     public enum AccessMode: Sendable {
+        /// Only read operations are allowed.
         case readOnly
+        /// Read and write operations are allowed.
         case readWrite
     }
 
@@ -13,6 +20,7 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
     private var cachedBookmarkData: Data?
     private var didStartSecurityScope = false
 
+    /// Creates a filesystem rooted at a security-scoped URL.
     public init(url: URL, mode: AccessMode = .readWrite, fileManager: FileManager = .default) throws {
         self.mode = mode
         backing = ReadWriteFilesystem(fileManager: fileManager)
@@ -21,6 +29,7 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
         try configureBackingForCurrentURL()
     }
 
+    /// Creates a filesystem from previously saved bookmark data.
     public init(bookmarkData: Data, mode: AccessMode = .readWrite, fileManager: FileManager = .default) throws {
         #if os(tvOS) || os(watchOS)
         throw ShellError.unsupported("security-scoped URLs not supported on this platform")
@@ -59,6 +68,7 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
         #endif
     }
 
+    /// Produces bookmark data for the currently scoped URL.
     public func makeBookmarkData() throws -> Data {
         #if os(tvOS) || os(watchOS)
         throw ShellError.unsupported("security-scoped URLs not supported on this platform")
@@ -77,11 +87,13 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
         #endif
     }
 
+    /// Saves bookmark data for later reuse.
     public func saveBookmark(id: String, store: any BookmarkStore) async throws {
         let data = try makeBookmarkData()
         try await store.saveBookmark(data, for: id)
     }
 
+    /// Loads bookmark data from `store` and creates a security-scoped filesystem from it.
     public static func loadBookmark(
         id: String,
         store: any BookmarkStore,
@@ -94,6 +106,7 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
         return try SecurityScopedFilesystem(bookmarkData: data, mode: mode, fileManager: fileManager)
     }
 
+    /// See ``WorkspaceFilesystem/configure(rootDirectory:)``.
     public func configure(rootDirectory: URL) throws {
         stopAccessingSecurityScopeIfNeeded()
         scopedURL = rootDirectory.standardizedFileURL
@@ -101,71 +114,88 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
         try configureBackingForCurrentURL()
     }
 
-    public func stat(path: String) async throws -> FileInfo {
+    /// See ``WorkspaceFilesystem/stat(path:)``.
+    public func stat(path: WorkspacePath) async throws -> FileInfo {
         try await backing.stat(path: path)
     }
 
-    public func listDirectory(path: String) async throws -> [DirectoryEntry] {
+    /// See ``WorkspaceFilesystem/listDirectory(path:)``.
+    public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         try await backing.listDirectory(path: path)
     }
 
-    public func readFile(path: String) async throws -> Data {
+    /// See ``WorkspaceFilesystem/readFile(path:)``.
+    public func readFile(path: WorkspacePath) async throws -> Data {
         try await backing.readFile(path: path)
     }
 
-    public func writeFile(path: String, data: Data, append: Bool) async throws {
+    /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
+    public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         try ensureWritable()
         try await backing.writeFile(path: path, data: data, append: append)
     }
 
-    public func createDirectory(path: String, recursive: Bool) async throws {
+    /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
+    public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
         try ensureWritable()
         try await backing.createDirectory(path: path, recursive: recursive)
     }
 
-    public func remove(path: String, recursive: Bool) async throws {
+    /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
+    public func remove(path: WorkspacePath, recursive: Bool) async throws {
         try ensureWritable()
         try await backing.remove(path: path, recursive: recursive)
     }
 
-    public func move(from sourcePath: String, to destinationPath: String) async throws {
+    /// See ``WorkspaceFilesystem/move(from:to:)``.
+    public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         try ensureWritable()
         try await backing.move(from: sourcePath, to: destinationPath)
     }
 
-    public func copy(from sourcePath: String, to destinationPath: String, recursive: Bool) async throws {
+    /// See ``WorkspaceFilesystem/copy(from:to:recursive:)``.
+    public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
+        async throws
+    {
         try ensureWritable()
         try await backing.copy(from: sourcePath, to: destinationPath, recursive: recursive)
     }
 
-    public func createSymlink(path: String, target: String) async throws {
+    /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
+    public func createSymlink(path: WorkspacePath, target: String) async throws {
         try ensureWritable()
         try await backing.createSymlink(path: path, target: target)
     }
 
-    public func createHardLink(path: String, target: String) async throws {
+    /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
+    public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         try ensureWritable()
         try await backing.createHardLink(path: path, target: target)
     }
 
-    public func readSymlink(path: String) async throws -> String {
+    /// See ``WorkspaceFilesystem/readSymlink(path:)``.
+    public func readSymlink(path: WorkspacePath) async throws -> String {
         try await backing.readSymlink(path: path)
     }
 
-    public func setPermissions(path: String, permissions: Int) async throws {
+    /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
+    public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
         try ensureWritable()
         try await backing.setPermissions(path: path, permissions: permissions)
     }
 
-    public func resolveRealPath(path: String) async throws -> String {
+    /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
+    public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await backing.resolveRealPath(path: path)
     }
 
-    public func exists(path: String) async -> Bool {
+    /// See ``WorkspaceFilesystem/exists(path:)``.
+    public func exists(path: WorkspacePath) async -> Bool {
         await backing.exists(path: path)
     }
 
-    public func glob(pattern: String, currentDirectory: String) async throws -> [String] {
+    /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
+    public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try await backing.glob(pattern: pattern, currentDirectory: currentDirectory)
     }
 

@@ -156,4 +156,136 @@ struct WorkspaceFilesystemTests {
 
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk-updated".utf8))
     }
+
+    @Test("in-memory filesystem handles symlink writes copies moves and configure reset")
+    func inMemoryFilesystemHandlesSymlinkWritesCopiesMovesAndConfigureReset() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.writeFile(path: "/target.txt", data: Data("one".utf8), append: false)
+        try await filesystem.createSymlink(path: "/link.txt", target: "target.txt")
+
+        try await filesystem.writeFile(path: "/link.txt", data: Data("two".utf8), append: false)
+        #expect(try await filesystem.readFile(path: "/target.txt") == Data("two".utf8))
+
+        try await filesystem.copy(from: "/link.txt", to: "/copied-link.txt", recursive: false)
+        #expect(try await filesystem.readSymlink(path: "/copied-link.txt") == "target.txt")
+
+        try await filesystem.createDirectory(path: "/tree/sub", recursive: true)
+        try await filesystem.writeFile(path: "/tree/sub/file.txt", data: Data("nested".utf8), append: false)
+        try await filesystem.copy(from: "/tree", to: "/tree-copy", recursive: true)
+        #expect(try await filesystem.readFile(path: "/tree-copy/sub/file.txt") == Data("nested".utf8))
+
+        try await filesystem.createDirectory(path: "/other", recursive: true)
+        try await filesystem.move(from: "/target.txt", to: "/other/moved.txt")
+        #expect(!(await filesystem.exists(path: "/target.txt")))
+        #expect(try await filesystem.readFile(path: "/other/moved.txt") == Data("two".utf8))
+
+        try filesystem.configure(rootDirectory: URL(fileURLWithPath: "/ignored"))
+        #expect(await filesystem.exists(path: "/"))
+        #expect(!(await filesystem.exists(path: "/other/moved.txt")))
+    }
+
+    @Test("in-memory filesystem reports POSIX errors for invalid operations")
+    func inMemoryFilesystemReportsPOSIXErrorsForInvalidOperations() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.writeFile(path: "/file.txt", data: Data("data".utf8), append: false)
+        try await filesystem.createDirectory(path: "/dir", recursive: true)
+        try await filesystem.writeFile(path: "/dir/child.txt", data: Data("child".utf8), append: false)
+
+        do {
+            _ = try await filesystem.readFile(path: "/dir")
+            Issue.record("expected EISDIR when reading a directory")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EISDIR))
+        }
+
+        do {
+            _ = try await filesystem.listDirectory(path: "/file.txt")
+            Issue.record("expected ENOTDIR when listing a file")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(ENOTDIR))
+        }
+
+        do {
+            try await filesystem.writeFile(path: "/", data: Data(), append: false)
+            Issue.record("expected EISDIR when writing root")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EISDIR))
+        }
+
+        do {
+            try await filesystem.createDirectory(path: "/dir", recursive: false)
+            Issue.record("expected EEXIST for existing directory")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EEXIST))
+        }
+
+        do {
+            try await filesystem.createDirectory(path: "/file.txt/nested", recursive: true)
+            Issue.record("expected ENOTDIR for file parent")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(ENOTDIR))
+        }
+
+        do {
+            try await filesystem.createDirectory(path: "/missing/nested", recursive: false)
+            Issue.record("expected ENOENT for missing intermediate directory")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(ENOENT))
+        }
+
+        do {
+            try await filesystem.remove(path: "/", recursive: true)
+            Issue.record("expected EPERM when removing root")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EPERM))
+        }
+
+        do {
+            try await filesystem.remove(path: "/dir", recursive: false)
+            Issue.record("expected ENOTEMPTY for non-empty directory")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(ENOTEMPTY))
+        }
+
+        try await filesystem.createDirectory(path: "/tree/sub", recursive: true)
+        do {
+            try await filesystem.move(from: "/tree", to: "/tree/sub/nested")
+            Issue.record("expected EINVAL when moving directory into descendant")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EINVAL))
+        }
+
+        do {
+            try await filesystem.copy(from: "/tree", to: "/tree-copy", recursive: false)
+            Issue.record("expected EISDIR for non-recursive directory copy")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EISDIR))
+        }
+
+        do {
+            _ = try await filesystem.readSymlink(path: "/file.txt")
+            Issue.record("expected EINVAL when reading a non-symlink")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EINVAL))
+        }
+
+        do {
+            try await filesystem.createHardLink(path: "/dir-link", target: "/dir")
+            Issue.record("expected EPERM for directory hard link")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EPERM))
+        }
+    }
 }
