@@ -173,7 +173,7 @@ let workspace = Workspace(filesystem: filesystem)
 
 ## Batched Edits
 
-`Workspace` includes a typed edit API for tool-driven mutations:
+`Workspace` includes explicit preview and apply APIs for tool-driven mutations:
 
 ```swift
 let result = try await workspace.applyEdits([
@@ -184,14 +184,24 @@ let result = try await workspace.applyEdits([
 ])
 ```
 
-You can also preview text replacements without mutating files:
+You can preview a batch before executing it:
 
 ```swift
-let preview = try await workspace.replaceInFiles(
-    "/src/*.txt",
-    search: "foo",
-    replacement: "bar",
-    dryRun: true
+let preview = try await workspace.previewEdits([
+    .copy(from: "/docs/guide.txt", to: "/workspace/guide.txt"),
+    .appendFile(path: "/workspace/notes.txt", content: "\nnext")
+])
+```
+
+Text replacements use a request type so scope, include, exclude, and matching strategy live in one value:
+
+```swift
+let preview = try await workspace.previewReplacement(
+    WorkspaceReplaceRequest(
+        pattern: "/src/*.txt",
+        search: .literal("foo"),
+        replacement: "bar"
+    )
 )
 ```
 
@@ -206,7 +216,7 @@ let preview = try await workspace.replaceInFiles(
 ## Limitations
 
 - `Workspace` is not a hardened sandbox.
-- `applyEdits` and `replaceInFiles` use best-effort logical rollback, not atomic transactions.
+- `applyEdits` and `applyReplacement` use logical rollback when `failurePolicy` is `.rollback`; other policies may leave partial changes in place.
 - Rollback is not crash-safe and does not coordinate with external processes.
 - `OverlayFilesystem` does not persist writes back to the original root.
 - Hard links across mounts are not supported.

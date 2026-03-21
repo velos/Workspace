@@ -30,8 +30,8 @@ struct WorkspaceMountingTests {
         #expect(!(await workspace.exists("/workspace-b/note.txt")))
     }
 
-    @Test("dry run batch edits preview mounted changes without mutating")
-    func dryRunBatchEditsPreviewMountedChangesWithoutMutating() async throws {
+    @Test("previewEdits previews mounted changes without mutating")
+    func previewEditsPreviewMountedChangesWithoutMutating() async throws {
         let memory = InMemoryFilesystem()
 
         let workspaceRoot = InMemoryFilesystem()
@@ -46,16 +46,15 @@ struct WorkspaceMountingTests {
         try await memory.writeFile(path: "/shared.txt", data: Data("memo".utf8), append: false)
 
         let workspace = Workspace(filesystem: mountable)
-        let result = try await workspace.applyEdits(
+        let result = try await workspace.previewEdits(
             [
                 .copy(from: "/memory/shared.txt", to: "/workspace/shared.txt"),
                 .appendFile(path: "/memory/shared.txt", content: "!"),
-            ],
-            dryRun: true
+            ]
         )
 
-        #expect(result.dryRun)
-        #expect(result.edits.map(\.operation) == ["copy", "appendFile"])
+        #expect(result.mode == .preview)
+        #expect(result.edits.map(\.operation) == [.copy, .appendFile])
         #expect(!(await workspace.exists("/workspace/shared.txt")))
         #expect(try await workspace.readFile("/memory/shared.txt") == "memo")
     }

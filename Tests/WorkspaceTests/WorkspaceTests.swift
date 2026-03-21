@@ -156,23 +156,25 @@ struct WorkspaceTests {
         #expect(summary.directoryCount == 2)
     }
 
-    @Test("replaceInFiles dry run previews without mutating files")
-    func replaceInFilesDryRunPreviewsWithoutMutatingFiles() async throws {
+    @Test("previewReplacement previews without mutating files")
+    func previewReplacementPreviewsWithoutMutatingFiles() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/src", recursive: true)
         try await fs.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
         try await fs.writeFile(path: "/src/b.txt", data: Data("foo bar".utf8), append: false)
         let state = Workspace(filesystem: fs)
 
-        let result = try await state.replaceInFiles("/src/*.txt", search: "foo", replacement: "baz", dryRun: true)
-        #expect(result.dryRun)
+        let result = try await state.previewReplacement(
+            WorkspaceReplaceRequest(pattern: "/src/*.txt", search: "foo", replacement: "baz")
+        )
+        #expect(result.mode == .preview)
         #expect(result.touchedPaths == ["/src/a.txt", "/src/b.txt"])
         #expect(result.changes.map(\.updatedContent) == ["baz", "baz bar"])
         #expect(try await state.readFile("/src/a.txt") == "foo")
     }
 
-    @Test("replaceInFiles rolls back on write failure")
-    func replaceInFilesRollsBackOnWriteFailure() async throws {
+    @Test("applyReplacement rolls back on write failure")
+    func applyReplacementRollsBackOnWriteFailure() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/src", recursive: true)
         try await base.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
@@ -182,9 +184,37 @@ struct WorkspaceTests {
             filesystem: FailOnceFilesystem(base: base, failingWritePaths: ["/src/b.txt"])
         )
 
-        let result = try await state.replaceInFiles("/src/*.txt", search: "foo", replacement: "bar")
+        let result = try await state.applyReplacement(
+            WorkspaceReplaceRequest(pattern: "/src/*.txt", search: "foo", replacement: "bar"),
+            failurePolicy: .rollback
+        )
         #expect(result.rolledBack)
+        #expect(result.failures.count == 1)
+        #expect(result.failures.first?.path == "/src/b.txt")
         #expect(try await base.readFile(path: "/src/a.txt") == Data("foo".utf8))
+        #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
+    }
+
+    @Test("applyReplacement best effort reports failures without rollback")
+    func applyReplacementBestEffortReportsFailuresWithoutRollback() async throws {
+        let base = InMemoryFilesystem()
+        try await base.createDirectory(path: "/src", recursive: true)
+        try await base.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
+        try await base.writeFile(path: "/src/b.txt", data: Data("foo".utf8), append: false)
+
+        let state = Workspace(
+            filesystem: FailOnceFilesystem(base: base, failingWritePaths: ["/src/b.txt"])
+        )
+
+        let result = try await state.applyReplacement(
+            WorkspaceReplaceRequest(pattern: "/src/*.txt", search: .regularExpression("f.o"), replacement: "bar"),
+            failurePolicy: .bestEffort
+        )
+
+        #expect(!result.rolledBack)
+        #expect(result.failures.count == 1)
+        #expect(result.failures.first?.path == "/src/b.txt")
+        #expect(try await base.readFile(path: "/src/a.txt") == Data("bar".utf8))
         #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
     }
 
@@ -202,6 +232,7 @@ struct WorkspaceTests {
         ])
 
         #expect(!result.rolledBack)
+        #expect(result.mode == .execution)
         #expect(result.touchedPaths == ["/src"])
         #expect(try await state.readFile("/src/a.txt") == "one two")
         #expect(try await state.readFile("/src/c.txt") == "one two")
@@ -221,6 +252,8 @@ struct WorkspaceTests {
         ])
 
         #expect(result.rolledBack)
+        #expect(result.failures.count == 1)
+        #expect(result.failures.first?.index == 1)
         #expect(try await base.readFile(path: "/a.txt") == Data("old".utf8))
         let bExists = await base.exists(path: "/b.txt")
         #expect(!bExists)

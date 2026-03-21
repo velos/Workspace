@@ -139,7 +139,97 @@ public struct WorkspaceTreeSummary: Sendable {
     }
 }
 
-/// A single text replacement result produced by ``Workspace/replaceInFiles(_:search:replacement:dryRun:rollbackOnError:)``.
+/// Whether a workspace mutation was previewed or executed.
+public enum WorkspaceMutationMode: String, Sendable, Codable {
+    /// The workspace mutation was only previewed.
+    case preview
+    /// The workspace mutation was executed against the backing filesystem.
+    case execution
+}
+
+/// The failure handling strategy used when applying a workspace mutation.
+public enum WorkspaceMutationFailurePolicy: String, Sendable, Codable {
+    /// Restore the original state when any execution step fails.
+    case rollback
+    /// Stop at the first failure and leave any already-applied changes in place.
+    case failFast
+    /// Continue after failures and report all failed steps.
+    case bestEffort
+}
+
+/// The text matching strategy used by a replacement request.
+public enum WorkspaceSearchPattern: Sendable, Equatable {
+    /// Match a literal substring.
+    case literal(String, caseSensitive: Bool = true)
+    /// Match a regular expression pattern using Foundation regular expression syntax.
+    case regularExpression(String)
+}
+
+/// A request describing a multi-file text replacement operation.
+public struct WorkspaceReplaceRequest: Sendable, Equatable {
+    /// The base directory used to resolve relative include and exclude patterns.
+    public var scope: WorkspacePath
+    /// Glob patterns selecting candidate files.
+    public var include: [String]
+    /// Glob patterns removed from the include set after expansion.
+    public var exclude: [String]
+    /// The text matching strategy to apply to each candidate file.
+    public var search: WorkspaceSearchPattern
+    /// The replacement string or regular expression template.
+    public var replacement: String
+
+    /// Creates a replacement request.
+    public init(
+        scope: WorkspacePath = .root,
+        include: [String],
+        exclude: [String] = [],
+        search: WorkspaceSearchPattern,
+        replacement: String
+    ) {
+        self.scope = scope
+        self.include = include
+        self.exclude = exclude
+        self.search = search
+        self.replacement = replacement
+    }
+
+    /// Creates a replacement request for a single include pattern and a literal search term.
+    public init(
+        pattern: String,
+        search: String,
+        replacement: String,
+        scope: WorkspacePath = .root,
+        exclude: [String] = []
+    ) {
+        self.init(
+            scope: scope,
+            include: [pattern],
+            exclude: exclude,
+            search: .literal(search),
+            replacement: replacement
+        )
+    }
+
+    /// Creates a replacement request for a single include pattern.
+    public init(
+        pattern: String,
+        search: WorkspaceSearchPattern,
+        replacement: String,
+        scope: WorkspacePath = .root,
+        exclude: [String] = []
+    ) {
+        self.init(
+            scope: scope,
+            include: [pattern],
+            exclude: exclude,
+            search: search,
+            replacement: replacement
+        )
+    }
+}
+
+/// A single text replacement result produced by ``Workspace/previewReplacement(_:)`` or
+/// ``Workspace/applyReplacement(_:failurePolicy:)``.
 public struct WorkspaceTextChange: Sendable {
     /// The file path that was changed.
     public var path: WorkspacePath
@@ -171,31 +261,35 @@ public struct WorkspaceTextChange: Sendable {
 
 /// The result of a multi-file text replacement operation.
 public struct WorkspaceReplaceResult: Sendable {
-    /// Whether the operation only previewed changes.
-    public var dryRun: Bool
+    /// Whether the operation was previewed or executed.
+    public var mode: WorkspaceMutationMode
     /// The distinct paths touched by the operation.
     public var touchedPaths: [WorkspacePath]
     /// Per-file change details.
     public var changes: [WorkspaceTextChange]
+    /// Execution failures encountered while applying the replacement.
+    public var failures: [WorkspaceReplaceFailure]
     /// Whether the operation rolled back after an error.
     public var rolledBack: Bool
 
     /// Creates a replacement result.
     public init(
-        dryRun: Bool,
+        mode: WorkspaceMutationMode,
         touchedPaths: [WorkspacePath],
         changes: [WorkspaceTextChange],
+        failures: [WorkspaceReplaceFailure] = [],
         rolledBack: Bool
     ) {
-        self.dryRun = dryRun
+        self.mode = mode
         self.touchedPaths = touchedPaths
         self.changes = changes
+        self.failures = failures
         self.rolledBack = rolledBack
     }
 }
 
 /// A filesystem edit that can be applied as part of a batch.
-public enum WorkspaceEdit: Sendable {
+public enum WorkspaceEdit: Sendable, Equatable {
     /// Writes UTF-8 content to a file, replacing any existing contents.
     case writeFile(path: WorkspacePath, content: String)
     /// Appends UTF-8 content to a file.
@@ -210,10 +304,44 @@ public enum WorkspaceEdit: Sendable {
     case copy(from: WorkspacePath, to: WorkspacePath, recursive: Bool = true)
 }
 
+/// The requested operation type for a batch edit entry.
+public enum WorkspaceBatchEditOperation: String, Sendable, Codable {
+    /// A file write that replaces the destination contents.
+    case writeFile
+    /// A file write that appends to the destination contents.
+    case appendFile
+    /// A delete operation.
+    case delete
+    /// A directory creation operation.
+    case createDirectory
+    /// A move or rename operation.
+    case move
+    /// A copy operation.
+    case copy
+}
+
+/// The predicted or observed effect of a batch edit entry.
+public enum WorkspaceBatchEditEffect: String, Sendable, Codable {
+    /// The operation creates a new entry.
+    case created
+    /// The operation changes an existing entry.
+    case modified
+    /// The operation removes an existing entry.
+    case deleted
+    /// The operation moves an entry to a new path.
+    case moved
+    /// The operation copies an entry to a new path.
+    case copied
+    /// The operation leaves the filesystem unchanged.
+    case unchanged
+}
+
 /// A preview or result entry for a single batch edit operation.
 public struct WorkspaceBatchEditEntry: Sendable {
-    /// The operation name.
-    public var operation: String
+    /// The requested operation.
+    public var operation: WorkspaceBatchEditOperation
+    /// The predicted or observed effect of the operation.
+    public var effect: WorkspaceBatchEditEffect
     /// Paths touched by the edit.
     public var touchedPaths: [WorkspacePath]
     /// The original file contents when relevant.
@@ -223,39 +351,76 @@ public struct WorkspaceBatchEditEntry: Sendable {
 
     /// Creates a batch edit entry.
     public init(
-        operation: String,
+        operation: WorkspaceBatchEditOperation,
+        effect: WorkspaceBatchEditEffect,
         touchedPaths: [WorkspacePath],
         originalContent: String? = nil,
         updatedContent: String? = nil
     ) {
         self.operation = operation
+        self.effect = effect
         self.touchedPaths = touchedPaths
         self.originalContent = originalContent
         self.updatedContent = updatedContent
     }
 }
 
+/// A failure encountered while executing a single replacement write.
+public struct WorkspaceReplaceFailure: Sendable {
+    /// The path whose replacement write failed.
+    public var path: WorkspacePath
+    /// A human-readable failure message.
+    public var message: String
+
+    /// Creates a replacement failure.
+    public init(path: WorkspacePath, message: String) {
+        self.path = path
+        self.message = message
+    }
+}
+
+/// A failure encountered while executing a single batch edit.
+public struct WorkspaceBatchEditFailure: Sendable {
+    /// The index of the failed edit in the original request.
+    public var index: Int
+    /// The edit that failed.
+    public var edit: WorkspaceEdit
+    /// A human-readable failure message.
+    public var message: String
+
+    /// Creates a batch edit failure.
+    public init(index: Int, edit: WorkspaceEdit, message: String) {
+        self.index = index
+        self.edit = edit
+        self.message = message
+    }
+}
+
 /// The result of applying a batch of workspace edits.
 public struct WorkspaceBatchEditResult: Sendable {
-    /// Whether the operation only previewed changes.
-    public var dryRun: Bool
+    /// Whether the operation was previewed or executed.
+    public var mode: WorkspaceMutationMode
     /// Canonicalized paths touched by the batch.
     public var touchedPaths: [WorkspacePath]
     /// Per-edit preview or result entries.
     public var edits: [WorkspaceBatchEditEntry]
+    /// Execution failures encountered while applying the batch.
+    public var failures: [WorkspaceBatchEditFailure]
     /// Whether the batch rolled back after an error.
     public var rolledBack: Bool
 
     /// Creates a batch edit result.
     public init(
-        dryRun: Bool,
+        mode: WorkspaceMutationMode,
         touchedPaths: [WorkspacePath],
         edits: [WorkspaceBatchEditEntry],
+        failures: [WorkspaceBatchEditFailure] = [],
         rolledBack: Bool
     ) {
-        self.dryRun = dryRun
+        self.mode = mode
         self.touchedPaths = touchedPaths
         self.edits = edits
+        self.failures = failures
         self.rolledBack = rolledBack
     }
 }
@@ -467,139 +632,167 @@ public actor Workspace {
         try await summarizeTree(WorkspacePath(validating: path), maxDepth: maxDepth)
     }
 
-    /// Replaces text across all files matching `pattern`.
-    ///
-    /// - Parameters:
-    ///   - pattern: A glob pattern used to select candidate files.
-    ///   - search: The substring to replace.
-    ///   - replacement: The replacement text.
-    ///   - dryRun: When `true`, returns a preview without writing changes.
-    ///   - rollbackOnError: When `true`, restores prior contents if a later write fails.
-    public func replaceInFiles(
-        _ pattern: String,
-        search: String,
-        replacement: String,
-        dryRun: Bool = false,
-        rollbackOnError: Bool = true
-    ) async throws -> WorkspaceReplaceResult {
-        let paths = try await filesystem.glob(pattern: pattern, currentDirectory: "/").sorted()
-        var changes: [WorkspaceTextChange] = []
-
-        for path in paths {
-            guard let originalContent = try await readUTF8IfPresent(path) else {
-                continue
-            }
-            let replacedCount = originalContent.components(separatedBy: search).count - 1
-            guard replacedCount > 0 else {
-                continue
-            }
-
-            let updatedContent = originalContent.replacingOccurrences(of: search, with: replacement)
-            changes.append(
-                WorkspaceTextChange(
-                    path: path,
-                    replacements: replacedCount,
-                    originalContent: originalContent,
-                    updatedContent: updatedContent
-                )
-            )
-        }
-
-        guard !dryRun, !changes.isEmpty else {
-            return WorkspaceReplaceResult(
-                dryRun: dryRun,
-                touchedPaths: changes.map(\.path),
-                changes: changes,
-                rolledBack: false
-            )
-        }
-
-        let snapshots = try await snapshotPaths(changes.map(\.path))
-        do {
-            for change in changes {
-                try await filesystem.writeFile(
-                    path: change.path,
-                    data: Data(change.updatedContent.utf8),
-                    append: false
-                )
-            }
-            return WorkspaceReplaceResult(
-                dryRun: false,
-                touchedPaths: changes.map(\.path),
-                changes: changes,
-                rolledBack: false
-            )
-        } catch {
-            guard rollbackOnError else {
-                throw error
-            }
-
-            try await rollback(snapshots)
-            return WorkspaceReplaceResult(
-                dryRun: false,
-                touchedPaths: changes.map(\.path),
-                changes: changes,
-                rolledBack: true
-            )
-        }
+    /// Returns a preview of a replacement request without mutating the workspace.
+    public func previewReplacement(_ request: WorkspaceReplaceRequest) async throws -> WorkspaceReplaceResult {
+        let normalizedRequest = normalize(request: request)
+        let changes = try await replacementChanges(for: normalizedRequest)
+        return WorkspaceReplaceResult(
+            mode: .preview,
+            touchedPaths: canonicalizedTouchedPaths(for: changes),
+            changes: changes,
+            rolledBack: false
+        )
     }
 
-    /// Applies a batch of filesystem edits as a unit.
+    /// Applies a replacement request across matching files.
     ///
     /// - Parameters:
-    ///   - edits: The edits to preview or apply.
-    ///   - dryRun: When `true`, returns a preview without mutating the filesystem.
-    ///   - rollbackOnError: When `true`, restores the previous state if a later edit fails.
+    ///   - request: The replacement request to execute.
+    ///   - failurePolicy: The behavior to use when a write fails.
+    public func applyReplacement(
+        _ request: WorkspaceReplaceRequest,
+        failurePolicy: WorkspaceMutationFailurePolicy = .rollback
+    ) async throws -> WorkspaceReplaceResult {
+        let normalizedRequest = normalize(request: request)
+        let changes = try await replacementChanges(for: normalizedRequest)
+        let touchedPaths = canonicalizedTouchedPaths(for: changes)
+
+        guard !changes.isEmpty else {
+            return WorkspaceReplaceResult(
+                mode: .execution,
+                touchedPaths: touchedPaths,
+                changes: changes,
+                rolledBack: false
+            )
+        }
+
+        let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
+        var failures: [WorkspaceReplaceFailure] = []
+
+        for change in changes {
+            do {
+                try await write(change: change)
+            } catch {
+                let failure = WorkspaceReplaceFailure(path: change.path, message: describe(error))
+                if failurePolicy == .rollback {
+                    try await rollback(snapshots)
+                    return WorkspaceReplaceResult(
+                        mode: .execution,
+                        touchedPaths: touchedPaths,
+                        changes: changes,
+                        failures: [failure],
+                        rolledBack: true
+                    )
+                }
+
+                failures.append(failure)
+                if failurePolicy == .failFast {
+                    break
+                }
+            }
+        }
+
+        return WorkspaceReplaceResult(
+            mode: .execution,
+            touchedPaths: touchedPaths,
+            changes: changes,
+            failures: failures,
+            rolledBack: false
+        )
+    }
+
+    /// Returns a preview of a batch edit request without mutating the workspace.
+    public func previewEdits(_ edits: [WorkspaceEdit]) async throws -> WorkspaceBatchEditResult {
+        let normalizedEdits = edits.map(normalize(edit:))
+        return WorkspaceBatchEditResult(
+            mode: .preview,
+            touchedPaths: canonicalizedTouchedPaths(for: normalizedEdits),
+            edits: try await previewEntries(for: normalizedEdits),
+            rolledBack: false
+        )
+    }
+
+    /// Applies a batch of filesystem edits.
+    ///
+    /// - Parameters:
+    ///   - edits: The edits to execute.
+    ///   - failurePolicy: The behavior to use when an edit fails.
     public func applyEdits(
         _ edits: [WorkspaceEdit],
-        dryRun: Bool = false,
-        rollbackOnError: Bool = true
+        failurePolicy: WorkspaceMutationFailurePolicy = .rollback
     ) async throws -> WorkspaceBatchEditResult {
         let normalizedEdits = edits.map(normalize(edit:))
         let touchedPaths = canonicalizedTouchedPaths(for: normalizedEdits)
         let previewEntries = try await previewEntries(for: normalizedEdits)
 
-        guard !dryRun, !normalizedEdits.isEmpty else {
+        guard !normalizedEdits.isEmpty else {
             return WorkspaceBatchEditResult(
-                dryRun: dryRun,
+                mode: .execution,
                 touchedPaths: touchedPaths,
                 edits: previewEntries,
                 rolledBack: false
             )
         }
 
-        let snapshots = try await snapshotPaths(touchedPaths)
-        do {
-            for edit in normalizedEdits {
+        let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
+        var failures: [WorkspaceBatchEditFailure] = []
+
+        for (index, edit) in normalizedEdits.enumerated() {
+            do {
                 try await apply(edit)
-            }
-            return WorkspaceBatchEditResult(
-                dryRun: false,
-                touchedPaths: touchedPaths,
-                edits: previewEntries,
-                rolledBack: false
-            )
-        } catch {
-            guard rollbackOnError else {
-                throw error
-            }
+            } catch {
+                let failure = WorkspaceBatchEditFailure(
+                    index: index,
+                    edit: edit,
+                    message: describe(error)
+                )
+                if failurePolicy == .rollback {
+                    try await rollback(snapshots)
+                    return WorkspaceBatchEditResult(
+                        mode: .execution,
+                        touchedPaths: touchedPaths,
+                        edits: previewEntries,
+                        failures: [failure],
+                        rolledBack: true
+                    )
+                }
 
-            try await rollback(snapshots)
-            return WorkspaceBatchEditResult(
-                dryRun: false,
-                touchedPaths: touchedPaths,
-                edits: previewEntries,
-                rolledBack: true
-            )
+                failures.append(failure)
+                if failurePolicy == .failFast {
+                    break
+                }
+            }
         }
+
+        return WorkspaceBatchEditResult(
+            mode: .execution,
+            touchedPaths: touchedPaths,
+            edits: previewEntries,
+            failures: failures,
+            rolledBack: false
+        )
     }
 
     private func normalize(_ path: WorkspacePath) -> WorkspacePath {
         WorkspacePath(normalizing: path.string)
     }
 
+    private func normalize(request: WorkspaceReplaceRequest) -> WorkspaceReplaceRequest {
+        WorkspaceReplaceRequest(
+            scope: normalize(request.scope),
+            include: request.include,
+            exclude: request.exclude,
+            search: request.search,
+            replacement: request.replacement
+        )
+    }
+
     private func readUTF8IfPresent(_ path: WorkspacePath) async throws -> String? {
         guard await filesystem.exists(path: path) else {
+            return nil
+        }
+        let info = try await filesystem.stat(path: path)
+        guard !info.isDirectory else {
             return nil
         }
         let data = try await filesystem.readFile(path: path)
@@ -721,6 +914,10 @@ public actor Workspace {
         }
     }
 
+    private func canonicalizedTouchedPaths(for changes: [WorkspaceTextChange]) -> [WorkspacePath] {
+        Array(Set(changes.map(\.path))).sorted()
+    }
+
     private func canonicalizedTouchedPaths(for edits: [WorkspaceEdit]) -> [WorkspacePath] {
         let paths = Set(edits.flatMap(touchedPaths(for:)))
         return paths.sorted().filter { candidate in
@@ -730,40 +927,192 @@ public actor Workspace {
         }
     }
 
+    private func statIfPresent(_ path: WorkspacePath) async throws -> FileInfo? {
+        guard await filesystem.exists(path: path) else {
+            return nil
+        }
+        return try await filesystem.stat(path: path)
+    }
+
+    private func replacementChanges(for request: WorkspaceReplaceRequest) async throws -> [WorkspaceTextChange] {
+        let paths = try await matchedPaths(for: request)
+        var changes: [WorkspaceTextChange] = []
+
+        for path in paths {
+            guard let originalContent = try await readUTF8IfPresent(path) else {
+                continue
+            }
+
+            let replacement = try replacement(
+                in: originalContent,
+                matching: request.search,
+                replacement: request.replacement
+            )
+            guard replacement.count > 0 else {
+                continue
+            }
+
+            changes.append(
+                WorkspaceTextChange(
+                    path: path,
+                    replacements: replacement.count,
+                    originalContent: originalContent,
+                    updatedContent: replacement.updatedContent
+                )
+            )
+        }
+
+        return changes
+    }
+
+    private func matchedPaths(for request: WorkspaceReplaceRequest) async throws -> [WorkspacePath] {
+        let included = try await expandedPaths(for: request.include, currentDirectory: request.scope)
+        guard !included.isEmpty else {
+            return []
+        }
+
+        let excluded = Set(try await expandedPaths(for: request.exclude, currentDirectory: request.scope))
+        return included.filter { !excluded.contains($0) }
+    }
+
+    private func expandedPaths(
+        for patterns: [String],
+        currentDirectory: WorkspacePath
+    ) async throws -> [WorkspacePath] {
+        var matched: Set<WorkspacePath> = []
+        for pattern in patterns {
+            let paths = try await filesystem.glob(pattern: pattern, currentDirectory: currentDirectory)
+            matched.formUnion(paths)
+        }
+        return matched.sorted()
+    }
+
+    private func replacement(
+        in content: String,
+        matching pattern: WorkspaceSearchPattern,
+        replacement: String
+    ) throws -> (count: Int, updatedContent: String) {
+        switch pattern {
+        case let .literal(search, caseSensitive):
+            guard !search.isEmpty else {
+                throw WorkspaceError.unsupported("search pattern must not be empty")
+            }
+
+            if caseSensitive {
+                let count = content.components(separatedBy: search).count - 1
+                let updated = content.replacingOccurrences(of: search, with: replacement)
+                return (count, updated)
+            }
+
+            let regex = try NSRegularExpression(
+                pattern: NSRegularExpression.escapedPattern(for: search),
+                options: [.caseInsensitive]
+            )
+            let range = NSRange(content.startIndex..<content.endIndex, in: content)
+            return (
+                regex.numberOfMatches(in: content, range: range),
+                regex.stringByReplacingMatches(
+                    in: content,
+                    range: range,
+                    withTemplate: NSRegularExpression.escapedTemplate(for: replacement)
+                )
+            )
+        case let .regularExpression(expression):
+            guard !expression.isEmpty else {
+                throw WorkspaceError.unsupported("search pattern must not be empty")
+            }
+
+            let regex = try NSRegularExpression(pattern: expression)
+            let range = NSRange(content.startIndex..<content.endIndex, in: content)
+            return (
+                regex.numberOfMatches(in: content, range: range),
+                regex.stringByReplacingMatches(
+                    in: content,
+                    range: range,
+                    withTemplate: replacement
+                )
+            )
+        }
+    }
+
     private func previewEntries(for edits: [WorkspaceEdit]) async throws -> [WorkspaceBatchEditEntry] {
         var entries: [WorkspaceBatchEditEntry] = []
         for edit in edits {
             switch edit {
             case let .writeFile(path, content):
+                let original = try await readUTF8IfPresent(path)
                 entries.append(
                     WorkspaceBatchEditEntry(
-                        operation: "writeFile",
+                        operation: .writeFile,
+                        effect: effect(forOriginalContent: original, updatedContent: content),
                         touchedPaths: [path],
-                        originalContent: try await readUTF8IfPresent(path),
+                        originalContent: original,
                         updatedContent: content
                     )
                 )
             case let .appendFile(path, content):
                 let original = try await readUTF8IfPresent(path)
+                let updated = (original ?? "") + content
                 entries.append(
                     WorkspaceBatchEditEntry(
-                        operation: "appendFile",
+                        operation: .appendFile,
+                        effect: effect(forOriginalContent: original, updatedContent: updated),
                         touchedPaths: [path],
                         originalContent: original,
-                        updatedContent: (original ?? "") + content
+                        updatedContent: updated
                     )
                 )
             case let .delete(path, _):
-                entries.append(WorkspaceBatchEditEntry(operation: "delete", touchedPaths: [path]))
+                entries.append(
+                    WorkspaceBatchEditEntry(
+                        operation: .delete,
+                        effect: await filesystem.exists(path: path) ? .deleted : .unchanged,
+                        touchedPaths: [path]
+                    )
+                )
             case let .createDirectory(path, _):
-                entries.append(WorkspaceBatchEditEntry(operation: "createDirectory", touchedPaths: [path]))
+                let existing = try await statIfPresent(path)
+                entries.append(
+                    WorkspaceBatchEditEntry(
+                        operation: .createDirectory,
+                        effect: existing == nil ? .created : .unchanged,
+                        touchedPaths: [path]
+                    )
+                )
             case let .move(from, to):
-                entries.append(WorkspaceBatchEditEntry(operation: "move", touchedPaths: [from, to]))
+                entries.append(
+                    WorkspaceBatchEditEntry(
+                        operation: .move,
+                        effect: from == to ? .unchanged : .moved,
+                        touchedPaths: [from, to]
+                    )
+                )
             case let .copy(from, to, _):
-                entries.append(WorkspaceBatchEditEntry(operation: "copy", touchedPaths: [from, to]))
+                entries.append(
+                    WorkspaceBatchEditEntry(
+                        operation: .copy,
+                        effect: .copied,
+                        touchedPaths: [from, to]
+                    )
+                )
             }
         }
         return entries
+    }
+
+    private func effect(forOriginalContent originalContent: String?, updatedContent: String) -> WorkspaceBatchEditEffect {
+        guard let originalContent else {
+            return .created
+        }
+        return originalContent == updatedContent ? .unchanged : .modified
+    }
+
+    private func write(change: WorkspaceTextChange) async throws {
+        try await filesystem.writeFile(
+            path: change.path,
+            data: Data(change.updatedContent.utf8),
+            append: false
+        )
     }
 
     private func apply(_ edit: WorkspaceEdit) async throws {
@@ -781,6 +1130,13 @@ public actor Workspace {
         case let .copy(from, to, recursive):
             try await filesystem.copy(from: from, to: to, recursive: recursive)
         }
+    }
+
+    private func describe(_ error: any Error) -> String {
+        if let error = error as? WorkspaceError {
+            return error.description
+        }
+        return String(describing: error)
     }
 
     private enum SnapshotEntry: Sendable {
