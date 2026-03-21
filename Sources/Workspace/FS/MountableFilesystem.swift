@@ -258,13 +258,13 @@ public final class MountableFilesystem: WorkspaceFilesystem, @unchecked Sendable
 
     /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
-        let normalizedPattern = PathUtils.normalize(path: pattern, currentDirectory: currentDirectory.string)
-        if !PathUtils.containsGlob(normalizedPattern) {
+        let normalizedPattern = WorkspacePath.normalize(path: pattern, currentDirectory: currentDirectory.string)
+        if !WorkspacePath.containsGlob(normalizedPattern) {
             let normalizedPath = WorkspacePath(normalizing: normalizedPattern)
             return await exists(path: normalizedPath) ? [normalizedPath] : []
         }
 
-        let regex = try NSRegularExpression(pattern: PathUtils.globToRegex(normalizedPattern))
+        let regex = try NSRegularExpression(pattern: WorkspacePath.globToRegex(normalizedPattern))
         let paths = try await allPaths()
         return paths.filter { path in
             let range = NSRange(path.string.startIndex..<path.string.endIndex, in: path.string)

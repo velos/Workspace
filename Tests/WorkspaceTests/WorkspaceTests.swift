@@ -94,6 +94,85 @@ private final class FailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable
     }
 }
 
+private final class NSErrorFailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable {
+    private let base: any WorkspaceFilesystem
+    private let failingWritePaths: Set<WorkspacePath>
+    private var failedWritePaths: Set<WorkspacePath> = []
+
+    init(base: any WorkspaceFilesystem, failingWritePaths: Set<WorkspacePath>) {
+        self.base = base
+        self.failingWritePaths = failingWritePaths
+    }
+
+    func configure(rootDirectory: URL) throws {
+        try base.configure(rootDirectory: rootDirectory)
+    }
+
+    func stat(path: WorkspacePath) async throws -> FileInfo {
+        try await base.stat(path: path)
+    }
+
+    func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
+        try await base.listDirectory(path: path)
+    }
+
+    func readFile(path: WorkspacePath) async throws -> Data {
+        try await base.readFile(path: path)
+    }
+
+    func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
+        if failingWritePaths.contains(path), !failedWritePaths.contains(path) {
+            failedWritePaths.insert(path)
+            throw NSError(domain: "WorkspaceTests", code: 42, userInfo: [NSLocalizedDescriptionKey: "forced NSError write failure"])
+        }
+        try await base.writeFile(path: path, data: data, append: append)
+    }
+
+    func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
+        try await base.createDirectory(path: path, recursive: recursive)
+    }
+
+    func remove(path: WorkspacePath, recursive: Bool) async throws {
+        try await base.remove(path: path, recursive: recursive)
+    }
+
+    func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
+        try await base.move(from: sourcePath, to: destinationPath)
+    }
+
+    func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws {
+        try await base.copy(from: sourcePath, to: destinationPath, recursive: recursive)
+    }
+
+    func createSymlink(path: WorkspacePath, target: String) async throws {
+        try await base.createSymlink(path: path, target: target)
+    }
+
+    func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
+        try await base.createHardLink(path: path, target: target)
+    }
+
+    func readSymlink(path: WorkspacePath) async throws -> String {
+        try await base.readSymlink(path: path)
+    }
+
+    func setPermissions(path: WorkspacePath, permissions: Int) async throws {
+        try await base.setPermissions(path: path, permissions: permissions)
+    }
+
+    func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
+        try await base.resolveRealPath(path: path)
+    }
+
+    func exists(path: WorkspacePath) async -> Bool {
+        await base.exists(path: path)
+    }
+
+    func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
+        try await base.glob(pattern: pattern, currentDirectory: currentDirectory)
+    }
+}
+
 private struct DemoConfig: Codable, Equatable, Sendable {
     var name: String
     var enabled: Bool
@@ -154,6 +233,23 @@ struct WorkspaceTests {
         #expect(summary.children.map(\.path) == ["/src/a.txt", "/src/b.txt", "/src/nested"])
         #expect(summary.fileCount == 2)
         #expect(summary.directoryCount == 2)
+    }
+
+    @Test("walkTree and summarizeTree report symlink kinds")
+    func walkTreeAndSummarizeTreeReportSymlinkKinds() async throws {
+        let fs = InMemoryFilesystem()
+        try await fs.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
+        try await fs.createSymlink(path: "/alias.txt", target: "note.txt")
+        let state = Workspace(filesystem: fs)
+
+        let tree = try await state.walkTree("/")
+        let alias = try #require(tree.children?.first(where: { $0.path == "/alias.txt" }))
+        #expect(alias.kind == .symlink)
+
+        let summary = try await state.summarizeTree("/")
+        let aliasSummary = try #require(summary.children.first(where: { $0.path == "/alias.txt" }))
+        #expect(aliasSummary.kind == .symlink)
+        #expect(summary.symlinkCount == 1)
     }
 
     @Test("previewReplacement previews without mutating files")
@@ -218,6 +314,117 @@ struct WorkspaceTests {
         #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
     }
 
+    @Test("applyReplacement fail-fast stops after the first failure")
+    func applyReplacementFailFastStopsAfterTheFirstFailure() async throws {
+        let base = InMemoryFilesystem()
+        try await base.createDirectory(path: "/src", recursive: true)
+        try await base.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
+        try await base.writeFile(path: "/src/b.txt", data: Data("foo".utf8), append: false)
+        try await base.writeFile(path: "/src/c.txt", data: Data("foo".utf8), append: false)
+
+        let state = Workspace(
+            filesystem: NSErrorFailOnceFilesystem(base: base, failingWritePaths: ["/src/b.txt"])
+        )
+
+        let result = try await state.applyReplacement(
+            WorkspaceReplaceRequest(pattern: "/src/*.txt", search: "foo", replacement: "bar"),
+            failurePolicy: .failFast
+        )
+
+        #expect(!result.rolledBack)
+        #expect(result.failures.count == 1)
+        #expect(result.failures.first?.path == "/src/b.txt")
+        #expect(result.failures.first?.message.contains("WorkspaceTests") == true)
+        #expect(try await base.readFile(path: "/src/a.txt") == Data("bar".utf8))
+        #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
+        #expect(try await base.readFile(path: "/src/c.txt") == Data("foo".utf8))
+    }
+
+    @Test("applyReplacement returns an empty execution result when nothing matches")
+    func applyReplacementReturnsEmptyExecutionResultWhenNothingMatches() async throws {
+        let state = Workspace(filesystem: InMemoryFilesystem())
+
+        let result = try await state.applyReplacement(
+            WorkspaceReplaceRequest(pattern: "/missing/*.txt", search: "foo", replacement: "bar")
+        )
+
+        #expect(result.mode == .execution)
+        #expect(result.touchedPaths.isEmpty)
+        #expect(result.changes.isEmpty)
+        #expect(result.failures.isEmpty)
+        #expect(!result.rolledBack)
+    }
+
+    @Test("previewReplacement respects scope excludes and case-insensitive matching")
+    func previewReplacementRespectsScopeExcludesAndCaseInsensitiveMatching() async throws {
+        let fs = InMemoryFilesystem()
+        try await fs.createDirectory(path: "/src/dir", recursive: true)
+        try await fs.writeFile(path: "/src/keep.txt", data: Data("FoO".utf8), append: false)
+        try await fs.writeFile(path: "/src/skip.txt", data: Data("foo".utf8), append: false)
+        let state = Workspace(filesystem: fs)
+
+        let result = try await state.previewReplacement(
+            WorkspaceReplaceRequest(
+                scope: "/src",
+                include: ["*.txt", "dir"],
+                exclude: ["skip.txt"],
+                search: .literal("foo", caseSensitive: false),
+                replacement: "bar"
+            )
+        )
+
+        #expect(result.touchedPaths == ["/src/keep.txt"])
+        #expect(result.changes.count == 1)
+        #expect(result.changes.first?.updatedContent == "bar")
+    }
+
+    @Test("previewReplacement rejects invalid UTF-8 and empty search patterns")
+    func previewReplacementRejectsInvalidUTF8AndEmptySearchPatterns() async throws {
+        let fs = InMemoryFilesystem()
+        try await fs.writeFile(path: "/binary.bin", data: Data([0xFF]), append: false)
+        try await fs.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
+        let state = Workspace(filesystem: fs)
+
+        do {
+            _ = try await state.previewReplacement(
+                WorkspaceReplaceRequest(
+                    include: ["/binary.bin"],
+                    search: .literal("x"),
+                    replacement: "y"
+                )
+            )
+            Issue.record("expected invalid UTF-8 error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("not valid UTF-8"))
+        }
+
+        do {
+            _ = try await state.previewReplacement(
+                WorkspaceReplaceRequest(
+                    include: ["/note.txt"],
+                    search: .literal("", caseSensitive: false),
+                    replacement: "y"
+                )
+            )
+            Issue.record("expected empty literal search rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("must not be empty"))
+        }
+
+        do {
+            _ = try await state.previewReplacement(
+                WorkspaceReplaceRequest(
+                    include: ["/note.txt"],
+                    search: .regularExpression(""),
+                    replacement: "y"
+                )
+            )
+            Issue.record("expected empty regex search rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("must not be empty"))
+        }
+    }
+
     @Test("applyEdits succeeds across multiple files")
     func applyEditsSucceedsAcrossMultipleFiles() async throws {
         let fs = InMemoryFilesystem()
@@ -257,6 +464,88 @@ struct WorkspaceTests {
         #expect(try await base.readFile(path: "/a.txt") == Data("old".utf8))
         let bExists = await base.exists(path: "/b.txt")
         #expect(!bExists)
+    }
+
+    @Test("previewEdits reports unchanged and delete effects")
+    func previewEditsReportsUnchangedAndDeleteEffects() async throws {
+        let fs = InMemoryFilesystem()
+        try await fs.createDirectory(path: "/dir", recursive: true)
+        try await fs.writeFile(path: "/same.txt", data: Data("same".utf8), append: false)
+        try await fs.writeFile(path: "/delete.txt", data: Data("bye".utf8), append: false)
+        let state = Workspace(filesystem: fs)
+
+        let result = try await state.previewEdits([
+            .writeFile(path: "/same.txt", content: "same"),
+            .delete(path: "/delete.txt"),
+            .delete(path: "/missing.txt"),
+            .createDirectory(path: "/dir"),
+            .move(from: "/same.txt", to: "/same.txt"),
+        ])
+
+        #expect(result.mode == .preview)
+        #expect(result.edits.map(\.effect) == [.unchanged, .deleted, .unchanged, .unchanged, .unchanged])
+    }
+
+    @Test("applyEdits fail-fast keeps prior changes and reports non-workspace errors")
+    func applyEditsFailFastKeepsPriorChangesAndReportsNonWorkspaceErrors() async throws {
+        let base = InMemoryFilesystem()
+        try await base.writeFile(path: "/old.txt", data: Data("gone".utf8), append: false)
+        let state = Workspace(
+            filesystem: NSErrorFailOnceFilesystem(base: base, failingWritePaths: ["/blocked.txt"])
+        )
+
+        let result = try await state.applyEdits([
+            .delete(path: "/old.txt"),
+            .writeFile(path: "/blocked.txt", content: "blocked"),
+            .writeFile(path: "/after.txt", content: "after"),
+        ], failurePolicy: .failFast)
+
+        #expect(!result.rolledBack)
+        #expect(result.failures.count == 1)
+        #expect(result.failures.first?.index == 1)
+        #expect(result.failures.first?.message.contains("WorkspaceTests") == true)
+        #expect(!(await base.exists(path: "/old.txt")))
+        #expect(!(await base.exists(path: "/blocked.txt")))
+        #expect(!(await base.exists(path: "/after.txt")))
+    }
+
+    @Test("applyEdits returns an empty execution result when given no edits")
+    func applyEditsReturnsAnEmptyExecutionResultWhenGivenNoEdits() async throws {
+        let state = Workspace(filesystem: InMemoryFilesystem())
+        let result = try await state.applyEdits([])
+
+        #expect(result.mode == .execution)
+        #expect(result.touchedPaths.isEmpty)
+        #expect(result.edits.isEmpty)
+        #expect(result.failures.isEmpty)
+        #expect(!result.rolledBack)
+    }
+
+    @Test("workspace path and type helpers cover normalization and coding")
+    func workspacePathAndTypeHelpersCoverNormalizationAndCoding() throws {
+        #expect(WorkspacePath(normalizing: "", relativeTo: "/base") == "/base")
+        #expect(WorkspacePath(normalizing: "./child", relativeTo: "/base") == "/base/child")
+        #expect(WorkspacePath.basename("/") == "/")
+        #expect(WorkspacePath.dirname("/") == .root)
+        #expect(WorkspacePath.join("/base", "/override") == "/override")
+        #expect(WorkspacePath.globToRegex("file?.[ch]") == "^file.\\.[ch]$")
+        #expect(WorkspacePath.globToRegex("file[") == "^file\\[$")
+
+        let encoded = try JSONEncoder().encode(WorkspacePath(normalizing: "/tmp/../file.txt"))
+        #expect(try JSONDecoder().decode(WorkspacePath.self, from: encoded) == "/file.txt")
+
+        let invalidPathError = WorkspaceError.invalidPath("/bad\u{0}path")
+        #expect(invalidPathError.description == "path contains null byte")
+
+        let fileInfo = FileInfo(
+            path: "/tmp/../file.txt",
+            isDirectory: false,
+            isSymbolicLink: false,
+            size: 7,
+            permissions: 0o644,
+            modificationDate: nil
+        )
+        #expect(fileInfo.path == "/file.txt")
     }
 
     @Test("applyEdits works with overlay and mountable filesystems")

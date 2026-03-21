@@ -233,6 +233,3 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
         return regex
     }
 }
-
-/// Backward-compatible alias for the legacy path utility name.
-public typealias PathUtils = WorkspacePath
