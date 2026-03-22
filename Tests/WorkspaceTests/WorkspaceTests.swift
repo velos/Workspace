@@ -501,7 +501,7 @@ struct WorkspaceTests {
     }
 
     @Test
-    func `previewEdits reports unchanged and delete effects`() async throws {
+    func `previewEdits reports change states and delete diffs`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/dir", recursive: true)
         try await fs.writeFile(path: "/same.txt", data: Data("same".utf8), append: false)
@@ -518,8 +518,10 @@ struct WorkspaceTests {
 
         #expect(result.mode == .preview)
         #expect(result.edits.map(\.status) == [.planned, .planned, .planned, .planned, .planned])
-        #expect(result.edits.map(\.effect) == [.unchanged, .deleted, .unchanged, .unchanged, .unchanged])
+        #expect(result.edits.map(\.changeState) == [.unchanged, .changed, .unchanged, .unchanged, .unchanged])
         #expect(result.edits[0].fileChanges.count == 1)
+        #expect(result.edits[0].fileChanges[0].effect == .unchanged)
+        #expect(result.edits[1].fileChanges[0].effect == .deleted)
         #expect(result.edits[0].fileChanges[0].diff?.hunks.isEmpty == true)
         #expect(removedLineTexts(result.edits[1].fileChanges.first?.diff) == ["bye"])
         #expect(result.edits[2].fileChanges.isEmpty)

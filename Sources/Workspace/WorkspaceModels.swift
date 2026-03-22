@@ -431,23 +431,15 @@ public enum WorkspaceEdit: Sendable, Equatable {
     /// Copies an entry.
     case copy(from: WorkspacePath, to: WorkspacePath, recursive: Bool = true)
 
-    /// The requested operation type for a batch edit entry.
-    public enum Operation: String, Sendable, Codable {
-        /// A file write that replaces the destination contents.
-        case writeFile
-        /// A file write that appends to the destination contents.
-        case appendFile
-        /// A delete operation.
-        case delete
-        /// A directory creation operation.
-        case createDirectory
-        /// A move or rename operation.
-        case move
-        /// A copy operation.
-        case copy
+    /// Whether a requested edit materially changes the workspace.
+    public enum ChangeState: String, Sendable, Codable {
+        /// The edit changes the workspace.
+        case changed
+        /// The edit leaves the workspace unchanged.
+        case unchanged
     }
 
-    /// The predicted or observed effect of a batch edit entry.
+    /// The predicted or observed effect of a file-level change.
     public enum Effect: String, Sendable, Codable {
         /// The operation creates a new entry.
         case created
@@ -498,10 +490,10 @@ public enum WorkspaceEdit: Sendable, Equatable {
 
     /// A preview or result entry for a single batch edit operation.
     public struct Entry: Sendable {
-        /// The requested operation.
-        public var operation: Operation
-        /// The predicted or observed effect of the operation.
-        public var effect: Effect
+        /// The requested edit.
+        public var edit: WorkspaceEdit
+        /// Whether the requested edit materially changes the workspace.
+        public var changeState: ChangeState
         /// The execution status of the operation.
         public var status: MutationStatus
         /// Paths touched by the edit.
@@ -511,14 +503,14 @@ public enum WorkspaceEdit: Sendable, Equatable {
 
         /// Creates a batch edit entry.
         public init(
-            operation: Operation,
-            effect: Effect,
+            edit: WorkspaceEdit,
+            changeState: ChangeState,
             status: MutationStatus = .planned,
             touchedPaths: [WorkspacePath],
             fileChanges: [FileChange] = []
         ) {
-            self.operation = operation
-            self.effect = effect
+            self.edit = edit
+            self.changeState = changeState
             self.status = status
             self.touchedPaths = touchedPaths
             self.fileChanges = fileChanges

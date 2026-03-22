@@ -674,16 +674,18 @@ public actor Workspace {
         case let .writeFile(path, content):
             let original = try await readUTF8IfPresent(path, on: target)
             let info = try await statIfPresent(path, on: target)
+            let effect = effect(forOriginalContent: original, updatedContent: content)
             return WorkspaceEdit.Entry(
-                operation: .writeFile,
-                effect: effect(forOriginalContent: original, updatedContent: content),
+                edit: edit,
+                changeState: changeState(for: effect),
                 touchedPaths: [path],
                 fileChanges: [
                     textFileChange(
                         path: path,
                         kind: info.map(treeKind(for:)) ?? .file,
                         originalContent: original,
-                        updatedContent: content
+                        updatedContent: content,
+                        effect: effect
                     )
                 ]
             )
@@ -691,49 +693,55 @@ public actor Workspace {
             let original = try await readUTF8IfPresent(path, on: target)
             let updated = (original ?? "") + content
             let info = try await statIfPresent(path, on: target)
+            let effect = effect(forOriginalContent: original, updatedContent: updated)
             return WorkspaceEdit.Entry(
-                operation: .appendFile,
-                effect: effect(forOriginalContent: original, updatedContent: updated),
+                edit: edit,
+                changeState: changeState(for: effect),
                 touchedPaths: [path],
                 fileChanges: [
                     textFileChange(
                         path: path,
                         kind: info.map(treeKind(for:)) ?? .file,
                         originalContent: original,
-                        updatedContent: updated
+                        updatedContent: updated,
+                        effect: effect
                     )
                 ]
             )
         case let .delete(path, _):
             let existing = try await statIfPresent(path, on: target)
             return WorkspaceEdit.Entry(
-                operation: .delete,
-                effect: existing == nil ? .unchanged : .deleted,
+                edit: edit,
+                changeState: existing == nil ? .unchanged : .changed,
                 touchedPaths: [path],
                 fileChanges: try await deletionFileChanges(at: path, on: target)
             )
         case let .createDirectory(path, _):
             let existing = try await statIfPresent(path, on: target)
             return WorkspaceEdit.Entry(
-                operation: .createDirectory,
-                effect: existing == nil ? .created : .unchanged,
+                edit: edit,
+                changeState: existing == nil ? .changed : .unchanged,
                 touchedPaths: [path]
             )
         case let .move(from, to):
             return WorkspaceEdit.Entry(
-                operation: .move,
-                effect: from == to ? .unchanged : .moved,
+                edit: edit,
+                changeState: from == to ? .unchanged : .changed,
                 touchedPaths: [from, to],
                 fileChanges: from == to ? [] : try await transferFileChanges(from: from, to: to, effect: .moved, on: target)
             )
         case let .copy(from, to, _):
             return WorkspaceEdit.Entry(
-                operation: .copy,
-                effect: .copied,
+                edit: edit,
+                changeState: .changed,
                 touchedPaths: [from, to],
                 fileChanges: try await transferFileChanges(from: from, to: to, effect: .copied, on: target)
             )
         }
+    }
+
+    private func changeState(for effect: WorkspaceEdit.Effect) -> WorkspaceEdit.ChangeState {
+        effect == .unchanged ? .unchanged : .changed
     }
 
     private func effect(forOriginalContent originalContent: String?, updatedContent: String) -> WorkspaceEdit.Effect {
@@ -747,12 +755,13 @@ public actor Workspace {
         path: WorkspacePath,
         kind: WorkspaceTree.Kind,
         originalContent: String?,
-        updatedContent: String
+        updatedContent: String,
+        effect: WorkspaceEdit.Effect
     ) -> WorkspaceEdit.FileChange {
         WorkspaceEdit.FileChange(
             path: path,
             kind: kind,
-            effect: effect(forOriginalContent: originalContent, updatedContent: updatedContent),
+            effect: effect,
             diff: textDiff(from: originalContent ?? "", to: updatedContent)
         )
     }

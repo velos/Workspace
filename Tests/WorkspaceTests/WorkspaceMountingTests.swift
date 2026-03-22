@@ -54,7 +54,10 @@ struct WorkspaceMountingTests {
         )
 
         #expect(result.mode == .preview)
-        #expect(result.edits.map(\.operation) == [.copy, .appendFile])
+        #expect(result.edits.map(\.edit) == [
+            .copy(from: "/memory/shared.txt", to: "/workspace/shared.txt"),
+            .appendFile(path: "/memory/shared.txt", content: "!")
+        ])
         #expect(!(await workspace.exists("/workspace/shared.txt")))
         #expect(try await workspace.readFile("/memory/shared.txt") == "memo")
     }
