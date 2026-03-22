@@ -1,566 +1,5 @@
 import Foundation
 
-/// The logical kind of a node in a workspace tree.
-public enum WorkspaceTreeNodeKind: String, Sendable, Codable {
-    /// A regular file.
-    case file
-    /// A directory.
-    case directory
-    /// A symbolic link.
-    case symlink
-}
-
-/// A recursive tree node returned from workspace tree traversal APIs.
-public struct WorkspaceTreeNode: Sendable {
-    /// The normalized path for the node.
-    public var path: WorkspacePath
-    /// The node's kind.
-    public var kind: WorkspaceTreeNodeKind
-    /// The size of the node in bytes.
-    public var size: UInt64
-    /// The node's POSIX permissions.
-    public var permissions: Int
-    /// The node's last modification timestamp when available.
-    public var modificationDate: Date?
-    /// Child nodes for directories when the traversal includes them.
-    public var children: [WorkspaceTreeNode]?
-
-    /// Creates a tree node.
-    public init(
-        path: WorkspacePath,
-        kind: WorkspaceTreeNodeKind,
-        size: UInt64,
-        permissions: Int,
-        modificationDate: Date?,
-        children: [WorkspaceTreeNode]? = nil
-    ) {
-        self.path = path
-        self.kind = kind
-        self.size = size
-        self.permissions = permissions
-        self.modificationDate = modificationDate
-        self.children = children
-    }
-
-    /// Convenience initializer that accepts a string path.
-    public init(
-        path: String,
-        kind: WorkspaceTreeNodeKind,
-        size: UInt64,
-        permissions: Int,
-        modificationDate: Date?,
-        children: [WorkspaceTreeNode]? = nil
-    ) {
-        self.init(
-            path: WorkspacePath(normalizing: path),
-            kind: kind,
-            size: size,
-            permissions: permissions,
-            modificationDate: modificationDate,
-            children: children
-        )
-    }
-}
-
-/// A summary entry for a direct child in a tree summary.
-public struct WorkspaceTreeSummaryEntry: Sendable {
-    /// The normalized path for the child entry.
-    public var path: WorkspacePath
-    /// The child entry's kind.
-    public var kind: WorkspaceTreeNodeKind
-    /// The child entry's size in bytes.
-    public var size: UInt64
-    /// The child entry's POSIX permissions.
-    public var permissions: Int
-
-    /// Creates a summary entry.
-    public init(path: WorkspacePath, kind: WorkspaceTreeNodeKind, size: UInt64, permissions: Int) {
-        self.path = path
-        self.kind = kind
-        self.size = size
-        self.permissions = permissions
-    }
-
-    /// Convenience initializer that accepts a string path.
-    public init(path: String, kind: WorkspaceTreeNodeKind, size: UInt64, permissions: Int) {
-        self.init(path: WorkspacePath(normalizing: path), kind: kind, size: size, permissions: permissions)
-    }
-}
-
-/// Aggregate information about a subtree in the workspace.
-public struct WorkspaceTreeSummary: Sendable {
-    /// The root path that was summarized.
-    public var path: WorkspacePath
-    /// The number of files in the summarized subtree.
-    public var fileCount: Int
-    /// The number of directories in the summarized subtree.
-    public var directoryCount: Int
-    /// The number of symlinks in the summarized subtree.
-    public var symlinkCount: Int
-    /// The total size in bytes across the summarized subtree.
-    public var totalBytes: UInt64
-    /// Direct child entries of the summarized root.
-    public var children: [WorkspaceTreeSummaryEntry]
-
-    /// Creates a tree summary.
-    public init(
-        path: WorkspacePath,
-        fileCount: Int,
-        directoryCount: Int,
-        symlinkCount: Int,
-        totalBytes: UInt64,
-        children: [WorkspaceTreeSummaryEntry]
-    ) {
-        self.path = path
-        self.fileCount = fileCount
-        self.directoryCount = directoryCount
-        self.symlinkCount = symlinkCount
-        self.totalBytes = totalBytes
-        self.children = children
-    }
-
-    /// Convenience initializer that accepts a string path.
-    public init(
-        path: String,
-        fileCount: Int,
-        directoryCount: Int,
-        symlinkCount: Int,
-        totalBytes: UInt64,
-        children: [WorkspaceTreeSummaryEntry]
-    ) {
-        self.init(
-            path: WorkspacePath(normalizing: path),
-            fileCount: fileCount,
-            directoryCount: directoryCount,
-            symlinkCount: symlinkCount,
-            totalBytes: totalBytes,
-            children: children
-        )
-    }
-}
-
-/// Whether a workspace mutation was previewed or executed.
-public enum WorkspaceMutationMode: String, Sendable, Codable {
-    /// The workspace mutation was only previewed.
-    case preview
-    /// The workspace mutation was executed against the backing filesystem.
-    case execution
-}
-
-/// The failure handling strategy used when applying a workspace mutation.
-public enum WorkspaceMutationFailurePolicy: String, Sendable, Codable {
-    /// Restore the original state when any execution step fails.
-    case rollback
-    /// Stop at the first failure and leave any already-applied changes in place.
-    case failFast
-    /// Continue after failures and report all failed steps.
-    case bestEffort
-}
-
-/// The text matching strategy used by a replacement request.
-public enum WorkspaceSearchPattern: Sendable, Equatable {
-    /// Match a literal substring.
-    case literal(String, caseSensitive: Bool = true)
-    /// Match a regular expression pattern using Foundation regular expression syntax.
-    case regularExpression(String)
-}
-
-/// A request describing a multi-file text replacement operation.
-public struct WorkspaceReplaceRequest: Sendable, Equatable {
-    /// The base directory used to resolve relative include and exclude patterns.
-    public var scope: WorkspacePath
-    /// Glob patterns selecting candidate files.
-    public var include: [String]
-    /// Glob patterns removed from the include set after expansion.
-    public var exclude: [String]
-    /// The text matching strategy to apply to each candidate file.
-    public var search: WorkspaceSearchPattern
-    /// The replacement string or regular expression template.
-    public var replacement: String
-
-    /// Creates a replacement request.
-    public init(
-        scope: WorkspacePath = .root,
-        include: [String],
-        exclude: [String] = [],
-        search: WorkspaceSearchPattern,
-        replacement: String
-    ) {
-        self.scope = scope
-        self.include = include
-        self.exclude = exclude
-        self.search = search
-        self.replacement = replacement
-    }
-
-    /// Creates a replacement request for a single include pattern and a literal search term.
-    public init(
-        pattern: String,
-        search: String,
-        replacement: String,
-        scope: WorkspacePath = .root,
-        exclude: [String] = []
-    ) {
-        self.init(
-            scope: scope,
-            include: [pattern],
-            exclude: exclude,
-            search: .literal(search),
-            replacement: replacement
-        )
-    }
-
-    /// Creates a replacement request for a single include pattern.
-    public init(
-        pattern: String,
-        search: WorkspaceSearchPattern,
-        replacement: String,
-        scope: WorkspacePath = .root,
-        exclude: [String] = []
-    ) {
-        self.init(
-            scope: scope,
-            include: [pattern],
-            exclude: exclude,
-            search: search,
-            replacement: replacement
-        )
-    }
-}
-
-/// The line classification used within a text diff.
-public enum WorkspaceTextDiffLineKind: String, Sendable, Codable {
-    /// A context line that is unchanged between the old and new content.
-    case context
-    /// A line present only in the new content.
-    case added
-    /// A line present only in the old content.
-    case removed
-}
-
-/// The execution status for a planned or applied workspace change.
-public enum WorkspaceChangeStatus: String, Sendable, Codable {
-    /// The change was only planned during preview.
-    case planned
-    /// The change was successfully applied.
-    case applied
-    /// The change failed while being applied.
-    case failed
-    /// The change was applied, then reverted due to rollback.
-    case rolledBack
-    /// The change was never attempted because execution stopped earlier.
-    case skipped
-}
-
-/// A single line in a structured text diff.
-public struct WorkspaceTextDiffLine: Sendable, Equatable {
-    /// The role of the line within the diff.
-    public var kind: WorkspaceTextDiffLineKind
-    /// The line content without a trailing newline character.
-    public var text: String
-    /// Whether the original line ended with a trailing newline.
-    public var hasTrailingNewline: Bool
-    /// The original 1-based line number when present.
-    public var oldLineNumber: Int?
-    /// The updated 1-based line number when present.
-    public var newLineNumber: Int?
-
-    /// Creates a diff line.
-    public init(
-        kind: WorkspaceTextDiffLineKind,
-        text: String,
-        hasTrailingNewline: Bool,
-        oldLineNumber: Int? = nil,
-        newLineNumber: Int? = nil
-    ) {
-        self.kind = kind
-        self.text = text
-        self.hasTrailingNewline = hasTrailingNewline
-        self.oldLineNumber = oldLineNumber
-        self.newLineNumber = newLineNumber
-    }
-}
-
-/// A contiguous hunk in a structured text diff.
-public struct WorkspaceTextDiffHunk: Sendable, Equatable {
-    /// The 1-based starting line number in the original content.
-    public var oldStartLine: Int
-    /// The number of original lines represented in the hunk.
-    public var oldLineCount: Int
-    /// The 1-based starting line number in the updated content.
-    public var newStartLine: Int
-    /// The number of updated lines represented in the hunk.
-    public var newLineCount: Int
-    /// The context and changed lines in the hunk.
-    public var lines: [WorkspaceTextDiffLine]
-
-    /// Creates a diff hunk.
-    public init(
-        oldStartLine: Int,
-        oldLineCount: Int,
-        newStartLine: Int,
-        newLineCount: Int,
-        lines: [WorkspaceTextDiffLine]
-    ) {
-        self.oldStartLine = oldStartLine
-        self.oldLineCount = oldLineCount
-        self.newStartLine = newStartLine
-        self.newLineCount = newLineCount
-        self.lines = lines
-    }
-}
-
-/// A line-based diff between two text snapshots.
-public struct WorkspaceTextDiff: Sendable, Equatable {
-    /// The hunks that make up the diff.
-    public var hunks: [WorkspaceTextDiffHunk]
-
-    /// Creates a text diff.
-    public init(hunks: [WorkspaceTextDiffHunk]) {
-        self.hunks = hunks
-    }
-}
-
-/// A file-level change contained within a batch edit result.
-public struct WorkspaceFileChange: Sendable {
-    /// The affected file or symlink path.
-    public var path: WorkspacePath
-    /// The original path for move and copy operations when applicable.
-    public var sourcePath: WorkspacePath?
-    /// The logical kind of the affected node.
-    public var kind: WorkspaceTreeNodeKind
-    /// The predicted or observed effect of the change.
-    public var effect: WorkspaceBatchEditEffect
-    /// The execution status of the change.
-    public var status: WorkspaceChangeStatus
-    /// A structured text diff when the change represents UTF-8 file content.
-    public var diff: WorkspaceTextDiff?
-
-    /// Creates a file-level change description.
-    public init(
-        path: WorkspacePath,
-        sourcePath: WorkspacePath? = nil,
-        kind: WorkspaceTreeNodeKind,
-        effect: WorkspaceBatchEditEffect,
-        status: WorkspaceChangeStatus = .planned,
-        diff: WorkspaceTextDiff? = nil
-    ) {
-        self.path = path
-        self.sourcePath = sourcePath
-        self.kind = kind
-        self.effect = effect
-        self.status = status
-        self.diff = diff
-    }
-}
-
-/// A single text replacement result produced by ``Workspace/previewReplacement(_:)`` or
-/// ``Workspace/applyReplacement(_:failurePolicy:)``.
-public struct WorkspaceTextChange: Sendable {
-    /// The file path that was changed.
-    public var path: WorkspacePath
-    /// The number of replacements applied to the file.
-    public var replacements: Int
-    /// The execution status of the file change.
-    public var status: WorkspaceChangeStatus
-    /// A line-based diff describing the text change.
-    public var diff: WorkspaceTextDiff
-
-    /// Creates a text change result.
-    public init(
-        path: WorkspacePath,
-        replacements: Int,
-        status: WorkspaceChangeStatus = .planned,
-        diff: WorkspaceTextDiff
-    ) {
-        self.path = path
-        self.replacements = replacements
-        self.status = status
-        self.diff = diff
-    }
-
-    /// Convenience initializer that accepts a string path.
-    public init(
-        path: String,
-        replacements: Int,
-        status: WorkspaceChangeStatus = .planned,
-        diff: WorkspaceTextDiff
-    ) {
-        self.init(
-            path: WorkspacePath(normalizing: path),
-            replacements: replacements,
-            status: status,
-            diff: diff
-        )
-    }
-}
-
-/// The result of a multi-file text replacement operation.
-public struct WorkspaceReplaceResult: Sendable {
-    /// Whether the operation was previewed or executed.
-    public var mode: WorkspaceMutationMode
-    /// The distinct paths touched by the operation.
-    public var touchedPaths: [WorkspacePath]
-    /// Per-file change details.
-    public var changes: [WorkspaceTextChange]
-    /// Execution failures encountered while applying the replacement.
-    public var failures: [WorkspaceReplaceFailure]
-    /// Whether the operation rolled back after an error.
-    public var rolledBack: Bool
-
-    /// Creates a replacement result.
-    public init(
-        mode: WorkspaceMutationMode,
-        touchedPaths: [WorkspacePath],
-        changes: [WorkspaceTextChange],
-        failures: [WorkspaceReplaceFailure] = [],
-        rolledBack: Bool
-    ) {
-        self.mode = mode
-        self.touchedPaths = touchedPaths
-        self.changes = changes
-        self.failures = failures
-        self.rolledBack = rolledBack
-    }
-}
-
-/// A filesystem edit that can be applied as part of a batch.
-public enum WorkspaceEdit: Sendable, Equatable {
-    /// Writes UTF-8 content to a file, replacing any existing contents.
-    case writeFile(path: WorkspacePath, content: String)
-    /// Appends UTF-8 content to a file.
-    case appendFile(path: WorkspacePath, content: String)
-    /// Removes a file or directory.
-    case delete(path: WorkspacePath, recursive: Bool = true)
-    /// Creates a directory.
-    case createDirectory(path: WorkspacePath, recursive: Bool = true)
-    /// Moves or renames an entry.
-    case move(from: WorkspacePath, to: WorkspacePath)
-    /// Copies an entry.
-    case copy(from: WorkspacePath, to: WorkspacePath, recursive: Bool = true)
-}
-
-/// The requested operation type for a batch edit entry.
-public enum WorkspaceBatchEditOperation: String, Sendable, Codable {
-    /// A file write that replaces the destination contents.
-    case writeFile
-    /// A file write that appends to the destination contents.
-    case appendFile
-    /// A delete operation.
-    case delete
-    /// A directory creation operation.
-    case createDirectory
-    /// A move or rename operation.
-    case move
-    /// A copy operation.
-    case copy
-}
-
-/// The predicted or observed effect of a batch edit entry.
-public enum WorkspaceBatchEditEffect: String, Sendable, Codable {
-    /// The operation creates a new entry.
-    case created
-    /// The operation changes an existing entry.
-    case modified
-    /// The operation removes an existing entry.
-    case deleted
-    /// The operation moves an entry to a new path.
-    case moved
-    /// The operation copies an entry to a new path.
-    case copied
-    /// The operation leaves the filesystem unchanged.
-    case unchanged
-}
-
-/// A preview or result entry for a single batch edit operation.
-public struct WorkspaceBatchEditEntry: Sendable {
-    /// The requested operation.
-    public var operation: WorkspaceBatchEditOperation
-    /// The predicted or observed effect of the operation.
-    public var effect: WorkspaceBatchEditEffect
-    /// The execution status of the operation.
-    public var status: WorkspaceChangeStatus
-    /// Paths touched by the edit.
-    public var touchedPaths: [WorkspacePath]
-    /// File-level details for text and structural file changes under this edit.
-    public var fileChanges: [WorkspaceFileChange]
-
-    /// Creates a batch edit entry.
-    public init(
-        operation: WorkspaceBatchEditOperation,
-        effect: WorkspaceBatchEditEffect,
-        status: WorkspaceChangeStatus = .planned,
-        touchedPaths: [WorkspacePath],
-        fileChanges: [WorkspaceFileChange] = []
-    ) {
-        self.operation = operation
-        self.effect = effect
-        self.status = status
-        self.touchedPaths = touchedPaths
-        self.fileChanges = fileChanges
-    }
-}
-
-/// A failure encountered while executing a single replacement write.
-public struct WorkspaceReplaceFailure: Sendable {
-    /// The path whose replacement write failed.
-    public var path: WorkspacePath
-    /// A human-readable failure message.
-    public var message: String
-
-    /// Creates a replacement failure.
-    public init(path: WorkspacePath, message: String) {
-        self.path = path
-        self.message = message
-    }
-}
-
-/// A failure encountered while executing a single batch edit.
-public struct WorkspaceBatchEditFailure: Sendable {
-    /// The index of the failed edit in the original request.
-    public var index: Int
-    /// The edit that failed.
-    public var edit: WorkspaceEdit
-    /// A human-readable failure message.
-    public var message: String
-
-    /// Creates a batch edit failure.
-    public init(index: Int, edit: WorkspaceEdit, message: String) {
-        self.index = index
-        self.edit = edit
-        self.message = message
-    }
-}
-
-/// The result of applying a batch of workspace edits.
-public struct WorkspaceBatchEditResult: Sendable {
-    /// Whether the operation was previewed or executed.
-    public var mode: WorkspaceMutationMode
-    /// Canonicalized paths touched by the batch.
-    public var touchedPaths: [WorkspacePath]
-    /// Per-edit preview or result entries.
-    public var edits: [WorkspaceBatchEditEntry]
-    /// Execution failures encountered while applying the batch.
-    public var failures: [WorkspaceBatchEditFailure]
-    /// Whether the batch rolled back after an error.
-    public var rolledBack: Bool
-
-    /// Creates a batch edit result.
-    public init(
-        mode: WorkspaceMutationMode,
-        touchedPaths: [WorkspacePath],
-        edits: [WorkspaceBatchEditEntry],
-        failures: [WorkspaceBatchEditFailure] = [],
-        rolledBack: Bool
-    ) {
-        self.mode = mode
-        self.touchedPaths = touchedPaths
-        self.edits = edits
-        self.failures = failures
-        self.rolledBack = rolledBack
-    }
-}
-
 /// A high-level API for reading, editing, and summarizing a workspace.
 public actor Workspace {
     private let filesystem: any WorkspaceFilesystem
@@ -749,12 +188,12 @@ public actor Workspace {
     }
 
     /// Builds a recursive tree representation for the entry at `path`.
-    public func walkTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> WorkspaceTreeNode {
+    public func walkTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> WorkspaceTree {
         try await buildTree(path: path, depth: 0, maxDepth: maxDepth)
     }
 
     /// Convenience overload for ``Workspace/walkTree(_:maxDepth:)`` that accepts a string path.
-    public func walkTree(_ path: String, maxDepth: Int? = nil) async throws -> WorkspaceTreeNode {
+    public func walkTree(_ path: String, maxDepth: Int? = nil) async throws -> WorkspaceTree {
         try await walkTree(WorkspacePath(validating: path), maxDepth: maxDepth)
     }
 
@@ -769,13 +208,13 @@ public actor Workspace {
     }
 
     private struct PlannedReplacement {
-        var change: WorkspaceTextChange
+        var change: ReplacementResult.Change
         var updatedContent: String
     }
 
     private struct PlannedBatchEdit {
         var edit: WorkspaceEdit
-        var entry: WorkspaceBatchEditEntry
+        var entry: WorkspaceEdit.Entry
     }
 
     private struct DiffToken: Hashable {
@@ -784,9 +223,9 @@ public actor Workspace {
     }
 
     /// Returns a preview of a replacement request without mutating the workspace.
-    public func previewReplacement(_ request: WorkspaceReplaceRequest) async throws -> WorkspaceReplaceResult {
+    public func previewReplacement(_ request: ReplacementRequest) async throws -> ReplacementResult {
         let changes = try await plannedReplacementChanges(for: request).map(\.change)
-        return WorkspaceReplaceResult(
+        return ReplacementResult(
             mode: .preview,
             touchedPaths: canonicalizedTouchedPaths(for: changes),
             changes: changes,
@@ -800,15 +239,15 @@ public actor Workspace {
     ///   - request: The replacement request to execute.
     ///   - failurePolicy: The behavior to use when a write fails.
     public func applyReplacement(
-        _ request: WorkspaceReplaceRequest,
-        failurePolicy: WorkspaceMutationFailurePolicy = .rollback
-    ) async throws -> WorkspaceReplaceResult {
+        _ request: ReplacementRequest,
+        failurePolicy: MutationFailurePolicy = .rollback
+    ) async throws -> ReplacementResult {
         let plannedChanges = try await plannedReplacementChanges(for: request)
         var changes = plannedChanges.map(\.change)
         let touchedPaths = canonicalizedTouchedPaths(for: changes)
 
         guard !changes.isEmpty else {
-            return WorkspaceReplaceResult(
+            return ReplacementResult(
                 mode: .execution,
                 touchedPaths: touchedPaths,
                 changes: changes,
@@ -817,7 +256,7 @@ public actor Workspace {
         }
 
         let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
-        var failures: [WorkspaceReplaceFailure] = []
+        var failures: [ReplacementResult.Failure] = []
         var appliedIndices: [Int] = []
 
         for (index, plannedChange) in plannedChanges.enumerated() {
@@ -827,7 +266,7 @@ public actor Workspace {
                 appliedIndices.append(index)
             } catch {
                 changes[index].status = .failed
-                let failure = WorkspaceReplaceFailure(path: plannedChange.change.path, message: describe(error))
+                let failure = ReplacementResult.Failure(path: plannedChange.change.path, message: describe(error))
                 if failurePolicy == .rollback {
                     try await rollback(snapshots)
                     for appliedIndex in appliedIndices {
@@ -836,7 +275,7 @@ public actor Workspace {
                     for skippedIndex in changes.indices where skippedIndex > index {
                         changes[skippedIndex].status = .skipped
                     }
-                    return WorkspaceReplaceResult(
+                    return ReplacementResult(
                         mode: .execution,
                         touchedPaths: touchedPaths,
                         changes: changes,
@@ -850,7 +289,7 @@ public actor Workspace {
                     for skippedIndex in changes.indices where skippedIndex > index {
                         changes[skippedIndex].status = .skipped
                     }
-                    return WorkspaceReplaceResult(
+                    return ReplacementResult(
                         mode: .execution,
                         touchedPaths: touchedPaths,
                         changes: changes,
@@ -861,7 +300,7 @@ public actor Workspace {
             }
         }
 
-        return WorkspaceReplaceResult(
+        return ReplacementResult(
             mode: .execution,
             touchedPaths: touchedPaths,
             changes: changes,
@@ -871,9 +310,9 @@ public actor Workspace {
     }
 
     /// Returns a preview of a batch edit request without mutating the workspace.
-    public func previewEdits(_ edits: [WorkspaceEdit]) async throws -> WorkspaceBatchEditResult {
+    public func previewEdits(_ edits: [WorkspaceEdit]) async throws -> WorkspaceEdit.Result {
         let plannedEdits = try await planBatchEdits(edits)
-        return WorkspaceBatchEditResult(
+        return WorkspaceEdit.Result(
             mode: .preview,
             touchedPaths: canonicalizedTouchedPaths(for: edits),
             edits: plannedEdits.map(\.entry),
@@ -888,14 +327,14 @@ public actor Workspace {
     ///   - failurePolicy: The behavior to use when an edit fails.
     public func applyEdits(
         _ edits: [WorkspaceEdit],
-        failurePolicy: WorkspaceMutationFailurePolicy = .rollback
-    ) async throws -> WorkspaceBatchEditResult {
+        failurePolicy: MutationFailurePolicy = .rollback
+    ) async throws -> WorkspaceEdit.Result {
         let touchedPaths = canonicalizedTouchedPaths(for: edits)
         let plannedEdits = try await planBatchEdits(edits)
         var executionEntries = plannedEdits.map(\.entry)
 
         guard !plannedEdits.isEmpty else {
-            return WorkspaceBatchEditResult(
+            return WorkspaceEdit.Result(
                 mode: .execution,
                 touchedPaths: touchedPaths,
                 edits: executionEntries,
@@ -904,7 +343,7 @@ public actor Workspace {
         }
 
         let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
-        var failures: [WorkspaceBatchEditFailure] = []
+        var failures: [WorkspaceEdit.Failure] = []
         var appliedIndices: [Int] = []
 
         for (index, plannedEdit) in plannedEdits.enumerated() {
@@ -914,7 +353,7 @@ public actor Workspace {
                 appliedIndices.append(index)
             } catch {
                 setStatus(.failed, for: &executionEntries[index])
-                let failure = WorkspaceBatchEditFailure(
+                let failure = WorkspaceEdit.Failure(
                     index: index,
                     edit: plannedEdit.edit,
                     message: describe(error)
@@ -927,7 +366,7 @@ public actor Workspace {
                     for skippedIndex in executionEntries.indices where skippedIndex > index {
                         setStatus(.skipped, for: &executionEntries[skippedIndex])
                     }
-                    return WorkspaceBatchEditResult(
+                    return WorkspaceEdit.Result(
                         mode: .execution,
                         touchedPaths: touchedPaths,
                         edits: executionEntries,
@@ -941,7 +380,7 @@ public actor Workspace {
                     for skippedIndex in executionEntries.indices where skippedIndex > index {
                         setStatus(.skipped, for: &executionEntries[skippedIndex])
                     }
-                    return WorkspaceBatchEditResult(
+                    return WorkspaceEdit.Result(
                         mode: .execution,
                         touchedPaths: touchedPaths,
                         edits: executionEntries,
@@ -952,7 +391,7 @@ public actor Workspace {
             }
         }
 
-        return WorkspaceBatchEditResult(
+        return WorkspaceEdit.Result(
             mode: .execution,
             touchedPaths: touchedPaths,
             edits: executionEntries,
@@ -983,10 +422,10 @@ public actor Workspace {
         return string
     }
 
-    private func buildTree(path: WorkspacePath, depth: Int, maxDepth: Int?) async throws -> WorkspaceTreeNode {
+    private func buildTree(path: WorkspacePath, depth: Int, maxDepth: Int?) async throws -> WorkspaceTree {
         let info = try await filesystem.stat(path: path)
         let kind = treeKind(for: info)
-        let children: [WorkspaceTreeNode]?
+        let children: [WorkspaceTree]?
 
         if info.isDirectory, maxDepth.map({ depth < $0 }) ?? true {
             let entries = try await filesystem.listDirectory(path: path)
@@ -1003,7 +442,7 @@ public actor Workspace {
             children = nil
         }
 
-        return WorkspaceTreeNode(
+        return WorkspaceTree(
             path: path,
             kind: kind,
             size: info.size,
@@ -1019,7 +458,7 @@ public actor Workspace {
         var directoryCount = info.isDirectory ? 1 : 0
         var symlinkCount = info.isSymbolicLink ? 1 : 0
         var totalBytes = info.size
-        var childSummaries: [WorkspaceTreeSummaryEntry] = []
+        var childSummaries: [WorkspaceTreeSummary.Entry] = []
 
         if info.isDirectory, maxDepth.map({ depth < $0 }) ?? true {
             let entries = try await filesystem.listDirectory(path: path)
@@ -1031,7 +470,7 @@ public actor Workspace {
                 symlinkCount += childSummary.symlinkCount
                 totalBytes += childSummary.totalBytes
                 childSummaries.append(
-                    WorkspaceTreeSummaryEntry(
+                    WorkspaceTreeSummary.Entry(
                         path: childPath,
                         kind: treeKind(for: entry.info),
                         size: entry.info.size,
@@ -1051,7 +490,7 @@ public actor Workspace {
         )
     }
 
-    private func treeKind(for info: FileInfo) -> WorkspaceTreeNodeKind {
+    private func treeKind(for info: FileInfo) -> WorkspaceTree.Kind {
         if info.isDirectory {
             return .directory
         }
@@ -1078,7 +517,7 @@ public actor Workspace {
         }
     }
 
-    private func canonicalizedTouchedPaths(for changes: [WorkspaceTextChange]) -> [WorkspacePath] {
+    private func canonicalizedTouchedPaths(for changes: [ReplacementResult.Change]) -> [WorkspacePath] {
         Array(Set(changes.map(\.path))).sorted()
     }
 
@@ -1102,7 +541,7 @@ public actor Workspace {
         return try await target.stat(path: path)
     }
 
-    private func plannedReplacementChanges(for request: WorkspaceReplaceRequest) async throws -> [PlannedReplacement] {
+    private func plannedReplacementChanges(for request: ReplacementRequest) async throws -> [PlannedReplacement] {
         let paths = try await matchedPaths(for: request)
         var changes: [PlannedReplacement] = []
 
@@ -1122,7 +561,7 @@ public actor Workspace {
 
             changes.append(
                 PlannedReplacement(
-                    change: WorkspaceTextChange(
+                    change: .init(
                         path: path,
                         replacements: replacement.count,
                         diff: textDiff(from: originalContent, to: replacement.updatedContent)
@@ -1135,7 +574,7 @@ public actor Workspace {
         return changes
     }
 
-    private func matchedPaths(for request: WorkspaceReplaceRequest) async throws -> [WorkspacePath] {
+    private func matchedPaths(for request: ReplacementRequest) async throws -> [WorkspacePath] {
         let included = try await expandedPaths(for: request.include, currentDirectory: request.scope)
         guard !included.isEmpty else {
             return []
@@ -1159,7 +598,7 @@ public actor Workspace {
 
     private func replacement(
         in content: String,
-        matching pattern: WorkspaceSearchPattern,
+        matching pattern: ReplacementRequest.Pattern,
         replacement: String
     ) throws -> (count: Int, updatedContent: String) {
         switch pattern {
@@ -1230,12 +669,12 @@ public actor Workspace {
     private func planEntry(
         for edit: WorkspaceEdit,
         on target: any WorkspaceFilesystem
-    ) async throws -> WorkspaceBatchEditEntry {
+    ) async throws -> WorkspaceEdit.Entry {
         switch edit {
         case let .writeFile(path, content):
             let original = try await readUTF8IfPresent(path, on: target)
             let info = try await statIfPresent(path, on: target)
-            return WorkspaceBatchEditEntry(
+            return WorkspaceEdit.Entry(
                 operation: .writeFile,
                 effect: effect(forOriginalContent: original, updatedContent: content),
                 touchedPaths: [path],
@@ -1252,7 +691,7 @@ public actor Workspace {
             let original = try await readUTF8IfPresent(path, on: target)
             let updated = (original ?? "") + content
             let info = try await statIfPresent(path, on: target)
-            return WorkspaceBatchEditEntry(
+            return WorkspaceEdit.Entry(
                 operation: .appendFile,
                 effect: effect(forOriginalContent: original, updatedContent: updated),
                 touchedPaths: [path],
@@ -1267,7 +706,7 @@ public actor Workspace {
             )
         case let .delete(path, _):
             let existing = try await statIfPresent(path, on: target)
-            return WorkspaceBatchEditEntry(
+            return WorkspaceEdit.Entry(
                 operation: .delete,
                 effect: existing == nil ? .unchanged : .deleted,
                 touchedPaths: [path],
@@ -1275,20 +714,20 @@ public actor Workspace {
             )
         case let .createDirectory(path, _):
             let existing = try await statIfPresent(path, on: target)
-            return WorkspaceBatchEditEntry(
+            return WorkspaceEdit.Entry(
                 operation: .createDirectory,
                 effect: existing == nil ? .created : .unchanged,
                 touchedPaths: [path]
             )
         case let .move(from, to):
-            return WorkspaceBatchEditEntry(
+            return WorkspaceEdit.Entry(
                 operation: .move,
                 effect: from == to ? .unchanged : .moved,
                 touchedPaths: [from, to],
                 fileChanges: from == to ? [] : try await transferFileChanges(from: from, to: to, effect: .moved, on: target)
             )
         case let .copy(from, to, _):
-            return WorkspaceBatchEditEntry(
+            return WorkspaceEdit.Entry(
                 operation: .copy,
                 effect: .copied,
                 touchedPaths: [from, to],
@@ -1297,7 +736,7 @@ public actor Workspace {
         }
     }
 
-    private func effect(forOriginalContent originalContent: String?, updatedContent: String) -> WorkspaceBatchEditEffect {
+    private func effect(forOriginalContent originalContent: String?, updatedContent: String) -> WorkspaceEdit.Effect {
         guard let originalContent else {
             return .created
         }
@@ -1306,11 +745,11 @@ public actor Workspace {
 
     private func textFileChange(
         path: WorkspacePath,
-        kind: WorkspaceTreeNodeKind,
+        kind: WorkspaceTree.Kind,
         originalContent: String?,
         updatedContent: String
-    ) -> WorkspaceFileChange {
-        WorkspaceFileChange(
+    ) -> WorkspaceEdit.FileChange {
+        WorkspaceEdit.FileChange(
             path: path,
             kind: kind,
             effect: effect(forOriginalContent: originalContent, updatedContent: updatedContent),
@@ -1321,21 +760,21 @@ public actor Workspace {
     private func deletionFileChanges(
         at path: WorkspacePath,
         on target: any WorkspaceFilesystem
-    ) async throws -> [WorkspaceFileChange] {
+    ) async throws -> [WorkspaceEdit.FileChange] {
         guard let info = try await statIfPresent(path, on: target) else {
             return []
         }
 
         if info.isDirectory {
             let entries = try await target.listDirectory(path: path)
-            var fileChanges: [WorkspaceFileChange] = []
+            var fileChanges: [WorkspaceEdit.FileChange] = []
             for entry in entries.sorted(by: { $0.name < $1.name }) {
                 fileChanges += try await deletionFileChanges(at: path.appending(entry.name), on: target)
             }
             return fileChanges
         }
 
-        let diff: WorkspaceTextDiff?
+        let diff: TextDiff?
         if info.isSymbolicLink {
             diff = nil
         } else if let originalContent = try await readUTF8IfPresent(
@@ -1349,7 +788,7 @@ public actor Workspace {
         }
 
         return [
-            WorkspaceFileChange(
+            WorkspaceEdit.FileChange(
                 path: path,
                 kind: treeKind(for: info),
                 effect: .deleted,
@@ -1361,16 +800,16 @@ public actor Workspace {
     private func transferFileChanges(
         from sourcePath: WorkspacePath,
         to destinationPath: WorkspacePath,
-        effect: WorkspaceBatchEditEffect,
+        effect: WorkspaceEdit.Effect,
         on target: any WorkspaceFilesystem
-    ) async throws -> [WorkspaceFileChange] {
+    ) async throws -> [WorkspaceEdit.FileChange] {
         guard let info = try await statIfPresent(sourcePath, on: target) else {
             return []
         }
 
         if info.isDirectory {
             let entries = try await target.listDirectory(path: sourcePath)
-            var fileChanges: [WorkspaceFileChange] = []
+            var fileChanges: [WorkspaceEdit.FileChange] = []
             for entry in entries.sorted(by: { $0.name < $1.name }) {
                 fileChanges += try await transferFileChanges(
                     from: sourcePath.appending(entry.name),
@@ -1383,7 +822,7 @@ public actor Workspace {
         }
 
         return [
-            WorkspaceFileChange(
+            WorkspaceEdit.FileChange(
                 path: destinationPath,
                 sourcePath: sourcePath,
                 kind: treeKind(for: info),
@@ -1417,14 +856,14 @@ public actor Workspace {
         }
     }
 
-    private func setStatus(_ status: WorkspaceChangeStatus, for entry: inout WorkspaceBatchEditEntry) {
+    private func setStatus(_ status: MutationStatus, for entry: inout WorkspaceEdit.Entry) {
         entry.status = status
         for index in entry.fileChanges.indices {
             entry.fileChanges[index].status = status
         }
     }
 
-    private func textDiff(from originalContent: String, to updatedContent: String) -> WorkspaceTextDiff {
+    private func textDiff(from originalContent: String, to updatedContent: String) -> TextDiff {
         let originalLines = diffTokens(in: originalContent)
         let updatedLines = diffTokens(in: updatedContent)
         let changes = Array(updatedLines.difference(from: originalLines))
@@ -1443,7 +882,7 @@ public actor Workspace {
             return nil
         }, by: \.0)
 
-        var lines: [WorkspaceTextDiffLine] = []
+        var lines: [TextDiff.Line] = []
         var originalIndex = 0
         var updatedIndex = 0
         var originalLineNumber = 1
@@ -1453,7 +892,7 @@ public actor Workspace {
             if let removed = removals[originalIndex] {
                 for (_, token) in removed {
                     lines.append(
-                        WorkspaceTextDiffLine(
+                        TextDiff.Line(
                             kind: .removed,
                             text: token.text,
                             hasTrailingNewline: token.hasTrailingNewline,
@@ -1469,7 +908,7 @@ public actor Workspace {
             if let inserted = insertions[updatedIndex] {
                 for (_, token) in inserted {
                     lines.append(
-                        WorkspaceTextDiffLine(
+                        TextDiff.Line(
                             kind: .added,
                             text: token.text,
                             hasTrailingNewline: token.hasTrailingNewline,
@@ -1488,7 +927,7 @@ public actor Workspace {
 
             let updatedLine = updatedLines[updatedIndex]
             lines.append(
-                WorkspaceTextDiffLine(
+                TextDiff.Line(
                     kind: .context,
                     text: updatedLine.text,
                     hasTrailingNewline: updatedLine.hasTrailingNewline,
@@ -1504,7 +943,7 @@ public actor Workspace {
 
         let changedIndices = lines.indices.filter { lines[$0].kind != .context }
         guard !changedIndices.isEmpty else {
-            return WorkspaceTextDiff(hunks: [])
+            return TextDiff(hunks: [])
         }
 
         var ranges: [Range<Int>] = []
@@ -1522,7 +961,7 @@ public actor Workspace {
             let hunkLines = Array(lines[range])
             let originalLineNumbers = hunkLines.compactMap(\.oldLineNumber)
             let updatedLineNumbers = hunkLines.compactMap(\.newLineNumber)
-            return WorkspaceTextDiffHunk(
+            return TextDiff.Hunk(
                 oldStartLine: originalLineNumbers.first ?? 1,
                 oldLineCount: originalLineNumbers.count,
                 newStartLine: updatedLineNumbers.first ?? 1,
@@ -1531,7 +970,7 @@ public actor Workspace {
             )
         }
 
-        return WorkspaceTextDiff(hunks: hunks)
+        return TextDiff(hunks: hunks)
     }
 
     private func diffTokens(in text: String) -> [DiffToken] {
@@ -1657,10 +1096,6 @@ public actor Workspace {
         }
     }
 }
-
-/// Deprecated alias for ``Workspace``.
-@available(*, deprecated, renamed: "Workspace")
-public typealias WorkspaceState = Workspace
 
 private extension Array {
     func asyncMap<T: Sendable>(

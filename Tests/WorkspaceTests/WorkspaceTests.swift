@@ -178,15 +178,15 @@ private struct DemoConfig: Codable, Equatable, Sendable {
     var enabled: Bool
 }
 
-private func diffLines(_ diff: WorkspaceTextDiff?) -> [WorkspaceTextDiffLine] {
+private func diffLines(_ diff: TextDiff?) -> [TextDiff.Line] {
     diff?.hunks.flatMap(\.lines) ?? []
 }
 
-private func addedLineTexts(_ diff: WorkspaceTextDiff?) -> [String] {
+private func addedLineTexts(_ diff: TextDiff?) -> [String] {
     diffLines(diff).filter { $0.kind == .added }.map(\.text)
 }
 
-private func removedLineTexts(_ diff: WorkspaceTextDiff?) -> [String] {
+private func removedLineTexts(_ diff: TextDiff?) -> [String] {
     diffLines(diff).filter { $0.kind == .removed }.map(\.text)
 }
 
@@ -213,6 +213,14 @@ struct WorkspaceTests {
         try await state.writeJson("/config.json", value: DemoConfig(name: "demo", enabled: true))
         let loaded = try await state.readJson("/config.json", as: DemoConfig.self)
         #expect(loaded == DemoConfig(name: "demo", enabled: true))
+    }
+
+    @Test
+    func `nested Codable mutation metadata roundtrips`() throws {
+        let original = MutationMode.execution
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(MutationMode.self, from: data)
+        #expect(decoded == original)
     }
 
     @Test
@@ -273,7 +281,7 @@ struct WorkspaceTests {
         let state = Workspace(filesystem: fs)
 
         let result = try await state.previewReplacement(
-            WorkspaceReplaceRequest(pattern: "/src/*.txt", search: "foo", replacement: "baz")
+            ReplacementRequest(pattern: "/src/*.txt", search: "foo", replacement: "baz")
         )
         #expect(result.mode == .preview)
         #expect(result.touchedPaths == ["/src/a.txt", "/src/b.txt"])
@@ -295,7 +303,7 @@ struct WorkspaceTests {
         )
 
         let result = try await state.applyReplacement(
-            WorkspaceReplaceRequest(pattern: "/src/*.txt", search: "foo", replacement: "bar"),
+            ReplacementRequest(pattern: "/src/*.txt", search: "foo", replacement: "bar"),
             failurePolicy: .rollback
         )
         #expect(result.rolledBack)
@@ -318,7 +326,7 @@ struct WorkspaceTests {
         )
 
         let result = try await state.applyReplacement(
-            WorkspaceReplaceRequest(pattern: "/src/*.txt", search: .regularExpression("f.o"), replacement: "bar"),
+            ReplacementRequest(pattern: "/src/*.txt", search: .regularExpression("f.o"), replacement: "bar"),
             failurePolicy: .bestEffort
         )
 
@@ -343,7 +351,7 @@ struct WorkspaceTests {
         )
 
         let result = try await state.applyReplacement(
-            WorkspaceReplaceRequest(pattern: "/src/*.txt", search: "foo", replacement: "bar"),
+            ReplacementRequest(pattern: "/src/*.txt", search: "foo", replacement: "bar"),
             failurePolicy: .failFast
         )
 
@@ -362,7 +370,7 @@ struct WorkspaceTests {
         let state = Workspace(filesystem: InMemoryFilesystem())
 
         let result = try await state.applyReplacement(
-            WorkspaceReplaceRequest(pattern: "/missing/*.txt", search: "foo", replacement: "bar")
+            ReplacementRequest(pattern: "/missing/*.txt", search: "foo", replacement: "bar")
         )
 
         #expect(result.mode == .execution)
@@ -381,7 +389,7 @@ struct WorkspaceTests {
         let state = Workspace(filesystem: fs)
 
         let result = try await state.previewReplacement(
-            WorkspaceReplaceRequest(
+            ReplacementRequest(
                 scope: "/src",
                 include: ["*.txt", "dir"],
                 exclude: ["skip.txt"],
@@ -406,7 +414,7 @@ struct WorkspaceTests {
 
         do {
             _ = try await state.previewReplacement(
-                WorkspaceReplaceRequest(
+                ReplacementRequest(
                     include: ["/binary.bin"],
                     search: .literal("x"),
                     replacement: "y"
@@ -419,7 +427,7 @@ struct WorkspaceTests {
 
         do {
             _ = try await state.previewReplacement(
-                WorkspaceReplaceRequest(
+                ReplacementRequest(
                     include: ["/note.txt"],
                     search: .literal("", caseSensitive: false),
                     replacement: "y"
@@ -432,7 +440,7 @@ struct WorkspaceTests {
 
         do {
             _ = try await state.previewReplacement(
-                WorkspaceReplaceRequest(
+                ReplacementRequest(
                     include: ["/note.txt"],
                     search: .regularExpression(""),
                     replacement: "y"

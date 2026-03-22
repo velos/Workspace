@@ -205,7 +205,7 @@ Text replacements use a request type so scope, include, exclude, and matching st
 
 ```swift
 let preview = try await workspace.previewReplacement(
-    WorkspaceReplaceRequest(
+    ReplacementRequest(
         pattern: "/src/*.txt",
         search: .literal("foo"),
         replacement: "bar"
