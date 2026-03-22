@@ -1,7 +1,7 @@
 import Foundation
 
 /// A disk-backed filesystem rooted in a standard app sandbox location.
-public final class SandboxFilesystem: WorkspaceFilesystem, @unchecked Sendable {
+public final class SandboxFilesystem: FileSystem, @unchecked Sendable {
     /// Supported strategies for choosing the sandbox root.
     public enum Root: Sendable {
         /// The user's documents directory.
@@ -22,87 +22,87 @@ public final class SandboxFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     public init(root: Root, fileManager: FileManager = .default) throws {
         backing = ReadWriteFilesystem(fileManager: fileManager)
         let resolvedRoot = try Self.resolveRootURL(root, fileManager: fileManager)
-        try backing.configure(rootDirectory: resolvedRoot)
+        try backing.applyConfiguration(rootDirectory: resolvedRoot)
     }
 
-    /// See ``WorkspaceFilesystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) throws {
-        try backing.configure(rootDirectory: rootDirectory)
+    /// See ``FileSystem/configure(rootDirectory:)``.
+    public func configure(rootDirectory: URL) async throws {
+        try await backing.configure(rootDirectory: rootDirectory)
     }
 
-    /// See ``WorkspaceFilesystem/stat(path:)``.
+    /// See ``FileSystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
         try await backing.stat(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/listDirectory(path:)``.
+    /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         try await backing.listDirectory(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/readFile(path:)``.
+    /// See ``FileSystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
         try await backing.readFile(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
+    /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         try await backing.writeFile(path: path, data: data, append: append)
     }
 
-    /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
+    /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
         try await backing.createDirectory(path: path, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
+    /// See ``FileSystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
         try await backing.remove(path: path, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/move(from:to:)``.
+    /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         try await backing.move(from: sourcePath, to: destinationPath)
     }
 
-    /// See ``WorkspaceFilesystem/copy(from:to:recursive:)``.
+    /// See ``FileSystem/copy(from:to:recursive:)``.
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
         try await backing.copy(from: sourcePath, to: destinationPath, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
+    /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
         try await backing.createSymlink(path: path, target: target)
     }
 
-    /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
+    /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         try await backing.createHardLink(path: path, target: target)
     }
 
-    /// See ``WorkspaceFilesystem/readSymlink(path:)``.
+    /// See ``FileSystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
         try await backing.readSymlink(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
-    public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
+    /// See ``FileSystem/setPermissions(path:permissions:)``.
+    public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
         try await backing.setPermissions(path: path, permissions: permissions)
     }
 
-    /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
+    /// See ``FileSystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await backing.resolveRealPath(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/exists(path:)``.
+    /// See ``FileSystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
         await backing.exists(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
+    /// See ``FileSystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try await backing.glob(pattern: pattern, currentDirectory: currentDirectory)
     }
@@ -113,20 +113,20 @@ public final class SandboxFilesystem: WorkspaceFilesystem, @unchecked Sendable {
             return fileManager.temporaryDirectory
         case .documents:
             guard let url = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
-                throw ShellError.unsupported("documents directory is unavailable")
+                throw WorkspaceError.unsupported("documents directory is unavailable")
             }
             return url
         case .caches:
             guard let url = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
-                throw ShellError.unsupported("caches directory is unavailable")
+                throw WorkspaceError.unsupported("caches directory is unavailable")
             }
             return url
         case let .appGroup(identifier):
             guard identifier.hasPrefix("group.") else {
-                throw ShellError.unsupported("invalid app group identifier: \(identifier)")
+                throw WorkspaceError.unsupported("invalid app group identifier: \(identifier)")
             }
             guard let url = fileManager.containerURL(forSecurityApplicationGroupIdentifier: identifier) else {
-                throw ShellError.unsupported("app group container unavailable: \(identifier)")
+                throw WorkspaceError.unsupported("app group container unavailable: \(identifier)")
             }
             return url
         case let .url(url):

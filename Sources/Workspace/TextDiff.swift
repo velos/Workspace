@@ -1,9 +1,9 @@
 import Foundation
 
 /// A line-based diff between two text snapshots.
-public struct TextDiff: Sendable, Equatable {
+public struct TextDiff: Sendable, Equatable, Codable {
     /// A contiguous hunk in a structured text diff.
-    public struct Hunk: Sendable, Equatable {
+    public struct Hunk: Sendable, Equatable, Codable {
         /// The 1-based starting line number in the original content.
         public var oldStartLine: Int
         /// The number of original lines represented in the hunk.
@@ -32,7 +32,7 @@ public struct TextDiff: Sendable, Equatable {
     }
 
     /// A single line in a structured text diff.
-    public struct Line: Sendable, Equatable {
+    public struct Line: Sendable, Equatable, Codable {
         /// The line classification used within a text diff.
         public enum Kind: String, Sendable, Codable {
             /// A context line that is unchanged between the old and new content.

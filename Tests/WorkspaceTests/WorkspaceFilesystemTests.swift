@@ -3,13 +3,13 @@ import Testing
 @testable import Workspace
 
 private actor PermissionRecorder {
-    private(set) var requests: [WorkspacePermissionRequest] = []
+    private(set) var requests: [PermissionRequest] = []
 
-    func record(_ request: WorkspacePermissionRequest) {
+    func record(_ request: PermissionRequest) {
         requests.append(request)
     }
 
-    func snapshot() -> [WorkspacePermissionRequest] {
+    func snapshot() -> [PermissionRequest] {
         requests
     }
 }
@@ -34,14 +34,14 @@ struct WorkspaceFilesystemTests {
         let base = InMemoryFilesystem()
 
         let recorder = PermissionRecorder()
-        let authorizer = WorkspacePermissionAuthorizer { request in
+        let authorizer = PermissionAuthorizer { request in
             await recorder.record(request)
             if request.operation == .writeFile {
                 return .deny(message: "writes are blocked")
             }
             return .allow
         }
-        let filesystem = PermissionedWorkspaceFilesystem(base: base, authorizer: authorizer)
+        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
 
         do {
             try await filesystem.writeFile(path: "/tmp/../note.txt", data: Data("hello".utf8), append: false)
@@ -63,11 +63,11 @@ struct WorkspaceFilesystemTests {
         try await base.writeFile(path: "/doc.txt", data: Data("hello".utf8), append: false)
 
         let recorder = PermissionRecorder()
-        let authorizer = WorkspacePermissionAuthorizer { request in
+        let authorizer = PermissionAuthorizer { request in
             await recorder.record(request)
             return .allowForSession
         }
-        let filesystem = PermissionedWorkspaceFilesystem(base: base, authorizer: authorizer)
+        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
 
         _ = try await filesystem.readFile(path: "/doc.txt")
         _ = try await filesystem.readFile(path: "/doc.txt")
@@ -90,11 +90,11 @@ struct WorkspaceFilesystemTests {
         )
 
         let recorder = PermissionRecorder()
-        let authorizer = WorkspacePermissionAuthorizer { request in
+        let authorizer = PermissionAuthorizer { request in
             await recorder.record(request)
             return .allow
         }
-        let filesystem = PermissionedWorkspaceFilesystem(base: mountable, authorizer: authorizer)
+        let filesystem = PermissionedFileSystem(base: mountable, authorizer: authorizer)
 
         let data = try await filesystem.readFile(path: "/docs/guide.txt")
         #expect(String(decoding: data, as: UTF8.self) == "guide")
@@ -147,12 +147,12 @@ struct WorkspaceFilesystemTests {
         let fileURL = root.appendingPathComponent("note.txt")
         try Data("disk".utf8).write(to: fileURL)
 
-        let filesystem = try OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
         try await filesystem.writeFile(path: "/note.txt", data: Data("overlay".utf8), append: false)
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("overlay".utf8))
 
         try Data("disk-updated".utf8).write(to: fileURL)
-        try filesystem.reload()
+        try await filesystem.reload()
 
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk-updated".utf8))
     }
@@ -179,7 +179,7 @@ struct WorkspaceFilesystemTests {
         #expect(!(await filesystem.exists(path: "/target.txt")))
         #expect(try await filesystem.readFile(path: "/other/moved.txt") == Data("two".utf8))
 
-        try filesystem.configure(rootDirectory: URL(fileURLWithPath: "/ignored"))
+        try await filesystem.configure(rootDirectory: URL(fileURLWithPath: "/ignored"))
         #expect(await filesystem.exists(path: "/"))
         #expect(!(await filesystem.exists(path: "/other/moved.txt")))
     }

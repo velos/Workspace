@@ -15,18 +15,18 @@ private enum WorkspaceTestSupport {
     }
 }
 
-private final class FailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable {
-    private let base: any WorkspaceFilesystem
+private final class FailOnceFilesystem: FileSystem, @unchecked Sendable {
+    private let base: any FileSystem
     private let failingWritePaths: Set<WorkspacePath>
     private var failedWritePaths: Set<WorkspacePath> = []
 
-    init(base: any WorkspaceFilesystem, failingWritePaths: Set<WorkspacePath>) {
+    init(base: any FileSystem, failingWritePaths: Set<WorkspacePath>) {
         self.base = base
         self.failingWritePaths = failingWritePaths
     }
 
-    func configure(rootDirectory: URL) throws {
-        try base.configure(rootDirectory: rootDirectory)
+    func configure(rootDirectory: URL) async throws {
+        try await base.configure(rootDirectory: rootDirectory)
     }
 
     func stat(path: WorkspacePath) async throws -> FileInfo {
@@ -77,7 +77,7 @@ private final class FailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable
         try await base.readSymlink(path: path)
     }
 
-    func setPermissions(path: WorkspacePath, permissions: Int) async throws {
+    func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
         try await base.setPermissions(path: path, permissions: permissions)
     }
 
@@ -94,18 +94,18 @@ private final class FailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable
     }
 }
 
-private final class NSErrorFailOnceFilesystem: WorkspaceFilesystem, @unchecked Sendable {
-    private let base: any WorkspaceFilesystem
+private final class NSErrorFailOnceFilesystem: FileSystem, @unchecked Sendable {
+    private let base: any FileSystem
     private let failingWritePaths: Set<WorkspacePath>
     private var failedWritePaths: Set<WorkspacePath> = []
 
-    init(base: any WorkspaceFilesystem, failingWritePaths: Set<WorkspacePath>) {
+    init(base: any FileSystem, failingWritePaths: Set<WorkspacePath>) {
         self.base = base
         self.failingWritePaths = failingWritePaths
     }
 
-    func configure(rootDirectory: URL) throws {
-        try base.configure(rootDirectory: rootDirectory)
+    func configure(rootDirectory: URL) async throws {
+        try await base.configure(rootDirectory: rootDirectory)
     }
 
     func stat(path: WorkspacePath) async throws -> FileInfo {
@@ -156,7 +156,7 @@ private final class NSErrorFailOnceFilesystem: WorkspaceFilesystem, @unchecked S
         try await base.readSymlink(path: path)
     }
 
-    func setPermissions(path: WorkspacePath, permissions: Int) async throws {
+    func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
         try await base.setPermissions(path: path, permissions: permissions)
     }
 
@@ -194,9 +194,9 @@ private func removedLineTexts(_ diff: TextDiff?) -> [String] {
 struct WorkspaceTests {
     @Test
     func `workspace module reexports core filesystem primitives`() async throws {
-        let workspaceFilesystem: any WorkspaceFilesystem = InMemoryFilesystem()
+        let workspaceFilesystem: any FileSystem = InMemoryFilesystem()
         let mount = MountableFilesystem.Mount(mountPoint: "/memory", filesystem: InMemoryFilesystem())
-        let permission = WorkspacePermissionRequest(operation: .readFile, path: "/memory/note.txt")
+        let permission = PermissionRequest(operation: .readFile, path: "/memory/note.txt")
         let error = WorkspaceError.unsupported("workspace shim check")
 
         #expect(await workspaceFilesystem.exists(path: "/"))
@@ -206,12 +206,12 @@ struct WorkspaceTests {
     }
 
     @Test
-    func `readJson and writeJson roundtrip`() async throws {
+    func `readJSON and writeJSON roundtrip`() async throws {
         let fs = InMemoryFilesystem()
         let state = Workspace(filesystem: fs)
 
-        try await state.writeJson("/config.json", value: DemoConfig(name: "demo", enabled: true))
-        let loaded = try await state.readJson("/config.json", as: DemoConfig.self)
+        try await state.writeJSON(DemoConfig(name: "demo", enabled: true), to: "/config.json")
+        let loaded: DemoConfig = try await state.readJSON(from: "/config.json")
         #expect(loaded == DemoConfig(name: "demo", enabled: true))
     }
 
@@ -230,7 +230,7 @@ struct WorkspaceTests {
         let state = Workspace(filesystem: fs)
 
         do {
-            _ = try await state.readJson("/broken.json", as: DemoConfig.self)
+            _ = try await state.readJSON(DemoConfig.self, from: "/broken.json")
             Issue.record("expected invalid JSON error")
         } catch let error as WorkspaceError {
             #expect(error.description.contains("invalid JSON"))
@@ -619,10 +619,9 @@ struct WorkspaceTests {
 
         let fileInfo = FileInfo(
             path: "/tmp/../file.txt",
-            isDirectory: false,
-            isSymbolicLink: false,
+            kind: .file,
             size: 7,
-            permissions: 0o644,
+            permissions: POSIXPermissions(0o644),
             modificationDate: nil
         )
         #expect(fileInfo.path == "/file.txt")
@@ -640,8 +639,8 @@ struct WorkspaceTests {
         let mountable = MountableFilesystem(
             base: InMemoryFilesystem(),
             mounts: [
-                .init(mountPoint: "/workspace", filesystem: try OverlayFilesystem(rootDirectory: workspaceRoot)),
-                .init(mountPoint: "/docs", filesystem: try OverlayFilesystem(rootDirectory: docsRoot)),
+                .init(mountPoint: "/workspace", filesystem: try await OverlayFilesystem(rootDirectory: workspaceRoot)),
+                .init(mountPoint: "/docs", filesystem: try await OverlayFilesystem(rootDirectory: docsRoot)),
             ]
         )
 

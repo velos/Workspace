@@ -24,13 +24,13 @@ private enum WorkspaceCoverageTestSupport {
 }
 
 private actor CoveragePermissionRecorder {
-    private(set) var requests: [WorkspacePermissionRequest] = []
+    private(set) var requests: [PermissionRequest] = []
 
-    func record(_ request: WorkspacePermissionRequest) {
+    func record(_ request: PermissionRequest) {
         requests.append(request)
     }
 
-    func snapshot() -> [WorkspacePermissionRequest] {
+    func snapshot() -> [PermissionRequest] {
         requests
     }
 }
@@ -73,9 +73,9 @@ struct WorkspaceCoverageTests {
         try await filesystem.createHardLink(path: "/docs/hard.txt", target: "/docs/note.txt")
         #expect(try await filesystem.readFile(path: "/docs/hard.txt") == WorkspaceCoverageTestSupport.data("hello world"))
 
-        try await filesystem.setPermissions(path: "/docs/note.txt", permissions: 0o600)
+        try await filesystem.setPermissions(path: "/docs/note.txt", permissions: POSIXPermissions(0o600))
         let updatedInfo = try await filesystem.stat(path: "/docs/note.txt")
-        #expect(updatedInfo.permissions == 0o600)
+        #expect(updatedInfo.permissions == POSIXPermissions(0o600))
 
         try await filesystem.createDirectory(path: "/tree/sub", recursive: true)
         try await filesystem.writeFile(path: "/tree/sub/deep.txt", data: WorkspaceCoverageTestSupport.data("nested"), append: false)
@@ -174,13 +174,13 @@ struct WorkspaceCoverageTests {
         try await filesystem.createDirectory(path: "/docs/external/sub", recursive: true)
         try await filesystem.createSymlink(path: "/docs/external/link.txt", target: "guide.txt")
         try await filesystem.createHardLink(path: "/docs/external/hard.txt", target: "/docs/external/guide.txt")
-        try await filesystem.setPermissions(path: "/docs/external/guide.txt", permissions: 0o600)
+        try await filesystem.setPermissions(path: "/docs/external/guide.txt", permissions: POSIXPermissions(0o600))
 
         #expect(try await filesystem.readSymlink(path: "/docs/external/link.txt") == "guide.txt")
         #expect(try await filesystem.resolveRealPath(path: "/docs/external/link.txt") == "/docs/external/guide.txt")
         #expect(try await mountedDocs.readFile(path: "/new.txt") == WorkspaceCoverageTestSupport.data("new"))
         #expect(try await mountedDocs.readFile(path: "/hard.txt") == WorkspaceCoverageTestSupport.data("guide"))
-        #expect(try await mountedDocs.stat(path: "/guide.txt").permissions == 0o600)
+        #expect(try await mountedDocs.stat(path: "/guide.txt").permissions == POSIXPermissions(0o600))
 
         let globbed = try await filesystem.glob(pattern: "/docs/*.txt", currentDirectory: "/")
         #expect(globbed.contains("/docs/local.txt"))
@@ -245,7 +245,7 @@ struct WorkspaceCoverageTests {
 
         let base = ReadWriteFilesystem()
         let filesystem = MountableFilesystem(base: base)
-        try filesystem.configure(rootDirectory: baseRoot)
+        try await filesystem.configure(rootDirectory: baseRoot)
 
         let memory = InMemoryFilesystem()
         filesystem.mount("/memory", filesystem: memory)
@@ -272,13 +272,13 @@ struct WorkspaceCoverageTests {
         let symlinkURL = root.appendingPathComponent("alias.txt")
         try FileManager.default.createSymbolicLink(atPath: symlinkURL.path, withDestinationPath: "dir/file.txt")
 
-        let filesystem = try OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
 
         #expect((try await filesystem.listDirectory(path: "/")).map(\.name) == ["alias.txt", "dir"])
         #expect((try await filesystem.listDirectory(path: "/dir")).map(\.name) == ["file.txt"])
         #expect(try await filesystem.readFile(path: "/alias.txt") == WorkspaceCoverageTestSupport.data("disk"))
         #expect(try await filesystem.readSymlink(path: "/alias.txt") == "dir/file.txt")
-        #expect(try await filesystem.stat(path: "/dir/file.txt").permissions == 0o640)
+        #expect(try await filesystem.stat(path: "/dir/file.txt").permissions == POSIXPermissions(0o640))
 
         try await filesystem.createDirectory(path: "/scratch", recursive: true)
         try await filesystem.writeFile(path: "/scratch/note.txt", data: WorkspaceCoverageTestSupport.data("hello"), append: false)
@@ -286,7 +286,7 @@ struct WorkspaceCoverageTests {
         try await filesystem.move(from: "/scratch/copy.txt", to: "/scratch/moved.txt")
         try await filesystem.createSymlink(path: "/scratch/link.txt", target: "note.txt")
         try await filesystem.createHardLink(path: "/scratch/hard.txt", target: "/scratch/note.txt")
-        try await filesystem.setPermissions(path: "/scratch/note.txt", permissions: 0o600)
+        try await filesystem.setPermissions(path: "/scratch/note.txt", permissions: POSIXPermissions(0o600))
 
         #expect(try await filesystem.readSymlink(path: "/scratch/link.txt") == "note.txt")
         #expect(try await filesystem.resolveRealPath(path: "/scratch/link.txt") == "/scratch/note.txt")
@@ -302,7 +302,7 @@ struct WorkspaceCoverageTests {
         let unconfigured = OverlayFilesystem()
 
         do {
-            try unconfigured.reload()
+            try await unconfigured.reload()
             Issue.record("expected missing rootDirectory rejection")
         } catch let error as WorkspaceError {
             #expect(error.description.contains("requires rootDirectory"))
@@ -312,7 +312,7 @@ struct WorkspaceCoverageTests {
         try FileManager.default.removeItem(at: root)
 
         let filesystem = OverlayFilesystem()
-        try filesystem.configure(rootDirectory: root)
+        try await filesystem.configure(rootDirectory: root)
 
         #expect(await filesystem.exists(path: "/"))
         #expect(!(await filesystem.exists(path: "/missing.txt")))
@@ -322,11 +322,11 @@ struct WorkspaceCoverageTests {
     func `permissioned filesystem covers forwarded operations`() async throws {
         let base = InMemoryFilesystem()
         let recorder = CoveragePermissionRecorder()
-        let authorizer = WorkspacePermissionAuthorizer { request in
+        let authorizer = PermissionAuthorizer { request in
             await recorder.record(request)
             return .allow
         }
-        let filesystem = PermissionedWorkspaceFilesystem(base: base, authorizer: authorizer)
+        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
 
         try await filesystem.writeFile(path: "/dir/../note.txt", data: WorkspaceCoverageTestSupport.data("hello"), append: false)
         try await filesystem.createDirectory(path: "/links", recursive: true)
@@ -339,7 +339,7 @@ struct WorkspaceCoverageTests {
         _ = try await filesystem.listDirectory(path: "/")
         _ = try await filesystem.readFile(path: "/note.txt")
         _ = try await filesystem.readSymlink(path: "/links/link.txt")
-        try await filesystem.setPermissions(path: "/note.txt", permissions: 0o600)
+        try await filesystem.setPermissions(path: "/note.txt", permissions: POSIXPermissions(0o600))
         _ = try await filesystem.resolveRealPath(path: "/links/link.txt")
         #expect(await filesystem.exists(path: "/note.txt"))
         _ = try await filesystem.glob(pattern: "*.txt", currentDirectory: "/")
@@ -379,9 +379,9 @@ struct WorkspaceCoverageTests {
         defer { WorkspaceCoverageTestSupport.removeDirectory(root) }
 
         let base = ReadWriteFilesystem()
-        let filesystem = PermissionedWorkspaceFilesystem(
+        let filesystem = PermissionedFileSystem(
             base: base,
-            authorizer: WorkspacePermissionAuthorizer { request in
+            authorizer: PermissionAuthorizer { request in
                 if request.operation == .remove {
                     return .deny(message: nil)
                 }
@@ -389,7 +389,7 @@ struct WorkspaceCoverageTests {
             }
         )
 
-        try filesystem.configure(rootDirectory: root)
+        try await filesystem.configure(rootDirectory: root)
         try await filesystem.writeFile(path: "/note.txt", data: WorkspaceCoverageTestSupport.data("hello"), append: false)
 
         do {
@@ -399,9 +399,9 @@ struct WorkspaceCoverageTests {
             #expect(error.description.contains("workspace access denied: remove"))
         }
 
-        let deniedExists = await PermissionedWorkspaceFilesystem(
+        let deniedExists = await PermissionedFileSystem(
             base: base,
-            authorizer: WorkspacePermissionAuthorizer { _ in .deny(message: "blocked") }
+            authorizer: PermissionAuthorizer { _ in .deny(message: "blocked") }
         ).exists(path: "/note.txt")
 
         #expect(!deniedExists)
@@ -421,12 +421,12 @@ struct WorkspaceCoverageTests {
         try await filesystem.move(from: "/copy.txt", to: "/moved.txt")
         try await filesystem.createSymlink(path: "/link.txt", target: "note.txt")
         try await filesystem.createHardLink(path: "/hard.txt", target: "/note.txt")
-        try await filesystem.setPermissions(path: "/note.txt", permissions: 0o600)
+        try await filesystem.setPermissions(path: "/note.txt", permissions: POSIXPermissions(0o600))
 
         #expect(try await filesystem.readFile(path: "/note.txt") == WorkspaceCoverageTestSupport.data("hello"))
         #expect(try await filesystem.readSymlink(path: "/link.txt") == "note.txt")
         #expect(try await filesystem.resolveRealPath(path: "/link.txt") == "/note.txt")
-        #expect(try await filesystem.stat(path: "/note.txt").permissions == 0o600)
+        #expect(try await filesystem.stat(path: "/note.txt").permissions == POSIXPermissions(0o600))
         #expect(await filesystem.exists(path: "/hard.txt"))
         #expect((try await filesystem.listDirectory(path: "/")).map(\.name).sorted() == ["dir", "hard.txt", "link.txt", "moved.txt", "note.txt"])
         #expect((try await filesystem.glob(pattern: "/*.txt", currentDirectory: "/")).contains("/moved.txt"))
@@ -461,7 +461,7 @@ struct WorkspaceCoverageTests {
         defer { WorkspaceCoverageTestSupport.removeDirectory(secondRoot) }
 
         let filesystem = try SandboxFilesystem(root: .url(firstRoot))
-        try filesystem.configure(rootDirectory: secondRoot)
+        try await filesystem.configure(rootDirectory: secondRoot)
         try await filesystem.writeFile(path: "/configured.txt", data: WorkspaceCoverageTestSupport.data("configured"), append: false)
 
         #expect(FileManager.default.fileExists(atPath: secondRoot.appendingPathComponent("configured.txt").path))
@@ -499,17 +499,17 @@ struct WorkspaceCoverageTests {
         try await filesystem.move(from: "/copy.txt", to: "/moved.txt")
         try await filesystem.createSymlink(path: "/link.txt", target: "note.txt")
         try await filesystem.createHardLink(path: "/hard.txt", target: "/note.txt")
-        try await filesystem.setPermissions(path: "/note.txt", permissions: 0o600)
+        try await filesystem.setPermissions(path: "/note.txt", permissions: POSIXPermissions(0o600))
 
         #expect(try await filesystem.readFile(path: "/note.txt") == WorkspaceCoverageTestSupport.data("hello"))
         #expect(try await filesystem.readSymlink(path: "/link.txt") == "note.txt")
         #expect(try await filesystem.resolveRealPath(path: "/link.txt") == "/note.txt")
-        #expect(try await filesystem.stat(path: "/note.txt").permissions == 0o600)
+        #expect(try await filesystem.stat(path: "/note.txt").permissions == POSIXPermissions(0o600))
         #expect(await filesystem.exists(path: "/hard.txt"))
         #expect((try await filesystem.listDirectory(path: "/")).map(\.name).sorted() == ["dir", "hard.txt", "link.txt", "moved.txt", "note.txt"])
         #expect((try await filesystem.glob(pattern: "/*.txt", currentDirectory: "/")).contains("/moved.txt"))
 
-        try filesystem.configure(rootDirectory: secondRoot)
+        try await filesystem.configure(rootDirectory: secondRoot)
         #expect(!(await filesystem.exists(path: "/note.txt")))
 
         try await filesystem.writeFile(path: "/fresh.txt", data: WorkspaceCoverageTestSupport.data("fresh"), append: false)

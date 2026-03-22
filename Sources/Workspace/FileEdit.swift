@@ -1,7 +1,7 @@
 import Foundation
 
 /// A filesystem edit that can be applied as part of a batch.
-public enum WorkspaceEdit: Sendable, Equatable {
+public enum FileEdit: Sendable, Equatable, Codable {
     /// Writes UTF-8 content to a file, replacing any existing contents.
     case writeFile(path: WorkspacePath, content: String)
     /// Appends UTF-8 content to a file.
@@ -40,13 +40,13 @@ public enum WorkspaceEdit: Sendable, Equatable {
     }
 
     /// A file-level change contained within a batch edit result.
-    public struct FileChange: Sendable {
+    public struct FileChange: Sendable, Codable {
         /// The affected file or symlink path.
         public var path: WorkspacePath
         /// The original path for move and copy operations when applicable.
         public var sourcePath: WorkspacePath?
         /// The logical kind of the affected node.
-        public var kind: WorkspaceTree.Kind
+        public var kind: FileTree.Kind
         /// The predicted or observed effect of the change.
         public var effect: Effect
         /// The execution status of the change.
@@ -58,7 +58,7 @@ public enum WorkspaceEdit: Sendable, Equatable {
         public init(
             path: WorkspacePath,
             sourcePath: WorkspacePath? = nil,
-            kind: WorkspaceTree.Kind,
+            kind: FileTree.Kind,
             effect: Effect,
             status: MutationStatus = .planned,
             diff: TextDiff? = nil
@@ -73,9 +73,9 @@ public enum WorkspaceEdit: Sendable, Equatable {
     }
 
     /// A preview or result entry for a single batch edit operation.
-    public struct Entry: Sendable {
+    public struct Entry: Sendable, Codable {
         /// The requested edit.
-        public var edit: WorkspaceEdit
+        public var edit: FileEdit
         /// Whether the requested edit materially changes the workspace.
         public var changeState: ChangeState
         /// The execution status of the operation.
@@ -87,7 +87,7 @@ public enum WorkspaceEdit: Sendable, Equatable {
 
         /// Creates a batch edit entry.
         public init(
-            edit: WorkspaceEdit,
+            edit: FileEdit,
             changeState: ChangeState,
             status: MutationStatus = .planned,
             touchedPaths: [WorkspacePath],
@@ -102,16 +102,16 @@ public enum WorkspaceEdit: Sendable, Equatable {
     }
 
     /// A failure encountered while executing a single batch edit.
-    public struct Failure: Sendable {
+    public struct Failure: Sendable, Codable {
         /// The index of the failed edit in the original request.
         public var index: Int
         /// The edit that failed.
-        public var edit: WorkspaceEdit
+        public var edit: FileEdit
         /// A human-readable failure message.
         public var message: String
 
         /// Creates a batch edit failure.
-        public init(index: Int, edit: WorkspaceEdit, message: String) {
+        public init(index: Int, edit: FileEdit, message: String) {
             self.index = index
             self.edit = edit
             self.message = message
@@ -119,7 +119,7 @@ public enum WorkspaceEdit: Sendable, Equatable {
     }
 
     /// The result of applying a batch of workspace edits.
-    public struct Result: Sendable {
+    public struct BatchResult: Sendable, Codable {
         /// Whether the operation was previewed or executed.
         public var mode: MutationMode
         /// Canonicalized paths touched by the batch.

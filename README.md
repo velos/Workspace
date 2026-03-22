@@ -27,12 +27,12 @@ Many agent and tooling flows need more than plain disk I/O:
 ## What It Provides
 
 - `Workspace`: high-level actor API for common file operations and batch edits
-- `WorkspaceFilesystem`: low-level protocol for custom filesystem backends
+- `FileSystem`: low-level protocol for custom filesystem backends (see also `ReadableFileSystem` / `WritableFileSystem`)
 - `ReadWriteFilesystem`: real disk access rooted to a configured directory
 - `InMemoryFilesystem`: fully in-memory filesystem for isolated sessions and tests
 - `OverlayFilesystem`: snapshot a disk root and keep writes in memory
 - `MountableFilesystem`: compose multiple filesystems under one virtual tree
-- `PermissionedWorkspaceFilesystem`: wrap any filesystem with operation-level approvals
+- `PermissionedFileSystem`: wrap any filesystem with operation-level approvals
 - `SandboxFilesystem`: convenience wrapper for app sandbox roots
 - `SecurityScopedFilesystem`: security-scoped URL and bookmark-backed access
 - `WorkspacePath`: path normalization and joining helpers
@@ -80,9 +80,9 @@ struct Config: Codable {
 let filesystem = InMemoryFilesystem()
 
 let workspace = Workspace(filesystem: filesystem)
-try await workspace.writeJson("/config.json", value: Config(name: "demo", enabled: true))
+try await workspace.writeJSON(Config(name: "demo", enabled: true), to: "/config.json")
 
-let config = try await workspace.readJson("/config.json", as: Config.self)
+let config = try await workspace.readJSON(Config.self, from: "/config.json")
 print(config.enabled) // true
 ```
 
@@ -100,7 +100,7 @@ let root = URL(fileURLWithPath: "/tmp/demo-workspace", isDirectory: true)
 let filesystem = try ReadWriteFilesystem(rootDirectory: root)
 let workspace = Workspace(filesystem: filesystem)
 
-try await workspace.mkdir("/src")
+try await workspace.createDirectory(at: "/src", recursive: false)
 try await workspace.writeFile("/src/main.swift", content: "print(\"hello\")\n")
 ```
 
@@ -113,7 +113,7 @@ import Foundation
 import Workspace
 
 let projectRoot = URL(fileURLWithPath: "/path/to/project", isDirectory: true)
-let filesystem = try OverlayFilesystem(rootDirectory: projectRoot)
+let filesystem = try await OverlayFilesystem(rootDirectory: projectRoot)
 let workspace = Workspace(filesystem: filesystem)
 
 let preview = try await workspace.summarizeTree("/Sources", maxDepth: 2)
@@ -144,21 +144,21 @@ let mounted = MountableFilesystem(
 
 let workspace = Workspace(filesystem: mounted)
 try await workspace.writeFile("/memory/plan.txt", content: "shared notes")
-try await workspace.cp("/memory/plan.txt", "/workspace-a/plan.txt")
+try await workspace.copyItem(from: "/memory/plan.txt", to: "/workspace-a/plan.txt", recursive: false)
 ```
 
 ### Operation-Level Permissions
 
-Use `PermissionedWorkspaceFilesystem` when the host should decide which operations are allowed:
+Use `PermissionedFileSystem` when the host should decide which operations are allowed:
 
 ```swift
 import Workspace
 
 let base = InMemoryFilesystem()
 
-let filesystem = PermissionedWorkspaceFilesystem(
+let filesystem = PermissionedFileSystem(
     base: base,
-    authorizer: WorkspacePermissionAuthorizer { request in
+    authorizer: PermissionAuthorizer { request in
         switch request.operation {
         case .readFile, .listDirectory, .stat:
             return .allowForSession
@@ -220,10 +220,10 @@ print(replacement.diff.hunks)     // structured line-based diff hunks
 
 ## Important Behavior
 
-- `InMemoryFilesystem` is ready to use immediately after initialization. Call `reset()` when you explicitly want to clear it.
+- `InMemoryFilesystem` is ready to use immediately after initialization. Call `reset()` when you explicitly want to clear it. A lock serializes mutations so the instance can be shared across concurrent tasks.
 - `OverlayFilesystem` snapshots a real root into memory. Call `reload()` when you explicitly want to discard overlay edits and rebuild from disk.
 - `ReadWriteFilesystem` and `OverlayFilesystem` normalize paths and enforce a rooted/jail model.
-- `PermissionedWorkspaceFilesystem` sees normalized virtual paths, not raw user input paths.
+- `PermissionedFileSystem` sees normalized virtual paths, not raw user input paths.
 - `walkTree` and `summarizeTree` return stable path ordering, which is useful for deterministic tool output.
 
 ## Limitations
@@ -233,7 +233,7 @@ print(replacement.diff.hunks)     // structured line-based diff hunks
 - Rollback is not crash-safe and does not coordinate with external processes.
 - `OverlayFilesystem` does not persist writes back to the original root.
 - Hard links across mounts are not supported.
-- Some mutable filesystem implementations are `@unchecked Sendable`; sharing one mutable filesystem instance across many independent actors or tasks should be done carefully.
+- Several filesystem types remain `@unchecked Sendable` at the type level; treat shared mutable instances as needing external coordination unless documented otherwise (for example, `InMemoryFilesystem` uses an internal lock).
 
 ## Security Notes
 

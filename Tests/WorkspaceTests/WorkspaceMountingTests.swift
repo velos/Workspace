@@ -23,7 +23,7 @@ struct WorkspaceMountingTests {
 
         let workspace = Workspace(filesystem: mountable)
         try await workspace.writeFile("/memory/shared.txt", content: "memo")
-        try await workspace.cp("/memory/shared.txt", "/workspace-a/note.txt")
+        try await workspace.copyItem(from: "/memory/shared.txt", to: "/workspace-a/note.txt")
 
         #expect(try await workspace.readFile("/memory/shared.txt") == "memo")
         #expect(try await workspace.readFile("/workspace-a/note.txt") == "memo")
@@ -93,8 +93,8 @@ struct WorkspaceMountingTests {
         try await docs.writeFile(path: "/guide.txt", data: Data("guide".utf8), append: false)
 
         let workspace = Workspace(filesystem: mountable)
-        try await workspace.cp("/docs/guide.txt", "/workspace/guide.txt")
-        try await workspace.mv("/workspace/guide.txt", "/workspace/guide-copy.txt")
+        try await workspace.copyItem(from: "/docs/guide.txt", to: "/workspace/guide.txt")
+        try await workspace.moveItem(from: "/workspace/guide.txt", to: "/workspace/guide-copy.txt")
 
         #expect(!(await workspace.exists("/workspace/guide.txt")))
         #expect(try await workspace.readFile("/workspace/guide-copy.txt") == "guide")

@@ -1,7 +1,7 @@
 import Foundation
 
 /// A recursive tree node returned from workspace tree traversal APIs.
-public struct WorkspaceTree: Sendable {
+public struct FileTree: Sendable, Codable {
     /// The logical kind of a node in a workspace tree.
     public enum Kind: String, Sendable, Codable {
         /// A regular file.
@@ -19,20 +19,20 @@ public struct WorkspaceTree: Sendable {
     /// The size of the node in bytes.
     public var size: UInt64
     /// The node's POSIX permissions.
-    public var permissions: Int
+    public var permissions: POSIXPermissions
     /// The node's last modification timestamp when available.
     public var modificationDate: Date?
     /// Child nodes for directories when the traversal includes them.
-    public var children: [WorkspaceTree]?
+    public var children: [FileTree]?
 
     /// Creates a tree node.
     public init(
         path: WorkspacePath,
         kind: Kind,
         size: UInt64,
-        permissions: Int,
+        permissions: POSIXPermissions,
         modificationDate: Date?,
-        children: [WorkspaceTree]? = nil
+        children: [FileTree]? = nil
     ) {
         self.path = path
         self.kind = kind
@@ -41,51 +41,27 @@ public struct WorkspaceTree: Sendable {
         self.modificationDate = modificationDate
         self.children = children
     }
-
-    /// Convenience initializer that accepts a string path.
-    public init(
-        path: String,
-        kind: Kind,
-        size: UInt64,
-        permissions: Int,
-        modificationDate: Date?,
-        children: [WorkspaceTree]? = nil
-    ) {
-        self.init(
-            path: WorkspacePath(normalizing: path),
-            kind: kind,
-            size: size,
-            permissions: permissions,
-            modificationDate: modificationDate,
-            children: children
-        )
-    }
 }
 
 /// Aggregate information about a subtree in the workspace.
-public struct WorkspaceTreeSummary: Sendable {
+public struct FileTreeSummary: Sendable, Codable {
     /// A summary entry for a direct child in a tree summary.
-    public struct Entry: Sendable {
+    public struct Entry: Sendable, Codable {
         /// The normalized path for the child entry.
         public var path: WorkspacePath
         /// The child entry's kind.
-        public var kind: WorkspaceTree.Kind
+        public var kind: FileTree.Kind
         /// The child entry's size in bytes.
         public var size: UInt64
         /// The child entry's POSIX permissions.
-        public var permissions: Int
+        public var permissions: POSIXPermissions
 
         /// Creates a summary entry.
-        public init(path: WorkspacePath, kind: WorkspaceTree.Kind, size: UInt64, permissions: Int) {
+        public init(path: WorkspacePath, kind: FileTree.Kind, size: UInt64, permissions: POSIXPermissions) {
             self.path = path
             self.kind = kind
             self.size = size
             self.permissions = permissions
-        }
-
-        /// Convenience initializer that accepts a string path.
-        public init(path: String, kind: WorkspaceTree.Kind, size: UInt64, permissions: Int) {
-            self.init(path: WorkspacePath(normalizing: path), kind: kind, size: size, permissions: permissions)
         }
     }
 
@@ -117,24 +93,5 @@ public struct WorkspaceTreeSummary: Sendable {
         self.symlinkCount = symlinkCount
         self.totalBytes = totalBytes
         self.children = children
-    }
-
-    /// Convenience initializer that accepts a string path.
-    public init(
-        path: String,
-        fileCount: Int,
-        directoryCount: Int,
-        symlinkCount: Int,
-        totalBytes: UInt64,
-        children: [Entry]
-    ) {
-        self.init(
-            path: WorkspacePath(normalizing: path),
-            fileCount: fileCount,
-            directoryCount: directoryCount,
-            symlinkCount: symlinkCount,
-            totalBytes: totalBytes,
-            children: children
-        )
     }
 }
