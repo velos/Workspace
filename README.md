@@ -182,6 +182,10 @@ let result = try await workspace.applyEdits([
     .appendFile(path: "/src/a.txt", content: " two"),
     .copy(from: "/src/a.txt", to: "/src/b.txt"),
 ])
+
+let writeChange = result.edits[1].fileChanges[0]
+print(writeChange.status)              // applied
+print(writeChange.diff?.hunks.count)   // Optional(1)
 ```
 
 You can preview a batch before executing it:
@@ -191,6 +195,10 @@ let preview = try await workspace.previewEdits([
     .copy(from: "/docs/guide.txt", to: "/workspace/guide.txt"),
     .appendFile(path: "/workspace/notes.txt", content: "\nnext")
 ])
+
+let appendPreview = preview.edits[1].fileChanges[0]
+print(appendPreview.status)            // planned
+print(appendPreview.diff?.hunks.count) // Optional(...)
 ```
 
 Text replacements use a request type so scope, include, exclude, and matching strategy live in one value:
@@ -203,6 +211,11 @@ let preview = try await workspace.previewReplacement(
         replacement: "bar"
     )
 )
+
+let replacement = preview.changes[0]
+print(replacement.status)         // planned
+print(replacement.replacements)   // number of matched replacements
+print(replacement.diff.hunks)     // structured line-based diff hunks
 ```
 
 ## Important Behavior

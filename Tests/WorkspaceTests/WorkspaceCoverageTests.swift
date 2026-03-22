@@ -37,8 +37,8 @@ private actor CoveragePermissionRecorder {
 
 @Suite("Workspace Coverage")
 struct WorkspaceCoverageTests {
-    @Test("read-write filesystem supports round-trip operations")
-    func readWriteFilesystemSupportsRoundTripOperations() async throws {
+    @Test
+    func `read-write filesystem supports round-trip operations`() async throws {
         let root = try WorkspaceCoverageTestSupport.makeTempDirectory(prefix: "WorkspaceReadWriteRoot")
         defer { WorkspaceCoverageTestSupport.removeDirectory(root) }
 
@@ -96,8 +96,8 @@ struct WorkspaceCoverageTests {
         #expect(await filesystem.exists(path: "/"))
     }
 
-    @Test("read-write filesystem covers errors and unconfigured access")
-    func readWriteFilesystemCoversErrorsAndUnconfiguredAccess() async throws {
+    @Test
+    func `read-write filesystem covers errors and unconfigured access`() async throws {
         let unconfigured = ReadWriteFilesystem()
 
         do {
@@ -144,8 +144,8 @@ struct WorkspaceCoverageTests {
         #expect(try await filesystem.glob(pattern: "/missing.txt", currentDirectory: "/").isEmpty)
     }
 
-    @Test("mountable filesystem merges base and synthetic directories")
-    func mountableFilesystemMergesBaseAndSyntheticDirectories() async throws {
+    @Test
+    func `mountable filesystem merges base and synthetic directories`() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/docs", recursive: true)
         try await base.writeFile(path: "/docs/local.txt", data: WorkspaceCoverageTestSupport.data("local"), append: false)
@@ -198,8 +198,8 @@ struct WorkspaceCoverageTests {
         }
     }
 
-    @Test("mountable filesystem supports cross-mount directory copy and move")
-    func mountableFilesystemSupportsCrossMountDirectoryCopyAndMove() async throws {
+    @Test
+    func `mountable filesystem supports cross-mount directory copy and move`() async throws {
         let source = InMemoryFilesystem()
         try await source.createDirectory(path: "/tree/sub", recursive: true)
         try await source.writeFile(path: "/tree/sub/file.txt", data: WorkspaceCoverageTestSupport.data("nested"), append: false)
@@ -238,8 +238,8 @@ struct WorkspaceCoverageTests {
         }
     }
 
-    @Test("mountable filesystem supports dynamic mounts and base configuration")
-    func mountableFilesystemSupportsDynamicMountsAndBaseConfiguration() async throws {
+    @Test
+    func `mountable filesystem supports dynamic mounts and base configuration`() async throws {
         let baseRoot = try WorkspaceCoverageTestSupport.makeTempDirectory(prefix: "WorkspaceMountableBase")
         defer { WorkspaceCoverageTestSupport.removeDirectory(baseRoot) }
 
@@ -257,8 +257,8 @@ struct WorkspaceCoverageTests {
         #expect(try await memory.readFile(path: "/note.txt") == WorkspaceCoverageTestSupport.data("memo"))
     }
 
-    @Test("overlay filesystem imports directories and symlinks and proxies mutations")
-    func overlayFilesystemImportsDirectoriesAndSymlinksAndProxiesMutations() async throws {
+    @Test
+    func `overlay filesystem imports directories and symlinks and proxies mutations`() async throws {
         let root = try WorkspaceCoverageTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayCoverage")
         defer { WorkspaceCoverageTestSupport.removeDirectory(root) }
 
@@ -297,8 +297,8 @@ struct WorkspaceCoverageTests {
         #expect(!(await filesystem.exists(path: "/scratch/moved.txt")))
     }
 
-    @Test("overlay filesystem reload handles missing and unconfigured roots")
-    func overlayFilesystemReloadHandlesMissingAndUnconfiguredRoots() async throws {
+    @Test
+    func `overlay filesystem reload handles missing and unconfigured roots`() async throws {
         let unconfigured = OverlayFilesystem()
 
         do {
@@ -318,8 +318,8 @@ struct WorkspaceCoverageTests {
         #expect(!(await filesystem.exists(path: "/missing.txt")))
     }
 
-    @Test("permissioned filesystem covers forwarded operations")
-    func permissionedFilesystemCoversForwardedOperations() async throws {
+    @Test
+    func `permissioned filesystem covers forwarded operations`() async throws {
         let base = InMemoryFilesystem()
         let recorder = CoveragePermissionRecorder()
         let authorizer = WorkspacePermissionAuthorizer { request in
@@ -373,8 +373,8 @@ struct WorkspaceCoverageTests {
         #expect(globRequest.destinationPath == "/")
     }
 
-    @Test("permissioned filesystem covers configure and denial paths")
-    func permissionedFilesystemCoversConfigureAndDenialPaths() async throws {
+    @Test
+    func `permissioned filesystem covers configure and denial paths`() async throws {
         let root = try WorkspaceCoverageTestSupport.makeTempDirectory(prefix: "WorkspacePermissionedConfig")
         defer { WorkspaceCoverageTestSupport.removeDirectory(root) }
 
@@ -408,8 +408,8 @@ struct WorkspaceCoverageTests {
         #expect(!(await filesystem.exists(path: "/\u{0}")))
     }
 
-    @Test("sandbox filesystem url root proxies filesystem operations")
-    func sandboxFilesystemURLRootProxiesFilesystemOperations() async throws {
+    @Test
+    func `sandbox filesystem url root proxies filesystem operations`() async throws {
         let root = try WorkspaceCoverageTestSupport.makeTempDirectory(prefix: "WorkspaceSandboxURL")
         defer { WorkspaceCoverageTestSupport.removeDirectory(root) }
 
@@ -435,8 +435,8 @@ struct WorkspaceCoverageTests {
         #expect(!(await filesystem.exists(path: "/moved.txt")))
     }
 
-    @Test("sandbox filesystem supports standard roots and rejects invalid app groups")
-    func sandboxFilesystemSupportsStandardRootsAndRejectsInvalidAppGroups() async throws {
+    @Test
+    func `sandbox filesystem supports standard roots and rejects invalid app groups`() async throws {
         let temporary = try SandboxFilesystem(root: .temporary)
         #expect(await temporary.exists(path: "/"))
 
@@ -467,8 +467,8 @@ struct WorkspaceCoverageTests {
         #expect(FileManager.default.fileExists(atPath: secondRoot.appendingPathComponent("configured.txt").path))
     }
 
-    @Test("user defaults bookmark store round-trips values")
-    func userDefaultsBookmarkStoreRoundTripsValues() async throws {
+    @Test
+    func `user defaults bookmark store round-trips values`() async throws {
         let suiteName = WorkspaceCoverageTestSupport.uniqueSuiteName()
         defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
 
@@ -483,8 +483,8 @@ struct WorkspaceCoverageTests {
     }
 
     #if os(macOS)
-    @Test("security-scoped filesystem supports url access and read-only mode")
-    func securityScopedFilesystemSupportsURLAccessAndReadOnlyMode() async throws {
+    @Test
+    func `security-scoped filesystem supports url access and read-only mode`() async throws {
         let firstRoot = try WorkspaceCoverageTestSupport.makeTempDirectory(prefix: "WorkspaceSecurityScopedFirst")
         defer { WorkspaceCoverageTestSupport.removeDirectory(firstRoot) }
 
@@ -526,8 +526,8 @@ struct WorkspaceCoverageTests {
         }
     }
 
-    @Test("security-scoped filesystem reports missing bookmarks")
-    func securityScopedFilesystemReportsMissingBookmarks() async throws {
+    @Test
+    func `security-scoped filesystem reports missing bookmarks`() async throws {
         let suiteName = WorkspaceCoverageTestSupport.uniqueSuiteName()
         defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
 

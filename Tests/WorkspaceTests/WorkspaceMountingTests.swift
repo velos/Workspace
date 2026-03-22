@@ -4,8 +4,8 @@ import Testing
 
 @Suite("Workspace Mounting")
 struct WorkspaceMountingTests {
-    @Test("multiple isolated mounts can share a memory workspace")
-    func multipleIsolatedMountsCanShareAMemoryWorkspace() async throws {
+    @Test
+    func `multiple isolated mounts can share a memory workspace`() async throws {
         let workspaceA = InMemoryFilesystem()
 
         let workspaceB = InMemoryFilesystem()
@@ -30,8 +30,8 @@ struct WorkspaceMountingTests {
         #expect(!(await workspace.exists("/workspace-b/note.txt")))
     }
 
-    @Test("previewEdits previews mounted changes without mutating")
-    func previewEditsPreviewMountedChangesWithoutMutating() async throws {
+    @Test
+    func `previewEdits previews mounted changes without mutating`() async throws {
         let memory = InMemoryFilesystem()
 
         let workspaceRoot = InMemoryFilesystem()
@@ -59,8 +59,8 @@ struct WorkspaceMountingTests {
         #expect(try await workspace.readFile("/memory/shared.txt") == "memo")
     }
 
-    @Test("walkTree maxDepth stops recursion at nested directories")
-    func walkTreeMaxDepthStopsRecursionAtNestedDirectories() async throws {
+    @Test
+    func `walkTree maxDepth stops recursion at nested directories`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.createDirectory(path: "/workspace/src/nested", recursive: true)
         try await filesystem.writeFile(path: "/workspace/src/nested/deep.txt", data: Data("deep".utf8), append: false)
@@ -74,8 +74,8 @@ struct WorkspaceMountingTests {
         #expect(src.children == nil)
     }
 
-    @Test("copy and move operations work across mounted roots")
-    func copyAndMoveOperationsWorkAcrossMountedRoots() async throws {
+    @Test
+    func `copy and move operations work across mounted roots`() async throws {
         let docs = InMemoryFilesystem()
 
         let workspaceFiles = InMemoryFilesystem()

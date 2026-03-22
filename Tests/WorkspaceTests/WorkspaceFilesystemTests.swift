@@ -29,8 +29,8 @@ private enum WorkspaceFilesystemTestSupport {
 
 @Suite("Workspace Filesystem")
 struct WorkspaceFilesystemTests {
-    @Test("permissioned filesystem normalizes paths and blocks denied writes")
-    func permissionedFilesystemNormalizesPathsAndBlocksDeniedWrites() async throws {
+    @Test
+    func `permissioned filesystem normalizes paths and blocks denied writes`() async throws {
         let base = InMemoryFilesystem()
 
         let recorder = PermissionRecorder()
@@ -57,8 +57,8 @@ struct WorkspaceFilesystemTests {
         #expect(!exists)
     }
 
-    @Test("permissioned filesystem caches allow-for-session decisions")
-    func permissionedFilesystemCachesAllowForSessionDecisions() async throws {
+    @Test
+    func `permissioned filesystem caches allow-for-session decisions`() async throws {
         let base = InMemoryFilesystem()
         try await base.writeFile(path: "/doc.txt", data: Data("hello".utf8), append: false)
 
@@ -77,8 +77,8 @@ struct WorkspaceFilesystemTests {
         #expect(requests.first?.operation == .readFile)
     }
 
-    @Test("permissioned mountable filesystem sees mounted virtual paths")
-    func permissionedMountableFilesystemSeesMountedVirtualPaths() async throws {
+    @Test
+    func `permissioned mountable filesystem sees mounted virtual paths`() async throws {
         let docs = InMemoryFilesystem()
         try await docs.writeFile(path: "/guide.txt", data: Data("guide".utf8), append: false)
 
@@ -104,8 +104,8 @@ struct WorkspaceFilesystemTests {
         #expect(requests.first?.path == "/docs/guide.txt")
     }
 
-    @Test("read-write filesystem rejects symlink escapes outside root")
-    func readWriteFilesystemRejectsSymlinkEscapesOutsideRoot() async throws {
+    @Test
+    func `read-write filesystem rejects symlink escapes outside root`() async throws {
         let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceFilesystemRoot")
         defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
 
@@ -126,8 +126,8 @@ struct WorkspaceFilesystemTests {
         }
     }
 
-    @Test("in-memory filesystem reset clears prior contents")
-    func inMemoryFilesystemResetClearsPriorContents() async throws {
+    @Test
+    func `in-memory filesystem reset clears prior contents`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
 
@@ -139,8 +139,8 @@ struct WorkspaceFilesystemTests {
         #expect(!(await filesystem.exists(path: "/note.txt")))
     }
 
-    @Test("overlay reload restores source snapshot")
-    func overlayReloadRestoresSourceSnapshot() async throws {
+    @Test
+    func `overlay reload restores source snapshot`() async throws {
         let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayRoot")
         defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
 
@@ -157,8 +157,8 @@ struct WorkspaceFilesystemTests {
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk-updated".utf8))
     }
 
-    @Test("in-memory filesystem handles symlink writes copies moves and configure reset")
-    func inMemoryFilesystemHandlesSymlinkWritesCopiesMovesAndConfigureReset() async throws {
+    @Test
+    func `in-memory filesystem handles symlink writes copies moves and configure reset`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/target.txt", data: Data("one".utf8), append: false)
         try await filesystem.createSymlink(path: "/link.txt", target: "target.txt")
@@ -184,8 +184,8 @@ struct WorkspaceFilesystemTests {
         #expect(!(await filesystem.exists(path: "/other/moved.txt")))
     }
 
-    @Test("in-memory filesystem reports POSIX errors for invalid operations")
-    func inMemoryFilesystemReportsPOSIXErrorsForInvalidOperations() async throws {
+    @Test
+    func `in-memory filesystem reports POSIX errors for invalid operations`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/file.txt", data: Data("data".utf8), append: false)
         try await filesystem.createDirectory(path: "/dir", recursive: true)

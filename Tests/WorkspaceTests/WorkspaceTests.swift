@@ -178,10 +178,22 @@ private struct DemoConfig: Codable, Equatable, Sendable {
     var enabled: Bool
 }
 
+private func diffLines(_ diff: WorkspaceTextDiff?) -> [WorkspaceTextDiffLine] {
+    diff?.hunks.flatMap(\.lines) ?? []
+}
+
+private func addedLineTexts(_ diff: WorkspaceTextDiff?) -> [String] {
+    diffLines(diff).filter { $0.kind == .added }.map(\.text)
+}
+
+private func removedLineTexts(_ diff: WorkspaceTextDiff?) -> [String] {
+    diffLines(diff).filter { $0.kind == .removed }.map(\.text)
+}
+
 @Suite("Workspace")
 struct WorkspaceTests {
-    @Test("workspace module reexports core filesystem primitives")
-    func workspaceModuleReexportsCoreFilesystemPrimitives() async throws {
+    @Test
+    func `workspace module reexports core filesystem primitives`() async throws {
         let workspaceFilesystem: any WorkspaceFilesystem = InMemoryFilesystem()
         let mount = MountableFilesystem.Mount(mountPoint: "/memory", filesystem: InMemoryFilesystem())
         let permission = WorkspacePermissionRequest(operation: .readFile, path: "/memory/note.txt")
@@ -193,8 +205,8 @@ struct WorkspaceTests {
         #expect(error.description.contains("workspace shim check"))
     }
 
-    @Test("readJson and writeJson roundtrip")
-    func readJsonAndWriteJsonRoundtrip() async throws {
+    @Test
+    func `readJson and writeJson roundtrip`() async throws {
         let fs = InMemoryFilesystem()
         let state = Workspace(filesystem: fs)
 
@@ -203,8 +215,8 @@ struct WorkspaceTests {
         #expect(loaded == DemoConfig(name: "demo", enabled: true))
     }
 
-    @Test("readJson rejects invalid JSON")
-    func readJsonRejectsInvalidJSON() async throws {
+    @Test
+    func `readJson rejects invalid JSON`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.writeFile(path: "/broken.json", data: Data("{ nope".utf8), append: false)
         let state = Workspace(filesystem: fs)
@@ -217,8 +229,8 @@ struct WorkspaceTests {
         }
     }
 
-    @Test("walkTree and summarizeTree preserve stable ordering")
-    func walkTreeAndSummarizeTreePreserveStableOrdering() async throws {
+    @Test
+    func `walkTree and summarizeTree preserve stable ordering`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/src", recursive: true)
         try await fs.writeFile(path: "/src/b.txt", data: Data("b".utf8), append: false)
@@ -235,8 +247,8 @@ struct WorkspaceTests {
         #expect(summary.directoryCount == 2)
     }
 
-    @Test("walkTree and summarizeTree report symlink kinds")
-    func walkTreeAndSummarizeTreeReportSymlinkKinds() async throws {
+    @Test
+    func `walkTree and summarizeTree report symlink kinds`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
         try await fs.createSymlink(path: "/alias.txt", target: "note.txt")
@@ -252,8 +264,8 @@ struct WorkspaceTests {
         #expect(summary.symlinkCount == 1)
     }
 
-    @Test("previewReplacement previews without mutating files")
-    func previewReplacementPreviewsWithoutMutatingFiles() async throws {
+    @Test
+    func `previewReplacement previews without mutating files`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/src", recursive: true)
         try await fs.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
@@ -265,12 +277,14 @@ struct WorkspaceTests {
         )
         #expect(result.mode == .preview)
         #expect(result.touchedPaths == ["/src/a.txt", "/src/b.txt"])
-        #expect(result.changes.map(\.updatedContent) == ["baz", "baz bar"])
+        #expect(result.changes.map(\.status) == [.planned, .planned])
+        #expect(result.changes.map(\.replacements) == [1, 1])
+        #expect(result.changes.map { addedLineTexts($0.diff) } == [["baz"], ["baz bar"]])
         #expect(try await state.readFile("/src/a.txt") == "foo")
     }
 
-    @Test("applyReplacement rolls back on write failure")
-    func applyReplacementRollsBackOnWriteFailure() async throws {
+    @Test
+    func `applyReplacement rolls back on write failure`() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/src", recursive: true)
         try await base.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
@@ -287,12 +301,13 @@ struct WorkspaceTests {
         #expect(result.rolledBack)
         #expect(result.failures.count == 1)
         #expect(result.failures.first?.path == "/src/b.txt")
+        #expect(result.changes.map(\.status) == [.rolledBack, .failed])
         #expect(try await base.readFile(path: "/src/a.txt") == Data("foo".utf8))
         #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
     }
 
-    @Test("applyReplacement best effort reports failures without rollback")
-    func applyReplacementBestEffortReportsFailuresWithoutRollback() async throws {
+    @Test
+    func `applyReplacement best effort reports failures without rollback`() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/src", recursive: true)
         try await base.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
@@ -310,12 +325,13 @@ struct WorkspaceTests {
         #expect(!result.rolledBack)
         #expect(result.failures.count == 1)
         #expect(result.failures.first?.path == "/src/b.txt")
+        #expect(result.changes.map(\.status) == [.applied, .failed])
         #expect(try await base.readFile(path: "/src/a.txt") == Data("bar".utf8))
         #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
     }
 
-    @Test("applyReplacement fail-fast stops after the first failure")
-    func applyReplacementFailFastStopsAfterTheFirstFailure() async throws {
+    @Test
+    func `applyReplacement fail-fast stops after the first failure`() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/src", recursive: true)
         try await base.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
@@ -335,13 +351,14 @@ struct WorkspaceTests {
         #expect(result.failures.count == 1)
         #expect(result.failures.first?.path == "/src/b.txt")
         #expect(result.failures.first?.message.contains("WorkspaceTests") == true)
+        #expect(result.changes.map(\.status) == [.applied, .failed, .skipped])
         #expect(try await base.readFile(path: "/src/a.txt") == Data("bar".utf8))
         #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
         #expect(try await base.readFile(path: "/src/c.txt") == Data("foo".utf8))
     }
 
-    @Test("applyReplacement returns an empty execution result when nothing matches")
-    func applyReplacementReturnsEmptyExecutionResultWhenNothingMatches() async throws {
+    @Test
+    func `applyReplacement returns an empty execution result when nothing matches`() async throws {
         let state = Workspace(filesystem: InMemoryFilesystem())
 
         let result = try await state.applyReplacement(
@@ -355,8 +372,8 @@ struct WorkspaceTests {
         #expect(!result.rolledBack)
     }
 
-    @Test("previewReplacement respects scope excludes and case-insensitive matching")
-    func previewReplacementRespectsScopeExcludesAndCaseInsensitiveMatching() async throws {
+    @Test
+    func `previewReplacement respects scope excludes and case-insensitive matching`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/src/dir", recursive: true)
         try await fs.writeFile(path: "/src/keep.txt", data: Data("FoO".utf8), append: false)
@@ -375,11 +392,13 @@ struct WorkspaceTests {
 
         #expect(result.touchedPaths == ["/src/keep.txt"])
         #expect(result.changes.count == 1)
-        #expect(result.changes.first?.updatedContent == "bar")
+        #expect(result.changes.first?.status == .planned)
+        #expect(removedLineTexts(result.changes.first?.diff) == ["FoO"])
+        #expect(addedLineTexts(result.changes.first?.diff) == ["bar"])
     }
 
-    @Test("previewReplacement rejects invalid UTF-8 and empty search patterns")
-    func previewReplacementRejectsInvalidUTF8AndEmptySearchPatterns() async throws {
+    @Test
+    func `previewReplacement rejects invalid UTF-8 and empty search patterns`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.writeFile(path: "/binary.bin", data: Data([0xFF]), append: false)
         try await fs.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
@@ -425,8 +444,8 @@ struct WorkspaceTests {
         }
     }
 
-    @Test("applyEdits succeeds across multiple files")
-    func applyEditsSucceedsAcrossMultipleFiles() async throws {
+    @Test
+    func `applyEdits succeeds across multiple files`() async throws {
         let fs = InMemoryFilesystem()
         let state = Workspace(filesystem: fs)
 
@@ -441,12 +460,17 @@ struct WorkspaceTests {
         #expect(!result.rolledBack)
         #expect(result.mode == .execution)
         #expect(result.touchedPaths == ["/src"])
+        #expect(result.edits.map(\.status) == [.applied, .applied, .applied, .applied, .applied])
+        #expect(addedLineTexts(result.edits[1].fileChanges.first?.diff) == ["one"])
+        #expect(addedLineTexts(result.edits[2].fileChanges.first?.diff) == ["one two"])
+        #expect(result.edits[3].fileChanges.first?.sourcePath == "/src/a.txt")
+        #expect(result.edits[4].fileChanges.first?.sourcePath == "/src/b.txt")
         #expect(try await state.readFile("/src/a.txt") == "one two")
         #expect(try await state.readFile("/src/c.txt") == "one two")
     }
 
-    @Test("applyEdits rolls back on failure")
-    func applyEditsRollsBackOnFailure() async throws {
+    @Test
+    func `applyEdits rolls back on failure`() async throws {
         let base = InMemoryFilesystem()
         try await base.writeFile(path: "/a.txt", data: Data("old".utf8), append: false)
         let state = Workspace(
@@ -461,13 +485,15 @@ struct WorkspaceTests {
         #expect(result.rolledBack)
         #expect(result.failures.count == 1)
         #expect(result.failures.first?.index == 1)
+        #expect(result.edits.map(\.status) == [.rolledBack, .failed])
+        #expect(result.edits.first?.fileChanges.first?.status == .rolledBack)
         #expect(try await base.readFile(path: "/a.txt") == Data("old".utf8))
         let bExists = await base.exists(path: "/b.txt")
         #expect(!bExists)
     }
 
-    @Test("previewEdits reports unchanged and delete effects")
-    func previewEditsReportsUnchangedAndDeleteEffects() async throws {
+    @Test
+    func `previewEdits reports unchanged and delete effects`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/dir", recursive: true)
         try await fs.writeFile(path: "/same.txt", data: Data("same".utf8), append: false)
@@ -483,11 +509,16 @@ struct WorkspaceTests {
         ])
 
         #expect(result.mode == .preview)
+        #expect(result.edits.map(\.status) == [.planned, .planned, .planned, .planned, .planned])
         #expect(result.edits.map(\.effect) == [.unchanged, .deleted, .unchanged, .unchanged, .unchanged])
+        #expect(result.edits[0].fileChanges.count == 1)
+        #expect(result.edits[0].fileChanges[0].diff?.hunks.isEmpty == true)
+        #expect(removedLineTexts(result.edits[1].fileChanges.first?.diff) == ["bye"])
+        #expect(result.edits[2].fileChanges.isEmpty)
     }
 
-    @Test("applyEdits fail-fast keeps prior changes and reports non-workspace errors")
-    func applyEditsFailFastKeepsPriorChangesAndReportsNonWorkspaceErrors() async throws {
+    @Test
+    func `applyEdits fail-fast keeps prior changes and reports non-workspace errors`() async throws {
         let base = InMemoryFilesystem()
         try await base.writeFile(path: "/old.txt", data: Data("gone".utf8), append: false)
         let state = Workspace(
@@ -504,13 +535,14 @@ struct WorkspaceTests {
         #expect(result.failures.count == 1)
         #expect(result.failures.first?.index == 1)
         #expect(result.failures.first?.message.contains("WorkspaceTests") == true)
+        #expect(result.edits.map(\.status) == [.applied, .failed, .skipped])
         #expect(!(await base.exists(path: "/old.txt")))
         #expect(!(await base.exists(path: "/blocked.txt")))
         #expect(!(await base.exists(path: "/after.txt")))
     }
 
-    @Test("applyEdits returns an empty execution result when given no edits")
-    func applyEditsReturnsAnEmptyExecutionResultWhenGivenNoEdits() async throws {
+    @Test
+    func `applyEdits returns an empty execution result when given no edits`() async throws {
         let state = Workspace(filesystem: InMemoryFilesystem())
         let result = try await state.applyEdits([])
 
@@ -521,8 +553,46 @@ struct WorkspaceTests {
         #expect(!result.rolledBack)
     }
 
-    @Test("workspace path and type helpers cover normalization and coding")
-    func workspacePathAndTypeHelpersCoverNormalizationAndCoding() throws {
+    @Test
+    func `previewEdits plans sequential text diffs across earlier edits`() async throws {
+        let state = Workspace(filesystem: InMemoryFilesystem())
+
+        let result = try await state.previewEdits([
+            .writeFile(path: "/note.txt", content: "one"),
+            .appendFile(path: "/note.txt", content: " two"),
+        ])
+
+        #expect(result.edits.map(\.status) == [.planned, .planned])
+        #expect(addedLineTexts(result.edits[0].fileChanges.first?.diff) == ["one"])
+        #expect(removedLineTexts(result.edits[1].fileChanges.first?.diff) == ["one"])
+        #expect(addedLineTexts(result.edits[1].fileChanges.first?.diff) == ["one two"])
+    }
+
+    @Test
+    func `previewEdits expands recursive file changes and omits binary diffs`() async throws {
+        let fs = InMemoryFilesystem()
+        try await fs.createDirectory(path: "/src/nested", recursive: true)
+        try await fs.writeFile(path: "/src/a.txt", data: Data("alpha".utf8), append: false)
+        try await fs.writeFile(path: "/src/nested/b.bin", data: Data([0xFF]), append: false)
+        let state = Workspace(filesystem: fs)
+
+        let copyPreview = try await state.previewEdits([
+            .copy(from: "/src", to: "/dest")
+        ])
+        let deletePreview = try await state.previewEdits([
+            .delete(path: "/src")
+        ])
+
+        #expect(copyPreview.edits[0].fileChanges.map(\.path) == ["/dest/a.txt", "/dest/nested/b.bin"])
+        #expect(copyPreview.edits[0].fileChanges.map(\.sourcePath) == ["/src/a.txt", "/src/nested/b.bin"])
+        #expect(copyPreview.edits[0].fileChanges.allSatisfy { $0.diff == nil })
+        #expect(deletePreview.edits[0].fileChanges.map(\.path) == ["/src/a.txt", "/src/nested/b.bin"])
+        #expect(deletePreview.edits[0].fileChanges.first?.diff != nil)
+        #expect(deletePreview.edits[0].fileChanges.last?.diff == nil)
+    }
+
+    @Test
+    func `workspace path and type helpers cover normalization and coding`() throws {
         #expect(WorkspacePath(normalizing: "", relativeTo: "/base") == "/base")
         #expect(WorkspacePath(normalizing: "./child", relativeTo: "/base") == "/base/child")
         #expect(WorkspacePath.basename("/") == "/")
@@ -548,8 +618,8 @@ struct WorkspaceTests {
         #expect(fileInfo.path == "/file.txt")
     }
 
-    @Test("applyEdits works with overlay and mountable filesystems")
-    func applyEditsWorksWithOverlayAndMountableFilesystems() async throws {
+    @Test
+    func `applyEdits works with overlay and mountable filesystems`() async throws {
         let workspaceRoot = try WorkspaceTestSupport.makeTempDirectory(prefix: "WorkspaceMountRoot")
         defer { WorkspaceTestSupport.removeDirectory(workspaceRoot) }
 
