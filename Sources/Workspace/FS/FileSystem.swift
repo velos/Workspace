@@ -147,4 +147,37 @@ extension FileSystem {
         _ = rootDirectory
         throw WorkspaceError.notConfigured
     }
+
+    /// The default implementation throws ``WorkspaceError/unsupported(_:)``.
+    public func createSymlink(path: WorkspacePath, target: String) async throws {
+        _ = path
+        _ = target
+        throw WorkspaceError.unsupported("symbolic links are not supported by this filesystem")
+    }
+
+    /// The default implementation throws ``WorkspaceError/unsupported(_:)``.
+    public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
+        _ = path
+        _ = target
+        throw WorkspaceError.unsupported("hard links are not supported by this filesystem")
+    }
+
+    /// The default implementation throws ``WorkspaceError/unsupported(_:)``.
+    public func readSymlink(path: WorkspacePath) async throws -> String {
+        _ = path
+        throw WorkspaceError.unsupported("symbolic links are not supported by this filesystem")
+    }
+
+    /// The default implementation throws ``WorkspaceError/unsupported(_:)``.
+    public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
+        _ = path
+        _ = permissions
+        throw WorkspaceError.unsupported("setting permissions is not supported by this filesystem")
+    }
+
+    /// The default implementation throws ``WorkspaceError/unsupported(_:)``.
+    public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
+        _ = path
+        throw WorkspaceError.unsupported("real path resolution is not supported by this filesystem")
+    }
 }

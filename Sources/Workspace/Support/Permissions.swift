@@ -113,7 +113,7 @@ public actor PermissionAuthorizer: PermissionAuthorizing {
 }
 
 /// A filesystem wrapper that authorizes each operation before forwarding it to another filesystem.
-public final class PermissionedFileSystem: FileSystem, @unchecked Sendable {
+public final class PermissionedFileSystem: FileSystem, Sendable {
     private let base: any FileSystem
     private let authorizer: any PermissionAuthorizing
 

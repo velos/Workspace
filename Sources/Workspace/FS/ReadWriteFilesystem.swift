@@ -10,6 +10,11 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     private var rootURL: URL?
     private var resolvedRootPath: String?
 
+    private struct ConfigurationSnapshot {
+        var rootURL: URL
+        var resolvedRootPath: String
+    }
+
     /// Creates an unconfigured disk-backed filesystem.
     public init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
@@ -39,7 +44,8 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
-        let url = try existingURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
 
         let fileType = attributes[.type] as? FileAttributeType
@@ -69,7 +75,8 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
-        let url = try existingURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR))
@@ -80,7 +87,7 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         entries.reserveCapacity(names.count)
         for name in names {
             let childPath = path.appending(name)
-            let info = try await stat(path: childPath)
+            let info = try stat(path: childPath, configuration: configuration)
             entries.append(DirectoryEntry(name: name, info: info))
         }
         return entries
@@ -88,13 +95,15 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
-        let url = try existingURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
         return try Data(contentsOf: url)
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
-        let url = try creationURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try creationURL(for: path, configuration: configuration)
 
         let parent = url.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -111,13 +120,15 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
-        let url = try creationURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try creationURL(for: path, configuration: configuration)
         try fileManager.createDirectory(at: url, withIntermediateDirectories: recursive)
     }
 
     /// See ``FileSystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
-        let url = try existingURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
 
         var isDirectory: ObjCBool = false
         let exists = fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory)
@@ -135,8 +146,9 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
-        let source = try existingURL(for: sourcePath)
-        let destination = try creationURL(for: destinationPath)
+        let configuration = try requireConfiguration()
+        let source = try existingURL(for: sourcePath, configuration: configuration)
+        let destination = try creationURL(for: destinationPath, configuration: configuration)
         let parent = destination.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
         try fileManager.moveItem(at: source, to: destination)
@@ -146,10 +158,11 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
-        let source = try existingURL(for: sourcePath)
-        let destination = try creationURL(for: destinationPath)
+        let configuration = try requireConfiguration()
+        let source = try existingURL(for: sourcePath, configuration: configuration)
+        let destination = try creationURL(for: destinationPath, configuration: configuration)
 
-        let sourceInfo = try await stat(path: sourcePath)
+        let sourceInfo = try stat(path: sourcePath, configuration: configuration)
         if sourceInfo.isDirectory, !recursive {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
         }
@@ -170,7 +183,8 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
         _ = try WorkspacePath(validating: target, relativeTo: path.dirname)
-        let url = try creationURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try creationURL(for: path, configuration: configuration)
         let parent = url.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
         try fileManager.createSymbolicLink(atPath: url.path, withDestinationPath: target)
@@ -178,8 +192,9 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
-        let linkURL = try creationURL(for: path)
-        let targetURL = try existingURL(for: target)
+        let configuration = try requireConfiguration()
+        let linkURL = try creationURL(for: path, configuration: configuration)
+        let targetURL = try existingURL(for: target, configuration: configuration)
 
         let parent = linkURL.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -188,22 +203,25 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
-        let url = try existingURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
         return try fileManager.destinationOfSymbolicLink(atPath: url.path)
     }
 
     /// See ``FileSystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
-        let url = try existingURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
         try fileManager.setAttributes([.posixPermissions: Int(permissions.rawValue)], ofItemAtPath: url.path)
     }
 
     /// See ``FileSystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
-        let url = try existingURL(for: path)
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
         let resolved = url.resolvingSymlinksInPath().standardizedFileURL
-        try ensureInsideRoot(resolved)
-        return virtualPath(from: resolved)
+        try ensureInsideRoot(resolved, configuration: configuration)
+        return virtualPath(from: resolved, configuration: configuration)
     }
 
     /// See ``FileSystem/exists(path:)``.
@@ -212,7 +230,8 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
             return false
         }
         do {
-            let url = try existingOrPotentialURL(for: path)
+            let configuration = try requireConfiguration()
+            let url = try existingOrPotentialURL(for: path, configuration: configuration)
             return fileManager.fileExists(atPath: url.path)
         } catch {
             return false
@@ -238,7 +257,8 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     private func allVirtualPaths() throws -> [WorkspacePath] {
-        let root = try requireRoot()
+        let configuration = try requireConfiguration()
+        let root = configuration.rootURL
         var paths: [WorkspacePath] = [.root]
 
         guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: nil) else {
@@ -246,14 +266,17 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         }
 
         for case let url as URL in enumerator {
-            paths.append(virtualPath(from: url))
+            paths.append(virtualPath(from: url, configuration: configuration))
         }
 
         return paths
     }
 
-    private func existingOrPotentialURL(for virtualPath: WorkspacePath) throws -> URL {
-        let root = try requireRoot()
+    private func existingOrPotentialURL(
+        for virtualPath: WorkspacePath,
+        configuration: ConfigurationSnapshot
+    ) throws -> URL {
+        let root = configuration.rootURL
         if virtualPath.isRoot {
             return root
         }
@@ -262,35 +285,35 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         return root.appendingPathComponent(relative)
     }
 
-    private func existingURL(for virtualPath: WorkspacePath) throws -> URL {
-        let url = try existingOrPotentialURL(for: virtualPath)
-        try ensureInsideRoot(url)
+    private func existingURL(
+        for virtualPath: WorkspacePath,
+        configuration: ConfigurationSnapshot
+    ) throws -> URL {
+        let url = try existingOrPotentialURL(for: virtualPath, configuration: configuration)
+        try ensureInsideRoot(url, configuration: configuration)
         return url
     }
 
-    private func creationURL(for virtualPath: WorkspacePath) throws -> URL {
-        let url = try existingOrPotentialURL(for: virtualPath)
+    private func creationURL(
+        for virtualPath: WorkspacePath,
+        configuration: ConfigurationSnapshot
+    ) throws -> URL {
+        let url = try existingOrPotentialURL(for: virtualPath, configuration: configuration)
         let parent = url.deletingLastPathComponent()
-        try ensureInsideRoot(parent)
+        try ensureInsideRoot(parent, configuration: configuration)
         return url
     }
 
-    private func ensureInsideRoot(_ url: URL) throws {
+    private func ensureInsideRoot(_ url: URL, configuration: ConfigurationSnapshot) throws {
         let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
-        guard let root = resolvedRootPath else {
-            throw WorkspaceError.notConfigured
-        }
+        let root = configuration.resolvedRootPath
         guard resolved == root || resolved.hasPrefix(root + "/") else {
-            throw WorkspaceError.invalidPath(virtualPath(from: url).description)
+            throw WorkspaceError.invalidPath(virtualPath(from: url, configuration: configuration).description)
         }
     }
 
-    private func virtualPath(from physicalURL: URL) -> WorkspacePath {
-        guard let root = try? requireRoot() else {
-            return .root
-        }
-
-        let rootPath = root.path
+    private func virtualPath(from physicalURL: URL, configuration: ConfigurationSnapshot) -> WorkspacePath {
+        let rootPath = configuration.rootURL.path
         let path = physicalURL.standardizedFileURL.path
 
         if path == rootPath {
@@ -309,12 +332,41 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         return WorkspacePath(unchecked: "/" + suffix)
     }
 
-    private func requireRoot() throws -> URL {
+    private func requireConfiguration() throws -> ConfigurationSnapshot {
         stateLock.lock()
         defer { stateLock.unlock() }
-        guard let rootURL else {
+        guard let rootURL, let resolvedRootPath else {
             throw WorkspaceError.notConfigured
         }
-        return rootURL
+        return ConfigurationSnapshot(rootURL: rootURL, resolvedRootPath: resolvedRootPath)
+    }
+
+    private func stat(path: WorkspacePath, configuration: ConfigurationSnapshot) throws -> FileInfo {
+        let url = try existingURL(for: path, configuration: configuration)
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+
+        let fileType = attributes[.type] as? FileAttributeType
+        let isDirectory = fileType == .typeDirectory
+        let isSymbolicLink = fileType == .typeSymbolicLink
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        let permissionBits = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        let modificationDate = attributes[.modificationDate] as? Date
+
+        let kind: FileTree.Kind
+        if isSymbolicLink {
+            kind = .symlink
+        } else if isDirectory {
+            kind = .directory
+        } else {
+            kind = .file
+        }
+
+        return FileInfo(
+            path: path,
+            kind: kind,
+            size: size,
+            permissions: POSIXPermissions(permissionBits),
+            modificationDate: modificationDate
+        )
     }
 }

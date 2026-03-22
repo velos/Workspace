@@ -8,7 +8,7 @@ public typealias ShellError = WorkspaceError
 @available(*, deprecated, renamed: "FileSystem")
 public typealias WorkspaceFilesystem = FileSystem
 
-@available(*, deprecated, renamed: "ShellFilesystem")
+@available(*, deprecated, renamed: "FileSystem")
 public typealias ShellFilesystem = FileSystem
 
 @available(*, deprecated, renamed: "FileTree")

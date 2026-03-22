@@ -15,10 +15,17 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
 
     private let mode: AccessMode
     private let backing: ReadWriteFilesystem
+    private let stateLock = NSLock()
 
     private var scopedURL: URL
     private var cachedBookmarkData: Data?
     private var didStartSecurityScope = false
+
+    private func withLock<R>(_ body: () throws -> R) rethrows -> R {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return try body()
+    }
 
     /// Creates a filesystem rooted at a security-scoped URL.
     public init(url: URL, mode: AccessMode = .readWrite, fileManager: FileManager = .default) throws {
@@ -62,6 +69,8 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
 
     deinit {
         #if os(iOS) || os(macOS)
+        stateLock.lock()
+        defer { stateLock.unlock() }
         if didStartSecurityScope {
             scopedURL.stopAccessingSecurityScopedResource()
         }
@@ -73,17 +82,19 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
         #if os(tvOS) || os(watchOS)
         throw WorkspaceError.unsupported("security-scoped URLs not supported on this platform")
         #else
-        if let cachedBookmarkData {
-            return cachedBookmarkData
-        }
+        try withLock {
+            if let cachedBookmarkData {
+                return cachedBookmarkData
+            }
 
-        let bookmarkData = try scopedURL.bookmarkData(
-            options: Self.bookmarkCreationOptions,
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil
-        )
-        cachedBookmarkData = bookmarkData
-        return bookmarkData
+            let bookmarkData = try scopedURL.bookmarkData(
+                options: Self.bookmarkCreationOptions,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            cachedBookmarkData = bookmarkData
+            return bookmarkData
+        }
         #endif
     }
 
@@ -108,10 +119,12 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/configure(rootDirectory:)``.
     public func configure(rootDirectory: URL) async throws {
-        stopAccessingSecurityScopeIfNeeded()
-        scopedURL = rootDirectory.standardizedFileURL
-        cachedBookmarkData = nil
-        try configureBackingForCurrentURL()
+        try withLock {
+            stopAccessingSecurityScopeIfNeeded()
+            scopedURL = rootDirectory.standardizedFileURL
+            cachedBookmarkData = nil
+            try configureBackingForCurrentURL()
+        }
     }
 
     /// See ``FileSystem/stat(path:)``.

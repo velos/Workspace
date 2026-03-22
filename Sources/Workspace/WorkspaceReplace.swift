@@ -1,9 +1,9 @@
 import Foundation
 
 /// A request describing a multi-file text replacement operation.
-public struct ReplacementRequest: Sendable, Equatable {
+public struct ReplacementRequest: Sendable, Equatable, Codable {
     /// The text matching strategy to apply to each candidate file.
-    public enum Pattern: Sendable, Equatable {
+    public enum Pattern: Sendable, Equatable, Codable {
         /// Match a literal substring.
         case literal(String, caseSensitive: Bool = true)
         /// Match a regular expression pattern using Foundation regular expression syntax.
@@ -72,7 +72,7 @@ public struct ReplacementRequest: Sendable, Equatable {
 }
 
 /// The result of a multi-file text replacement operation.
-public struct ReplacementResult: Sendable {
+public struct ReplacementResult: Sendable, Codable {
     /// Whether the operation was previewed or executed.
     public var mode: MutationMode
     /// The distinct paths touched by the operation.
@@ -86,7 +86,7 @@ public struct ReplacementResult: Sendable {
 
     /// A single-file text replacement outcome from ``Workspace/previewReplacement(_:)`` or
     /// ``Workspace/applyReplacement(_:failurePolicy:)``.
-    public struct Change: Sendable {
+    public struct Change: Sendable, Codable {
         /// The file path that was changed.
         public var path: WorkspacePath
         /// The number of replacements applied to the file.
@@ -126,7 +126,7 @@ public struct ReplacementResult: Sendable {
     }
 
     /// A failure encountered while executing a single replacement write.
-    public struct Failure: Sendable {
+    public struct Failure: Sendable, Codable {
         /// The path whose replacement write failed.
         public var path: WorkspacePath
         /// A human-readable failure message.

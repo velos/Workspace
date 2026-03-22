@@ -173,6 +173,50 @@ private final class NSErrorFailOnceFilesystem: FileSystem, @unchecked Sendable {
     }
 }
 
+private final class MinimalFilesystem: FileSystem, @unchecked Sendable {
+    private let base = InMemoryFilesystem()
+
+    func stat(path: WorkspacePath) async throws -> FileInfo {
+        try await base.stat(path: path)
+    }
+
+    func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
+        try await base.listDirectory(path: path)
+    }
+
+    func readFile(path: WorkspacePath) async throws -> Data {
+        try await base.readFile(path: path)
+    }
+
+    func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
+        try await base.writeFile(path: path, data: data, append: append)
+    }
+
+    func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
+        try await base.createDirectory(path: path, recursive: recursive)
+    }
+
+    func remove(path: WorkspacePath, recursive: Bool) async throws {
+        try await base.remove(path: path, recursive: recursive)
+    }
+
+    func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
+        try await base.move(from: sourcePath, to: destinationPath)
+    }
+
+    func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws {
+        try await base.copy(from: sourcePath, to: destinationPath, recursive: recursive)
+    }
+
+    func exists(path: WorkspacePath) async -> Bool {
+        await base.exists(path: path)
+    }
+
+    func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
+        try await base.glob(pattern: pattern, currentDirectory: currentDirectory)
+    }
+}
+
 private struct DemoConfig: Codable, Equatable, Sendable {
     var name: String
     var enabled: Bool
@@ -224,7 +268,110 @@ struct WorkspaceTests {
     }
 
     @Test
-    func `readJson rejects invalid JSON`() async throws {
+    func `replacement request and result roundtrip through Codable`() throws {
+        let request = ReplacementRequest(
+            scope: "/Sources",
+            include: ["**/*.swift"],
+            exclude: ["**/*Tests.swift"],
+            search: .literal("workspace", caseSensitive: false),
+            replacement: "Workspace"
+        )
+        let requestData = try JSONEncoder().encode(request)
+        let decodedRequest = try JSONDecoder().decode(ReplacementRequest.self, from: requestData)
+        #expect(decodedRequest == request)
+
+        let diff = TextDiff(
+            hunks: [
+                .init(
+                    oldStartLine: 1,
+                    oldLineCount: 1,
+                    newStartLine: 1,
+                    newLineCount: 1,
+                    lines: [
+                        .init(
+                            kind: .added,
+                            text: "Workspace",
+                            hasTrailingNewline: true,
+                            oldLineNumber: nil,
+                            newLineNumber: 1
+                        )
+                    ]
+                )
+            ]
+        )
+        let result = ReplacementResult(
+            mode: .preview,
+            touchedPaths: ["/Sources/Workspace.swift"],
+            changes: [
+                .init(
+                    path: "/Sources/Workspace.swift",
+                    replacements: 1,
+                    status: .planned,
+                    diff: diff
+                )
+            ],
+            failures: [.init(path: "/Sources/Broken.swift", message: "decode failed")],
+            rolledBack: false
+        )
+
+        let resultData = try JSONEncoder().encode(result)
+        let decodedResult = try JSONDecoder().decode(ReplacementResult.self, from: resultData)
+        #expect(decodedResult.mode == result.mode)
+        #expect(decodedResult.touchedPaths == result.touchedPaths)
+        #expect(decodedResult.changes.count == 1)
+        #expect(decodedResult.changes[0].path == result.changes[0].path)
+        #expect(decodedResult.changes[0].replacements == result.changes[0].replacements)
+        #expect(decodedResult.changes[0].status == result.changes[0].status)
+        #expect(decodedResult.changes[0].diff == result.changes[0].diff)
+        #expect(decodedResult.failures.count == 1)
+        #expect(decodedResult.failures[0].path == result.failures[0].path)
+        #expect(decodedResult.failures[0].message == result.failures[0].message)
+        #expect(decodedResult.rolledBack == result.rolledBack)
+    }
+
+    @Test
+    func `default filesystem extensions throw unsupported advanced operations`() async throws {
+        let filesystem = MinimalFilesystem()
+        try await filesystem.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
+
+        do {
+            try await filesystem.createSymlink(path: "/alias.txt", target: "note.txt")
+            Issue.record("expected unsupported createSymlink error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("symbolic links are not supported"))
+        }
+
+        do {
+            try await filesystem.createHardLink(path: "/hard.txt", target: "/note.txt")
+            Issue.record("expected unsupported createHardLink error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("hard links are not supported"))
+        }
+
+        do {
+            _ = try await filesystem.readSymlink(path: "/note.txt")
+            Issue.record("expected unsupported readSymlink error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("symbolic links are not supported"))
+        }
+
+        do {
+            try await filesystem.setPermissions(path: "/note.txt", permissions: .defaultFile)
+            Issue.record("expected unsupported setPermissions error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("setting permissions is not supported"))
+        }
+
+        do {
+            _ = try await filesystem.resolveRealPath(path: "/note.txt")
+            Issue.record("expected unsupported resolveRealPath error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("real path resolution is not supported"))
+        }
+    }
+
+    @Test
+    func `readJSON rejects invalid JSON`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.writeFile(path: "/broken.json", data: Data("{ nope".utf8), append: false)
         let state = Workspace(filesystem: fs)
