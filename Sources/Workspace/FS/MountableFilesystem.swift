@@ -205,7 +205,7 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
         }
 
         let info = try await source.filesystem.stat(path: source.relativePath)
-        if info.isDirectory, !recursive {
+        if info.kind == .directory, !recursive {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
         }
         try await copyTree(
@@ -286,7 +286,7 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
         destinationPath: WorkspacePath
     ) async throws {
         let info = try await sourceFS.stat(path: sourcePath)
-        if info.isDirectory {
+        if info.kind == .directory {
             try await destinationFS.createDirectory(path: destinationPath, recursive: true)
             let children = try await sourceFS.listDirectory(path: sourcePath)
             for child in children {
@@ -300,7 +300,7 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
             return
         }
 
-        if info.isSymbolicLink {
+        if info.kind == .symlink {
             let target = try await sourceFS.readSymlink(path: sourcePath)
             try await destinationFS.createSymlink(path: destinationPath, target: target)
             return
@@ -329,7 +329,7 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
             for entry in entries {
                 let childPath = current.appending(entry.name)
                 paths.append(childPath)
-                if entry.info.isDirectory {
+                if entry.info.kind == .directory {
                     queue.append(childPath)
                 }
             }

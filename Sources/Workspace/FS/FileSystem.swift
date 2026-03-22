@@ -54,16 +54,6 @@ public struct FileInfo: Sendable, Codable {
     /// The last modification timestamp when available.
     public var modificationDate: Date?
 
-    /// Whether the entry is a directory.
-    public var isDirectory: Bool {
-        kind == .directory
-    }
-
-    /// Whether the entry is a symbolic link.
-    public var isSymbolicLink: Bool {
-        kind == .symlink
-    }
-
     /// Creates metadata for a filesystem entry.
     public init(
         path: WorkspacePath,

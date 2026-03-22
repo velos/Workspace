@@ -163,14 +163,14 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         let destination = try creationURL(for: destinationPath, configuration: configuration)
 
         let sourceInfo = try stat(path: sourcePath, configuration: configuration)
-        if sourceInfo.isDirectory, !recursive {
+        if sourceInfo.kind == .directory, !recursive {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
         }
 
         let parent = destination.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
 
-        if sourceInfo.isDirectory {
+        if sourceInfo.kind == .directory {
             try fileManager.copyItem(at: source, to: destination)
         } else {
             if fileManager.fileExists(atPath: destination.path) {

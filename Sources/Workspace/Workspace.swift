@@ -323,7 +323,7 @@ public actor Workspace {
             return nil
         }
         let info = try await target.stat(path: path)
-        guard !info.isDirectory else {
+        guard info.kind != .directory else {
             return nil
         }
         let data = try await target.readFile(path: path)
@@ -340,7 +340,7 @@ public actor Workspace {
         let info = try await filesystem.stat(path: path)
         let children: [FileTree]?
 
-        if info.isDirectory, maxDepth.map({ depth < $0 }) ?? true {
+        if info.kind == .directory, maxDepth.map({ depth < $0 }) ?? true {
             let entries = try await filesystem.listDirectory(path: path)
             children = try await entries
                 .sorted { $0.name < $1.name }
@@ -367,13 +367,13 @@ public actor Workspace {
 
     private func buildSummary(path: WorkspacePath, depth: Int, maxDepth: Int?) async throws -> FileTreeSummary {
         let info = try await filesystem.stat(path: path)
-        var fileCount = info.isDirectory ? 0 : 1
-        var directoryCount = info.isDirectory ? 1 : 0
-        var symlinkCount = info.isSymbolicLink ? 1 : 0
+        var fileCount = info.kind == .directory ? 0 : 1
+        var directoryCount = info.kind == .directory ? 1 : 0
+        var symlinkCount = info.kind == .symlink ? 1 : 0
         var totalBytes = info.size
         var childSummaries: [FileTreeSummary.Entry] = []
 
-        if info.isDirectory, maxDepth.map({ depth < $0 }) ?? true {
+        if info.kind == .directory, maxDepth.map({ depth < $0 }) ?? true {
             let entries = try await filesystem.listDirectory(path: path)
             for entry in entries.sorted(by: { $0.name < $1.name }) {
                 let childPath = path.appending(entry.name)
@@ -677,7 +677,7 @@ public actor Workspace {
             return []
         }
 
-        if info.isDirectory {
+        if info.kind == .directory {
             let entries = try await target.listDirectory(path: path)
             var fileChanges: [FileEdit.FileChange] = []
             for entry in entries.sorted(by: { $0.name < $1.name }) {
@@ -687,7 +687,7 @@ public actor Workspace {
         }
 
         let diff: TextDiff?
-        if info.isSymbolicLink {
+        if info.kind == .symlink {
             diff = nil
         } else if let originalContent = try await readUTF8IfPresent(
             path,
@@ -719,7 +719,7 @@ public actor Workspace {
             return []
         }
 
-        if info.isDirectory {
+        if info.kind == .directory {
             let entries = try await target.listDirectory(path: sourcePath)
             var fileChanges: [FileEdit.FileChange] = []
             for entry in entries.sorted(by: { $0.name < $1.name }) {
@@ -934,7 +934,7 @@ public actor Workspace {
         }
 
         let info = try await filesystem.stat(path: path)
-        if info.isDirectory {
+        if info.kind == .directory {
             let entries = try await filesystem.listDirectory(path: path)
             let children = try await entries
                 .sorted { $0.name < $1.name }
@@ -944,7 +944,7 @@ public actor Workspace {
             return .directory(path: path, permissions: info.permissions, children: children)
         }
 
-        if info.isSymbolicLink {
+        if info.kind == .symlink {
             let target = try await filesystem.readSymlink(path: path)
             return .symlink(path: path, target: target, permissions: info.permissions)
         }

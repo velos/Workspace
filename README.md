@@ -67,6 +67,18 @@ let text = try await workspace.readFile("/notes/todo.txt")
 print(text) // ship it
 ```
 
+### Binary Data
+
+```swift
+import Workspace
+
+let workspace = Workspace(filesystem: InMemoryFilesystem())
+try await workspace.writeData(Data([0xDE, 0xAD, 0xBE, 0xEF]), to: "/blob.bin")
+
+let blob = try await workspace.readData(from: "/blob.bin")
+print(blob.count) // 4
+```
+
 ### JSON Helpers
 
 ```swift
@@ -218,12 +230,15 @@ print(replacement.replacements)   // number of matched replacements
 print(replacement.diff.hunks)     // structured line-based diff hunks
 ```
 
+`ReplacementRequest`, `ReplacementResult`, edit metadata, tree metadata, and diffs are `Codable`, which makes previews and results easy to serialize for agent or tool workflows.
+
 ## Important Behavior
 
-- `InMemoryFilesystem` is ready to use immediately after initialization. Call `reset()` when you explicitly want to clear it. A lock serializes mutations so the instance can be shared across concurrent tasks.
-- `OverlayFilesystem` snapshots a real root into memory. Call `reload()` when you explicitly want to discard overlay edits and rebuild from disk.
+- `InMemoryFilesystem` is ready to use immediately after initialization. Call `await reset()` when you explicitly want to clear it. Actor isolation serializes access to the tree.
+- `OverlayFilesystem` snapshots a real root into memory. Call `try await reload()` when you explicitly want to discard overlay edits and rebuild from disk.
 - `ReadWriteFilesystem` and `OverlayFilesystem` normalize paths and enforce a rooted/jail model.
 - `PermissionedFileSystem` sees normalized virtual paths, not raw user input paths.
+- `FileSystem` provides default throwing implementations for advanced operations like symlinks, hard links, permission mutation, and real-path resolution, so minimal custom backends only need to implement the core read/write surface.
 - `walkTree` and `summarizeTree` return stable path ordering, which is useful for deterministic tool output.
 
 ## Limitations
@@ -233,7 +248,7 @@ print(replacement.diff.hunks)     // structured line-based diff hunks
 - Rollback is not crash-safe and does not coordinate with external processes.
 - `OverlayFilesystem` does not persist writes back to the original root.
 - Hard links across mounts are not supported.
-- Several filesystem types remain `@unchecked Sendable` at the type level; treat shared mutable instances as needing external coordination unless documented otherwise (for example, `InMemoryFilesystem` uses an internal lock).
+- Some filesystem types still use `@unchecked Sendable`; treat shared mutable class-based implementations carefully unless their synchronization guarantees are documented.
 
 ## Security Notes
 

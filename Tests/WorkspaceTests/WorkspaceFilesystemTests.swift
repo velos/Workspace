@@ -133,7 +133,7 @@ struct WorkspaceFilesystemTests {
 
         #expect(await filesystem.exists(path: "/note.txt"))
 
-        filesystem.reset()
+        await filesystem.reset()
 
         #expect(await filesystem.exists(path: "/"))
         #expect(!(await filesystem.exists(path: "/note.txt")))

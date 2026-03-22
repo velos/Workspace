@@ -52,7 +52,7 @@ struct WorkspaceCoverageTests {
 
         let fileInfo = try await filesystem.stat(path: "/docs/note.txt")
         #expect(fileInfo.size == 11)
-        #expect(!fileInfo.isDirectory)
+        #expect(fileInfo.kind == .file)
 
         let directoryEntries = try await filesystem.listDirectory(path: "/docs")
         #expect(directoryEntries.map(\.name) == ["note.txt"])
@@ -160,7 +160,7 @@ struct WorkspaceCoverageTests {
         )
 
         let docsInfo = try await filesystem.stat(path: "/docs")
-        #expect(docsInfo.isDirectory)
+        #expect(docsInfo.kind == .directory)
         #expect(await filesystem.exists(path: "/docs"))
         #expect(try await filesystem.readFile(path: "/base.txt") == WorkspaceCoverageTestSupport.data("base"))
 

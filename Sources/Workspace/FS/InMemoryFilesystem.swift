@@ -5,10 +5,9 @@ import Foundation
 /// This implementation is useful for tests, previews, and transient workspaces where no host disk
 /// interaction should occur.
 ///
-/// An internal lock serializes access to the tree so concurrent callers do not corrupt the
-/// structure. The class remains ``@unchecked Sendable`` because Swift cannot prove the lock covers
-/// every mutation, but all public entry points acquire it.
-public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
+/// Actor isolation serializes access to the tree so the filesystem can be shared safely across
+/// concurrent tasks.
+public actor InMemoryFilesystem: FileSystem {
     private final class Node {
         enum Kind {
             case file(Data)
@@ -69,13 +68,6 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
     }
 
     private var root: Node
-    private let lock = NSLock()
-
-    private func withLock<R>(_ body: () throws -> R) rethrows -> R {
-        lock.lock()
-        defer { lock.unlock() }
-        return try body()
-    }
 
     /// Creates an empty in-memory filesystem rooted at `/`.
     public init() {
@@ -84,98 +76,85 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/configure(rootDirectory:)``.
     public func configure(rootDirectory: URL) async throws {
-        withLock {
-            _ = rootDirectory
-            root = Node(kind: .directory([:]), permissions: 0o755)
-        }
+        _ = rootDirectory
+        root = Node(kind: .directory([:]), permissions: 0o755)
     }
 
     /// Clears the filesystem and recreates an empty root directory.
     public func reset() {
-        withLock {
-            root = Node(kind: .directory([:]), permissions: 0o755)
-        }
+        root = Node(kind: .directory([:]), permissions: 0o755)
     }
 
     /// See ``FileSystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
-        try withLock {
-            let node = try node(at: path, followFinalSymlink: false)
-            return fileInfo(for: node, path: path)
-        }
+        let node = try node(at: path, followFinalSymlink: false)
+        return fileInfo(for: node, path: path)
     }
 
     /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
-        try withLock {
-            let node = try node(at: path, followFinalSymlink: true)
+        let node = try node(at: path, followFinalSymlink: true)
 
-            guard case let .directory(children) = node.kind else {
-                throw posixError(ENOTDIR)
-            }
+        guard case let .directory(children) = node.kind else {
+            throw posixError(ENOTDIR)
+        }
 
-            return children.keys.sorted().compactMap { name in
-                guard let child = children[name] else {
-                    return nil
-                }
-                let childPath = path.appending(name)
-                return DirectoryEntry(name: name, info: fileInfo(for: child, path: childPath))
+        return children.keys.sorted().compactMap { name in
+            guard let child = children[name] else {
+                return nil
             }
+            let childPath = path.appending(name)
+            return DirectoryEntry(name: name, info: fileInfo(for: child, path: childPath))
         }
     }
 
     /// See ``FileSystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
-        try withLock {
-            let node = try node(at: path, followFinalSymlink: true)
+        let node = try node(at: path, followFinalSymlink: true)
 
-            guard case let .file(data) = node.kind else {
-                throw posixError(EISDIR)
-            }
-
-            return data
+        guard case let .file(data) = node.kind else {
+            throw posixError(EISDIR)
         }
+
+        return data
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
-        try withLock {
-            guard !path.isRoot else {
-                throw posixError(EISDIR)
-            }
-
-            var writePath = path
-            var depth = 0
-            while depth < 64, let symlinkTarget = try symlinkTargetIfPresent(at: writePath) {
-                writePath = WorkspacePath(normalizing: symlinkTarget, relativeTo: writePath.dirname)
-                depth += 1
-            }
-            if depth >= 64 {
-                throw posixError(ELOOP)
-            }
-
-            let (parent, name) = try parentDirectoryAndName(for: writePath)
-            var children = try directoryChildren(of: parent)
-
-            if append,
-               let existing = children[name],
-               case let .file(existingData) = existing.kind {
-                existing.kind = .file(existingData + data)
-                existing.modificationDate = Date()
-                children[name] = existing
-            } else {
-                let node = Node(kind: .file(data), permissions: 0o644)
-                children[name] = node
-            }
-
-            parent.kind = .directory(children)
-            parent.modificationDate = Date()
+        guard !path.isRoot else {
+            throw posixError(EISDIR)
         }
+
+        var writePath = path
+        var depth = 0
+        while depth < 64, let symlinkTarget = try symlinkTargetIfPresent(at: writePath) {
+            writePath = WorkspacePath(normalizing: symlinkTarget, relativeTo: writePath.dirname)
+            depth += 1
+        }
+        if depth >= 64 {
+            throw posixError(ELOOP)
+        }
+
+        let (parent, name) = try parentDirectoryAndName(for: writePath)
+        var children = try directoryChildren(of: parent)
+
+        if append,
+           let existing = children[name],
+           case let .file(existingData) = existing.kind {
+            existing.kind = .file(existingData + data)
+            existing.modificationDate = Date()
+            children[name] = existing
+        } else {
+            let node = Node(kind: .file(data), permissions: 0o644)
+            children[name] = node
+        }
+
+        parent.kind = .directory(children)
+        parent.modificationDate = Date()
     }
 
     /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
-        try withLock {
         if path.isRoot {
             return
         }
@@ -209,12 +188,10 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
                 current = directory
             }
         }
-        }
     }
 
     /// See ``FileSystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
-        try withLock {
         if path.isRoot {
             throw posixError(EPERM)
         }
@@ -231,12 +208,10 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
         parentChildren.removeValue(forKey: name)
         parent.kind = .directory(parentChildren)
         parent.modificationDate = Date()
-        }
     }
 
     /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
-        try withLock {
         if sourcePath == destinationPath {
             return
         }
@@ -277,14 +252,12 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
         destinationChildren[destinationName] = sourceNode
         destinationParent.kind = .directory(destinationChildren)
         destinationParent.modificationDate = Date()
-        }
     }
 
     /// See ``FileSystem/copy(from:to:recursive:)``.
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
-        try withLock {
         let sourceNode = try node(at: sourcePath, followFinalSymlink: false)
         if sourceNode.isDirectory, !recursive {
             throw posixError(EISDIR)
@@ -299,12 +272,10 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
         destinationChildren[destinationName] = sourceNode.clone()
         destinationParent.kind = .directory(destinationChildren)
         destinationParent.modificationDate = Date()
-        }
     }
 
     /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
-        try withLock {
         _ = try WorkspacePath(validating: target, relativeTo: path.dirname)
         guard !path.isRoot else {
             throw posixError(EEXIST)
@@ -319,12 +290,10 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
         children[name] = Node(kind: .symlink(target), permissions: 0o777)
         parent.kind = .directory(children)
         parent.modificationDate = Date()
-        }
     }
 
     /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
-        try withLock {
         guard !path.isRoot else {
             throw posixError(EEXIST)
         }
@@ -343,12 +312,10 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
         children[name] = sourceNode
         parent.kind = .directory(children)
         parent.modificationDate = Date()
-        }
     }
 
     /// See ``FileSystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
-        try withLock {
         let node = try node(at: path, followFinalSymlink: false)
 
         guard case let .symlink(target) = node.kind else {
@@ -356,40 +323,32 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
         }
 
         return target
-        }
     }
 
     /// See ``FileSystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
-        try withLock {
         let node = try node(at: path, followFinalSymlink: false)
         node.permissions = Int(permissions.rawValue)
         node.modificationDate = Date()
-        }
     }
 
     /// See ``FileSystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
-        try withLock {
-            try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0)
-        }
+        try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0)
     }
 
     /// See ``FileSystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
-        withLock {
-            do {
-                _ = try node(at: path, followFinalSymlink: true)
-                return true
-            } catch {
-                return false
-            }
+        do {
+            _ = try node(at: path, followFinalSymlink: true)
+            return true
+        } catch {
+            return false
         }
     }
 
     /// See ``FileSystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
-        try withLock {
         let normalizedPattern = try WorkspacePath(validating: pattern, relativeTo: currentDirectory)
         if !WorkspacePath.containsGlob(normalizedPattern.string) {
             let exists: Bool = {
@@ -412,7 +371,6 @@ public final class InMemoryFilesystem: FileSystem, @unchecked Sendable {
         }
 
         return matches.sorted()
-        }
     }
 
     private func allVirtualPaths() -> [WorkspacePath] {
