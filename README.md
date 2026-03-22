@@ -27,12 +27,12 @@ Many agent and tooling flows need more than plain disk I/O:
 ## What It Provides
 
 - `Workspace`: high-level actor API for common file operations and batch edits
-- `WorkspaceFilesystem`: low-level protocol for custom filesystem backends
+- `FileSystem`: low-level protocol for custom filesystem backends (see also `ReadableFileSystem` / `WritableFileSystem`)
 - `ReadWriteFilesystem`: real disk access rooted to a configured directory
 - `InMemoryFilesystem`: fully in-memory filesystem for isolated sessions and tests
 - `OverlayFilesystem`: snapshot a disk root and keep writes in memory
 - `MountableFilesystem`: compose multiple filesystems under one virtual tree
-- `PermissionedWorkspaceFilesystem`: wrap any filesystem with operation-level approvals
+- `PermissionedFileSystem`: wrap any filesystem with operation-level approvals
 - `SandboxFilesystem`: convenience wrapper for app sandbox roots
 - `SecurityScopedFilesystem`: security-scoped URL and bookmark-backed access
 - `WorkspacePath`: path normalization and joining helpers
@@ -67,6 +67,18 @@ let text = try await workspace.readFile("/notes/todo.txt")
 print(text) // ship it
 ```
 
+### Binary Data
+
+```swift
+import Workspace
+
+let workspace = Workspace(filesystem: InMemoryFilesystem())
+try await workspace.writeData(Data([0xDE, 0xAD, 0xBE, 0xEF]), to: "/blob.bin")
+
+let blob = try await workspace.readData(from: "/blob.bin")
+print(blob.count) // 4
+```
+
 ### JSON Helpers
 
 ```swift
@@ -80,9 +92,9 @@ struct Config: Codable {
 let filesystem = InMemoryFilesystem()
 
 let workspace = Workspace(filesystem: filesystem)
-try await workspace.writeJson("/config.json", value: Config(name: "demo", enabled: true))
+try await workspace.writeJSON(Config(name: "demo", enabled: true), to: "/config.json")
 
-let config = try await workspace.readJson("/config.json", as: Config.self)
+let config = try await workspace.readJSON(Config.self, from: "/config.json")
 print(config.enabled) // true
 ```
 
@@ -100,7 +112,7 @@ let root = URL(fileURLWithPath: "/tmp/demo-workspace", isDirectory: true)
 let filesystem = try ReadWriteFilesystem(rootDirectory: root)
 let workspace = Workspace(filesystem: filesystem)
 
-try await workspace.mkdir("/src")
+try await workspace.createDirectory(at: "/src", recursive: false)
 try await workspace.writeFile("/src/main.swift", content: "print(\"hello\")\n")
 ```
 
@@ -113,7 +125,7 @@ import Foundation
 import Workspace
 
 let projectRoot = URL(fileURLWithPath: "/path/to/project", isDirectory: true)
-let filesystem = try OverlayFilesystem(rootDirectory: projectRoot)
+let filesystem = try await OverlayFilesystem(rootDirectory: projectRoot)
 let workspace = Workspace(filesystem: filesystem)
 
 let preview = try await workspace.summarizeTree("/Sources", maxDepth: 2)
@@ -144,21 +156,21 @@ let mounted = MountableFilesystem(
 
 let workspace = Workspace(filesystem: mounted)
 try await workspace.writeFile("/memory/plan.txt", content: "shared notes")
-try await workspace.cp("/memory/plan.txt", "/workspace-a/plan.txt")
+try await workspace.copyItem(from: "/memory/plan.txt", to: "/workspace-a/plan.txt", recursive: false)
 ```
 
 ### Operation-Level Permissions
 
-Use `PermissionedWorkspaceFilesystem` when the host should decide which operations are allowed:
+Use `PermissionedFileSystem` when the host should decide which operations are allowed:
 
 ```swift
 import Workspace
 
 let base = InMemoryFilesystem()
 
-let filesystem = PermissionedWorkspaceFilesystem(
+let filesystem = PermissionedFileSystem(
     base: base,
-    authorizer: WorkspacePermissionAuthorizer { request in
+    authorizer: PermissionAuthorizer { request in
         switch request.operation {
         case .readFile, .listDirectory, .stat:
             return .allowForSession
@@ -182,6 +194,10 @@ let result = try await workspace.applyEdits([
     .appendFile(path: "/src/a.txt", content: " two"),
     .copy(from: "/src/a.txt", to: "/src/b.txt"),
 ])
+
+let writeChange = result.edits[1].fileChanges[0]
+print(writeChange.status)              // applied
+print(writeChange.diff?.hunks.count)   // Optional(1)
 ```
 
 You can preview a batch before executing it:
@@ -191,26 +207,38 @@ let preview = try await workspace.previewEdits([
     .copy(from: "/docs/guide.txt", to: "/workspace/guide.txt"),
     .appendFile(path: "/workspace/notes.txt", content: "\nnext")
 ])
+
+let appendPreview = preview.edits[1].fileChanges[0]
+print(appendPreview.status)            // planned
+print(appendPreview.diff?.hunks.count) // Optional(...)
 ```
 
 Text replacements use a request type so scope, include, exclude, and matching strategy live in one value:
 
 ```swift
 let preview = try await workspace.previewReplacement(
-    WorkspaceReplaceRequest(
+    ReplacementRequest(
         pattern: "/src/*.txt",
         search: .literal("foo"),
         replacement: "bar"
     )
 )
+
+let replacement = preview.changes[0]
+print(replacement.status)         // planned
+print(replacement.replacements)   // number of matched replacements
+print(replacement.diff.hunks)     // structured line-based diff hunks
 ```
+
+`ReplacementRequest`, `ReplacementResult`, edit metadata, tree metadata, and diffs are `Codable`, which makes previews and results easy to serialize for agent or tool workflows.
 
 ## Important Behavior
 
-- `InMemoryFilesystem` is ready to use immediately after initialization. Call `reset()` when you explicitly want to clear it.
-- `OverlayFilesystem` snapshots a real root into memory. Call `reload()` when you explicitly want to discard overlay edits and rebuild from disk.
+- `InMemoryFilesystem` is ready to use immediately after initialization. Call `await reset()` when you explicitly want to clear it. Actor isolation serializes access to the tree.
+- `OverlayFilesystem` snapshots a real root into memory. Call `try await reload()` when you explicitly want to discard overlay edits and rebuild from disk.
 - `ReadWriteFilesystem` and `OverlayFilesystem` normalize paths and enforce a rooted/jail model.
-- `PermissionedWorkspaceFilesystem` sees normalized virtual paths, not raw user input paths.
+- `PermissionedFileSystem` sees normalized virtual paths, not raw user input paths.
+- `FileSystem` provides default throwing implementations for advanced operations like symlinks, hard links, permission mutation, and real-path resolution, so minimal custom backends only need to implement the core read/write surface.
 - `walkTree` and `summarizeTree` return stable path ordering, which is useful for deterministic tool output.
 
 ## Limitations
@@ -220,7 +248,7 @@ let preview = try await workspace.previewReplacement(
 - Rollback is not crash-safe and does not coordinate with external processes.
 - `OverlayFilesystem` does not persist writes back to the original root.
 - Hard links across mounts are not supported.
-- Some mutable filesystem implementations are `@unchecked Sendable`; sharing one mutable filesystem instance across many independent actors or tasks should be done carefully.
+- Some filesystem types still use `@unchecked Sendable`; treat shared mutable class-based implementations carefully unless their synchronization guarantees are documented.
 
 ## Security Notes
 

@@ -3,13 +3,13 @@ import Testing
 @testable import Workspace
 
 private actor PermissionRecorder {
-    private(set) var requests: [WorkspacePermissionRequest] = []
+    private(set) var requests: [PermissionRequest] = []
 
-    func record(_ request: WorkspacePermissionRequest) {
+    func record(_ request: PermissionRequest) {
         requests.append(request)
     }
 
-    func snapshot() -> [WorkspacePermissionRequest] {
+    func snapshot() -> [PermissionRequest] {
         requests
     }
 }
@@ -29,19 +29,19 @@ private enum WorkspaceFilesystemTestSupport {
 
 @Suite("Workspace Filesystem")
 struct WorkspaceFilesystemTests {
-    @Test("permissioned filesystem normalizes paths and blocks denied writes")
-    func permissionedFilesystemNormalizesPathsAndBlocksDeniedWrites() async throws {
+    @Test
+    func `permissioned filesystem normalizes paths and blocks denied writes`() async throws {
         let base = InMemoryFilesystem()
 
         let recorder = PermissionRecorder()
-        let authorizer = WorkspacePermissionAuthorizer { request in
+        let authorizer = PermissionAuthorizer { request in
             await recorder.record(request)
             if request.operation == .writeFile {
                 return .deny(message: "writes are blocked")
             }
             return .allow
         }
-        let filesystem = PermissionedWorkspaceFilesystem(base: base, authorizer: authorizer)
+        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
 
         do {
             try await filesystem.writeFile(path: "/tmp/../note.txt", data: Data("hello".utf8), append: false)
@@ -57,17 +57,17 @@ struct WorkspaceFilesystemTests {
         #expect(!exists)
     }
 
-    @Test("permissioned filesystem caches allow-for-session decisions")
-    func permissionedFilesystemCachesAllowForSessionDecisions() async throws {
+    @Test
+    func `permissioned filesystem caches allow-for-session decisions`() async throws {
         let base = InMemoryFilesystem()
         try await base.writeFile(path: "/doc.txt", data: Data("hello".utf8), append: false)
 
         let recorder = PermissionRecorder()
-        let authorizer = WorkspacePermissionAuthorizer { request in
+        let authorizer = PermissionAuthorizer { request in
             await recorder.record(request)
             return .allowForSession
         }
-        let filesystem = PermissionedWorkspaceFilesystem(base: base, authorizer: authorizer)
+        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
 
         _ = try await filesystem.readFile(path: "/doc.txt")
         _ = try await filesystem.readFile(path: "/doc.txt")
@@ -77,8 +77,8 @@ struct WorkspaceFilesystemTests {
         #expect(requests.first?.operation == .readFile)
     }
 
-    @Test("permissioned mountable filesystem sees mounted virtual paths")
-    func permissionedMountableFilesystemSeesMountedVirtualPaths() async throws {
+    @Test
+    func `permissioned mountable filesystem sees mounted virtual paths`() async throws {
         let docs = InMemoryFilesystem()
         try await docs.writeFile(path: "/guide.txt", data: Data("guide".utf8), append: false)
 
@@ -90,11 +90,11 @@ struct WorkspaceFilesystemTests {
         )
 
         let recorder = PermissionRecorder()
-        let authorizer = WorkspacePermissionAuthorizer { request in
+        let authorizer = PermissionAuthorizer { request in
             await recorder.record(request)
             return .allow
         }
-        let filesystem = PermissionedWorkspaceFilesystem(base: mountable, authorizer: authorizer)
+        let filesystem = PermissionedFileSystem(base: mountable, authorizer: authorizer)
 
         let data = try await filesystem.readFile(path: "/docs/guide.txt")
         #expect(String(decoding: data, as: UTF8.self) == "guide")
@@ -104,8 +104,8 @@ struct WorkspaceFilesystemTests {
         #expect(requests.first?.path == "/docs/guide.txt")
     }
 
-    @Test("read-write filesystem rejects symlink escapes outside root")
-    func readWriteFilesystemRejectsSymlinkEscapesOutsideRoot() async throws {
+    @Test
+    func `read-write filesystem rejects symlink escapes outside root`() async throws {
         let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceFilesystemRoot")
         defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
 
@@ -126,39 +126,39 @@ struct WorkspaceFilesystemTests {
         }
     }
 
-    @Test("in-memory filesystem reset clears prior contents")
-    func inMemoryFilesystemResetClearsPriorContents() async throws {
+    @Test
+    func `in-memory filesystem reset clears prior contents`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
 
         #expect(await filesystem.exists(path: "/note.txt"))
 
-        filesystem.reset()
+        await filesystem.reset()
 
         #expect(await filesystem.exists(path: "/"))
         #expect(!(await filesystem.exists(path: "/note.txt")))
     }
 
-    @Test("overlay reload restores source snapshot")
-    func overlayReloadRestoresSourceSnapshot() async throws {
+    @Test
+    func `overlay reload restores source snapshot`() async throws {
         let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayRoot")
         defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
 
         let fileURL = root.appendingPathComponent("note.txt")
         try Data("disk".utf8).write(to: fileURL)
 
-        let filesystem = try OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
         try await filesystem.writeFile(path: "/note.txt", data: Data("overlay".utf8), append: false)
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("overlay".utf8))
 
         try Data("disk-updated".utf8).write(to: fileURL)
-        try filesystem.reload()
+        try await filesystem.reload()
 
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk-updated".utf8))
     }
 
-    @Test("in-memory filesystem handles symlink writes copies moves and configure reset")
-    func inMemoryFilesystemHandlesSymlinkWritesCopiesMovesAndConfigureReset() async throws {
+    @Test
+    func `in-memory filesystem handles symlink writes copies moves and configure reset`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/target.txt", data: Data("one".utf8), append: false)
         try await filesystem.createSymlink(path: "/link.txt", target: "target.txt")
@@ -179,13 +179,13 @@ struct WorkspaceFilesystemTests {
         #expect(!(await filesystem.exists(path: "/target.txt")))
         #expect(try await filesystem.readFile(path: "/other/moved.txt") == Data("two".utf8))
 
-        try filesystem.configure(rootDirectory: URL(fileURLWithPath: "/ignored"))
+        try await filesystem.configure(rootDirectory: URL(fileURLWithPath: "/ignored"))
         #expect(await filesystem.exists(path: "/"))
         #expect(!(await filesystem.exists(path: "/other/moved.txt")))
     }
 
-    @Test("in-memory filesystem reports POSIX errors for invalid operations")
-    func inMemoryFilesystemReportsPOSIXErrorsForInvalidOperations() async throws {
+    @Test
+    func `in-memory filesystem reports POSIX errors for invalid operations`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/file.txt", data: Data("data".utf8), append: false)
         try await filesystem.createDirectory(path: "/dir", recursive: true)

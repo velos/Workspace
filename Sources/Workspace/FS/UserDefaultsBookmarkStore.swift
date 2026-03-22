@@ -10,7 +10,7 @@ public actor UserDefaultsBookmarkStore: BookmarkStore {
     /// - Parameters:
     ///   - suiteName: The suite to use. When `nil`, `UserDefaults.standard` is used.
     ///   - keyPrefix: The prefix applied to every stored bookmark key.
-    public init(suiteName: String? = nil, keyPrefix: String = "bashswift.bookmark.") {
+    public init(suiteName: String? = nil, keyPrefix: String = "workspace.bookmark.") {
         defaults = suiteName.flatMap(UserDefaults.init(suiteName:)) ?? .standard
         self.keyPrefix = keyPrefix
     }

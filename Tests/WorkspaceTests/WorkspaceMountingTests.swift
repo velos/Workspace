@@ -4,8 +4,8 @@ import Testing
 
 @Suite("Workspace Mounting")
 struct WorkspaceMountingTests {
-    @Test("multiple isolated mounts can share a memory workspace")
-    func multipleIsolatedMountsCanShareAMemoryWorkspace() async throws {
+    @Test
+    func `multiple isolated mounts can share a memory workspace`() async throws {
         let workspaceA = InMemoryFilesystem()
 
         let workspaceB = InMemoryFilesystem()
@@ -23,15 +23,15 @@ struct WorkspaceMountingTests {
 
         let workspace = Workspace(filesystem: mountable)
         try await workspace.writeFile("/memory/shared.txt", content: "memo")
-        try await workspace.cp("/memory/shared.txt", "/workspace-a/note.txt")
+        try await workspace.copyItem(from: "/memory/shared.txt", to: "/workspace-a/note.txt")
 
         #expect(try await workspace.readFile("/memory/shared.txt") == "memo")
         #expect(try await workspace.readFile("/workspace-a/note.txt") == "memo")
         #expect(!(await workspace.exists("/workspace-b/note.txt")))
     }
 
-    @Test("previewEdits previews mounted changes without mutating")
-    func previewEditsPreviewMountedChangesWithoutMutating() async throws {
+    @Test
+    func `previewEdits previews mounted changes without mutating`() async throws {
         let memory = InMemoryFilesystem()
 
         let workspaceRoot = InMemoryFilesystem()
@@ -54,13 +54,16 @@ struct WorkspaceMountingTests {
         )
 
         #expect(result.mode == .preview)
-        #expect(result.edits.map(\.operation) == [.copy, .appendFile])
+        #expect(result.edits.map(\.edit) == [
+            .copy(from: "/memory/shared.txt", to: "/workspace/shared.txt"),
+            .appendFile(path: "/memory/shared.txt", content: "!")
+        ])
         #expect(!(await workspace.exists("/workspace/shared.txt")))
         #expect(try await workspace.readFile("/memory/shared.txt") == "memo")
     }
 
-    @Test("walkTree maxDepth stops recursion at nested directories")
-    func walkTreeMaxDepthStopsRecursionAtNestedDirectories() async throws {
+    @Test
+    func `walkTree maxDepth stops recursion at nested directories`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.createDirectory(path: "/workspace/src/nested", recursive: true)
         try await filesystem.writeFile(path: "/workspace/src/nested/deep.txt", data: Data("deep".utf8), append: false)
@@ -74,8 +77,8 @@ struct WorkspaceMountingTests {
         #expect(src.children == nil)
     }
 
-    @Test("copy and move operations work across mounted roots")
-    func copyAndMoveOperationsWorkAcrossMountedRoots() async throws {
+    @Test
+    func `copy and move operations work across mounted roots`() async throws {
         let docs = InMemoryFilesystem()
 
         let workspaceFiles = InMemoryFilesystem()
@@ -90,8 +93,8 @@ struct WorkspaceMountingTests {
         try await docs.writeFile(path: "/guide.txt", data: Data("guide".utf8), append: false)
 
         let workspace = Workspace(filesystem: mountable)
-        try await workspace.cp("/docs/guide.txt", "/workspace/guide.txt")
-        try await workspace.mv("/workspace/guide.txt", "/workspace/guide-copy.txt")
+        try await workspace.copyItem(from: "/docs/guide.txt", to: "/workspace/guide.txt")
+        try await workspace.moveItem(from: "/workspace/guide.txt", to: "/workspace/guide-copy.txt")
 
         #expect(!(await workspace.exists("/workspace/guide.txt")))
         #expect(try await workspace.readFile("/workspace/guide-copy.txt") == "guide")

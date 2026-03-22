@@ -4,10 +4,11 @@ import Foundation
 ///
 /// Mutations apply only to the overlay, leaving the source directory untouched until the overlay is
 /// rebuilt.
-public final class OverlayFilesystem: WorkspaceFilesystem, @unchecked Sendable {
+public actor OverlayFilesystem: FileSystem {
     private let fileManager: FileManager
-    private let overlay: InMemoryFilesystem
+    private var overlay: InMemoryFilesystem
     private var rootURL: URL?
+    private var configurationVersion = 0
 
     /// Creates an unconfigured overlay filesystem.
     public init(fileManager: FileManager = .default) {
@@ -16,182 +17,164 @@ public final class OverlayFilesystem: WorkspaceFilesystem, @unchecked Sendable {
     }
 
     /// Creates and configures an overlay for `rootDirectory`.
-    public convenience init(rootDirectory: URL, fileManager: FileManager = .default) throws {
-        self.init(fileManager: fileManager)
-        try configure(rootDirectory: rootDirectory)
+    public init(rootDirectory: URL, fileManager: FileManager = .default) async throws {
+        self.fileManager = fileManager
+        overlay = InMemoryFilesystem()
+        try await configure(rootDirectory: rootDirectory)
     }
 
-    /// See ``WorkspaceFilesystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) throws {
-        rootURL = rootDirectory.standardizedFileURL
-        try reload()
+    /// See ``FileSystem/configure(rootDirectory:)``.
+    public func configure(rootDirectory: URL) async throws {
+        let standardizedRoot = rootDirectory.standardizedFileURL
+        configurationVersion += 1
+        let version = configurationVersion
+        rootURL = standardizedRoot
+
+        let newOverlay = try await makeOverlay(from: standardizedRoot)
+        guard configurationVersion == version, rootURL == standardizedRoot else {
+            return
+        }
+        overlay = newOverlay
     }
 
     /// Rebuilds the overlay from the configured root directory.
-    public func reload() throws {
-        guard rootURL != nil else {
-            throw ShellError.unsupported("overlay filesystem requires rootDirectory")
+    public func reload() async throws {
+        guard let currentRoot = rootURL else {
+            throw WorkspaceError.unsupported("overlay filesystem requires rootDirectory")
         }
-        try rebuildOverlay()
+
+        let version = configurationVersion
+        let newOverlay = try await makeOverlay(from: currentRoot)
+        guard configurationVersion == version, rootURL == currentRoot else {
+            return
+        }
+        overlay = newOverlay
     }
 
-    /// See ``WorkspaceFilesystem/stat(path:)``.
+    /// See ``FileSystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
         try await overlay.stat(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/listDirectory(path:)``.
+    /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         try await overlay.listDirectory(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/readFile(path:)``.
+    /// See ``FileSystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
         try await overlay.readFile(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
+    /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         try await overlay.writeFile(path: path, data: data, append: append)
     }
 
-    /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
+    /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
         try await overlay.createDirectory(path: path, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
+    /// See ``FileSystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
         try await overlay.remove(path: path, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/move(from:to:)``.
+    /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         try await overlay.move(from: sourcePath, to: destinationPath)
     }
 
-    /// See ``WorkspaceFilesystem/copy(from:to:recursive:)``.
+    /// See ``FileSystem/copy(from:to:recursive:)``.
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
         try await overlay.copy(from: sourcePath, to: destinationPath, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
+    /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
         try await overlay.createSymlink(path: path, target: target)
     }
 
-    /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
+    /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         try await overlay.createHardLink(path: path, target: target)
     }
 
-    /// See ``WorkspaceFilesystem/readSymlink(path:)``.
+    /// See ``FileSystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
         try await overlay.readSymlink(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
-    public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
+    /// See ``FileSystem/setPermissions(path:permissions:)``.
+    public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
         try await overlay.setPermissions(path: path, permissions: permissions)
     }
 
-    /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
+    /// See ``FileSystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await overlay.resolveRealPath(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/exists(path:)``.
+    /// See ``FileSystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
         await overlay.exists(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
+    /// See ``FileSystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try await overlay.glob(pattern: pattern, currentDirectory: currentDirectory)
     }
 
-    private func rebuildOverlay() throws {
-        overlay.reset()
-
-        guard let rootURL else {
-            return
-        }
-
+    private func makeOverlay(from rootURL: URL) async throws -> InMemoryFilesystem {
+        let overlay = InMemoryFilesystem()
         guard fileManager.fileExists(atPath: rootURL.path) else {
-            return
+            return overlay
         }
 
         let names = try fileManager.contentsOfDirectory(atPath: rootURL.path).sorted()
         for name in names {
             let childURL = rootURL.appendingPathComponent(name, isDirectory: true)
-            try importItem(at: childURL, virtualPath: WorkspacePath.root.appending(name))
+            try await importItem(at: childURL, virtualPath: WorkspacePath.root.appending(name), into: overlay)
         }
+        return overlay
     }
 
-    private func importItem(at url: URL, virtualPath: WorkspacePath) throws {
+    private func importItem(at url: URL, virtualPath: WorkspacePath, into overlay: InMemoryFilesystem) async throws {
         let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+        let permissionBits = (attributes[.posixPermissions] as? NSNumber)?.intValue
+        let permissions = permissionBits.map(POSIXPermissions.init(_:))
 
         if values.isSymbolicLink == true {
             let target = try fileManager.destinationOfSymbolicLink(atPath: url.path)
-            try performAsync {
-                try await self.overlay.createSymlink(path: virtualPath, target: target)
-                if let permissions {
-                    try await self.overlay.setPermissions(path: virtualPath, permissions: permissions)
-                }
+            try await overlay.createSymlink(path: virtualPath, target: target)
+            if let permissions {
+                try await overlay.setPermissions(path: virtualPath, permissions: permissions)
             }
             return
         }
 
         if values.isDirectory == true {
-            try performAsync {
-                try await self.overlay.createDirectory(path: virtualPath, recursive: true)
-                if let permissions {
-                    try await self.overlay.setPermissions(path: virtualPath, permissions: permissions)
-                }
+            try await overlay.createDirectory(path: virtualPath, recursive: true)
+            if let permissions {
+                try await overlay.setPermissions(path: virtualPath, permissions: permissions)
             }
 
             let children = try fileManager.contentsOfDirectory(atPath: url.path).sorted()
             for child in children {
                 let childURL = url.appendingPathComponent(child, isDirectory: true)
-                try importItem(at: childURL, virtualPath: virtualPath.appending(child))
+                try await importItem(at: childURL, virtualPath: virtualPath.appending(child), into: overlay)
             }
             return
         }
 
         let data = try Data(contentsOf: url)
-        try performAsync {
-            try await self.overlay.writeFile(path: virtualPath, data: data, append: false)
-            if let permissions {
-                try await self.overlay.setPermissions(path: virtualPath, permissions: permissions)
-            }
-        }
-    }
-
-    private func performAsync(
-        _ operation: @escaping @Sendable () async throws -> Void
-    ) throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        final class ErrorBox: @unchecked Sendable {
-            var error: Error?
-        }
-        let box = ErrorBox()
-
-        Task {
-            defer { semaphore.signal() }
-            do {
-                try await operation()
-            } catch {
-                box.error = error
-            }
-        }
-
-        semaphore.wait()
-        if let error = box.error {
-            throw error
+        try await overlay.writeFile(path: virtualPath, data: data, append: false)
+        if let permissions {
+            try await overlay.setPermissions(path: virtualPath, permissions: permissions)
         }
     }
 }

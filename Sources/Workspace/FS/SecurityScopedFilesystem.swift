@@ -4,7 +4,7 @@ import Foundation
 ///
 /// This adapter is intended for iOS and macOS workflows where filesystem access must be granted through
 /// a bookmark or document picker URL.
-public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sendable {
+public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
     /// The permitted mutability for the scoped filesystem.
     public enum AccessMode: Sendable {
         /// Only read operations are allowed.
@@ -15,10 +15,17 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
 
     private let mode: AccessMode
     private let backing: ReadWriteFilesystem
+    private let stateLock = NSLock()
 
     private var scopedURL: URL
     private var cachedBookmarkData: Data?
     private var didStartSecurityScope = false
+
+    private func withLock<R>(_ body: () throws -> R) rethrows -> R {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return try body()
+    }
 
     /// Creates a filesystem rooted at a security-scoped URL.
     public init(url: URL, mode: AccessMode = .readWrite, fileManager: FileManager = .default) throws {
@@ -32,7 +39,7 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
     /// Creates a filesystem from previously saved bookmark data.
     public init(bookmarkData: Data, mode: AccessMode = .readWrite, fileManager: FileManager = .default) throws {
         #if os(tvOS) || os(watchOS)
-        throw ShellError.unsupported("security-scoped URLs not supported on this platform")
+        throw WorkspaceError.unsupported("security-scoped URLs not supported on this platform")
         #else
         self.mode = mode
         backing = ReadWriteFilesystem(fileManager: fileManager)
@@ -62,6 +69,8 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
 
     deinit {
         #if os(iOS) || os(macOS)
+        stateLock.lock()
+        defer { stateLock.unlock() }
         if didStartSecurityScope {
             scopedURL.stopAccessingSecurityScopedResource()
         }
@@ -71,19 +80,21 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
     /// Produces bookmark data for the currently scoped URL.
     public func makeBookmarkData() throws -> Data {
         #if os(tvOS) || os(watchOS)
-        throw ShellError.unsupported("security-scoped URLs not supported on this platform")
+        throw WorkspaceError.unsupported("security-scoped URLs not supported on this platform")
         #else
-        if let cachedBookmarkData {
-            return cachedBookmarkData
-        }
+        try withLock {
+            if let cachedBookmarkData {
+                return cachedBookmarkData
+            }
 
-        let bookmarkData = try scopedURL.bookmarkData(
-            options: Self.bookmarkCreationOptions,
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil
-        )
-        cachedBookmarkData = bookmarkData
-        return bookmarkData
+            let bookmarkData = try scopedURL.bookmarkData(
+                options: Self.bookmarkCreationOptions,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            cachedBookmarkData = bookmarkData
+            return bookmarkData
+        }
         #endif
     }
 
@@ -101,59 +112,61 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
         fileManager: FileManager = .default
     ) async throws -> SecurityScopedFilesystem {
         guard let data = try await store.loadBookmark(for: id) else {
-            throw ShellError.unsupported("bookmark not found: \(id)")
+            throw WorkspaceError.unsupported("bookmark not found: \(id)")
         }
         return try SecurityScopedFilesystem(bookmarkData: data, mode: mode, fileManager: fileManager)
     }
 
-    /// See ``WorkspaceFilesystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) throws {
-        stopAccessingSecurityScopeIfNeeded()
-        scopedURL = rootDirectory.standardizedFileURL
-        cachedBookmarkData = nil
-        try configureBackingForCurrentURL()
+    /// See ``FileSystem/configure(rootDirectory:)``.
+    public func configure(rootDirectory: URL) async throws {
+        try withLock {
+            stopAccessingSecurityScopeIfNeeded()
+            scopedURL = rootDirectory.standardizedFileURL
+            cachedBookmarkData = nil
+            try configureBackingForCurrentURL()
+        }
     }
 
-    /// See ``WorkspaceFilesystem/stat(path:)``.
+    /// See ``FileSystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
         try await backing.stat(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/listDirectory(path:)``.
+    /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         try await backing.listDirectory(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/readFile(path:)``.
+    /// See ``FileSystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
         try await backing.readFile(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/writeFile(path:data:append:)``.
+    /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         try ensureWritable()
         try await backing.writeFile(path: path, data: data, append: append)
     }
 
-    /// See ``WorkspaceFilesystem/createDirectory(path:recursive:)``.
+    /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
         try ensureWritable()
         try await backing.createDirectory(path: path, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/remove(path:recursive:)``.
+    /// See ``FileSystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
         try ensureWritable()
         try await backing.remove(path: path, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/move(from:to:)``.
+    /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         try ensureWritable()
         try await backing.move(from: sourcePath, to: destinationPath)
     }
 
-    /// See ``WorkspaceFilesystem/copy(from:to:recursive:)``.
+    /// See ``FileSystem/copy(from:to:recursive:)``.
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
@@ -161,62 +174,62 @@ public final class SecurityScopedFilesystem: WorkspaceFilesystem, @unchecked Sen
         try await backing.copy(from: sourcePath, to: destinationPath, recursive: recursive)
     }
 
-    /// See ``WorkspaceFilesystem/createSymlink(path:target:)``.
+    /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
         try ensureWritable()
         try await backing.createSymlink(path: path, target: target)
     }
 
-    /// See ``WorkspaceFilesystem/createHardLink(path:target:)``.
+    /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         try ensureWritable()
         try await backing.createHardLink(path: path, target: target)
     }
 
-    /// See ``WorkspaceFilesystem/readSymlink(path:)``.
+    /// See ``FileSystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
         try await backing.readSymlink(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/setPermissions(path:permissions:)``.
-    public func setPermissions(path: WorkspacePath, permissions: Int) async throws {
+    /// See ``FileSystem/setPermissions(path:permissions:)``.
+    public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
         try ensureWritable()
         try await backing.setPermissions(path: path, permissions: permissions)
     }
 
-    /// See ``WorkspaceFilesystem/resolveRealPath(path:)``.
+    /// See ``FileSystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await backing.resolveRealPath(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/exists(path:)``.
+    /// See ``FileSystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
         await backing.exists(path: path)
     }
 
-    /// See ``WorkspaceFilesystem/glob(pattern:currentDirectory:)``.
+    /// See ``FileSystem/glob(pattern:currentDirectory:)``.
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
         try await backing.glob(pattern: pattern, currentDirectory: currentDirectory)
     }
 
     private func ensureWritable() throws {
         guard mode == .readWrite else {
-            throw ShellError.unsupported("filesystem is read-only")
+            throw WorkspaceError.readOnly
         }
     }
 
     private func configureBackingForCurrentURL() throws {
         try beginAccessingSecurityScopeIfNeeded()
-        try backing.configure(rootDirectory: scopedURL)
+        try backing.applyConfiguration(rootDirectory: scopedURL)
     }
 
     private func beginAccessingSecurityScopeIfNeeded() throws {
         #if os(tvOS) || os(watchOS)
-        throw ShellError.unsupported("security-scoped URLs not supported on this platform")
+        throw WorkspaceError.unsupported("security-scoped URLs not supported on this platform")
         #elseif os(iOS)
         if !didStartSecurityScope {
             guard scopedURL.startAccessingSecurityScopedResource() else {
-                throw ShellError.unsupported("could not start security-scoped access")
+                throw WorkspaceError.unsupported("could not start security-scoped access")
             }
             didStartSecurityScope = true
         }

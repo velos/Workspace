@@ -35,11 +35,11 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     /// - Parameters:
     ///   - path: The path text to validate and normalize.
     ///   - currentDirectory: The base path used for relative inputs.
-    /// - Throws: ``ShellError/invalidPath(_:)`` when the input contains unsupported characters.
+    /// - Throws: ``WorkspaceError/invalidPath(_:)`` when the input contains unsupported characters.
     public init(validating path: some StringProtocol, relativeTo currentDirectory: WorkspacePath = .root) throws {
         let string = String(path)
         if string.contains("\u{0}") {
-            throw ShellError.invalidPath(string)
+            throw WorkspaceError.invalidPath(string)
         }
         self.init(normalizing: string, relativeTo: currentDirectory)
     }
