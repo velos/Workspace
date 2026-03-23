@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
+        uses: swift-actions/setup-swift@v3
         with:
           swift-version: "6.2"
 
@@ -47,7 +47,7 @@ jobs:
 
       - name: Publish test report
         if: ${{ !cancelled() }}
-        uses: dorny/test-reporter@v2
+        uses: dorny/test-reporter@v3
         with:
           name: Swift Test Report
           path: .build/test-results/xunit.xml
