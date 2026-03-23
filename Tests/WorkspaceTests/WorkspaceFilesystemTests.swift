@@ -25,11 +25,39 @@ private enum WorkspaceFilesystemTestSupport {
     static func removeDirectory(_ url: URL) {
         try? FileManager.default.removeItem(at: url)
     }
+
+    static func data(_ value: String) -> Data {
+        Data(value.utf8)
+    }
+
+    static func uniqueSuiteName(prefix: String = "WorkspaceFilesystemTests") -> String {
+        "\(prefix).\(UUID().uuidString)"
+    }
+}
+
+private final class NilAppGroupFileManager: FileManager {
+    override func containerURL(forSecurityApplicationGroupIdentifier groupIdentifier: String) -> URL? {
+        nil
+    }
+}
+
+extension Tag {
+    @Tag static var permissions: Self
+    @Tag static var readWrite: Self
+    @Tag static var inMemory: Self
+    @Tag static var overlay: Self
+    @Tag static var sandbox: Self
+    @Tag static var bookmarks: Self
+    @Tag static var securityScoped: Self
+    @Tag static var watching: Self
+    @Tag static var edits: Self
+    @Tag static var replacement: Self
+    @Tag static var tree: Self
 }
 
 @Suite("Workspace Filesystem")
 struct WorkspaceFilesystemTests {
-    @Test
+    @Test(.tags(.permissions))
     func `permissioned filesystem normalizes paths and blocks denied writes`() async throws {
         let base = InMemoryFilesystem()
 
@@ -57,7 +85,7 @@ struct WorkspaceFilesystemTests {
         #expect(!exists)
     }
 
-    @Test
+    @Test(.tags(.permissions))
     func `permissioned filesystem caches allow-for-session decisions`() async throws {
         let base = InMemoryFilesystem()
         try await base.writeFile(path: "/doc.txt", data: Data("hello".utf8), append: false)
@@ -77,7 +105,7 @@ struct WorkspaceFilesystemTests {
         #expect(requests.first?.operation == .readFile)
     }
 
-    @Test
+    @Test(.tags(.permissions))
     func `permissioned mountable filesystem sees mounted virtual paths`() async throws {
         let docs = InMemoryFilesystem()
         try await docs.writeFile(path: "/guide.txt", data: Data("guide".utf8), append: false)
@@ -104,7 +132,7 @@ struct WorkspaceFilesystemTests {
         #expect(requests.first?.path == "/docs/guide.txt")
     }
 
-    @Test
+    @Test(.tags(.readWrite))
     func `read-write filesystem rejects symlink escapes outside root`() async throws {
         let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceFilesystemRoot")
         defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
@@ -126,7 +154,7 @@ struct WorkspaceFilesystemTests {
         }
     }
 
-    @Test
+    @Test(.tags(.inMemory))
     func `in-memory filesystem reset clears prior contents`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
@@ -139,7 +167,7 @@ struct WorkspaceFilesystemTests {
         #expect(!(await filesystem.exists(path: "/note.txt")))
     }
 
-    @Test
+    @Test(.tags(.overlay))
     func `overlay reload restores source snapshot`() async throws {
         let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayRoot")
         defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
@@ -157,7 +185,7 @@ struct WorkspaceFilesystemTests {
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk-updated".utf8))
     }
 
-    @Test
+    @Test(.tags(.inMemory))
     func `in-memory filesystem handles symlink writes copies moves and configure reset`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/target.txt", data: Data("one".utf8), append: false)
@@ -184,7 +212,7 @@ struct WorkspaceFilesystemTests {
         #expect(!(await filesystem.exists(path: "/other/moved.txt")))
     }
 
-    @Test
+    @Test(.tags(.inMemory))
     func `in-memory filesystem reports POSIX errors for invalid operations`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/file.txt", data: Data("data".utf8), append: false)
@@ -288,4 +316,466 @@ struct WorkspaceFilesystemTests {
             #expect(error.code == Int(EPERM))
         }
     }
+
+    @Test(.tags(.readWrite))
+    func `read-write filesystem supports file metadata links globbing and recursive copies`() async throws {
+        let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceReadWriteRoot")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+
+        try await filesystem.createDirectory(path: "/docs", recursive: false)
+        try await filesystem.writeFile(path: "/docs/note.txt", data: WorkspaceFilesystemTestSupport.data("hello"), append: false)
+        try await filesystem.writeFile(path: "/docs/note.txt", data: WorkspaceFilesystemTestSupport.data(" world"), append: true)
+
+        #expect(try await filesystem.readFile(path: "/docs/note.txt") == WorkspaceFilesystemTestSupport.data("hello world"))
+
+        let fileInfo = try await filesystem.stat(path: "/docs/note.txt")
+        #expect(fileInfo.size == 11)
+        #expect(fileInfo.kind == .file)
+        let directoryInfo = try await filesystem.stat(path: "/docs")
+        #expect(directoryInfo.kind == .directory)
+
+        let directoryEntries = try await filesystem.listDirectory(path: "/docs")
+        #expect(directoryEntries.map(\.name) == ["note.txt"])
+
+        try await filesystem.copy(from: "/docs/note.txt", to: "/docs/replaced.txt", recursive: false)
+        try await filesystem.writeFile(path: "/docs/replaced.txt", data: WorkspaceFilesystemTestSupport.data("stale"), append: false)
+        try await filesystem.copy(from: "/docs/note.txt", to: "/docs/replaced.txt", recursive: false)
+        #expect(try await filesystem.readFile(path: "/docs/replaced.txt") == WorkspaceFilesystemTestSupport.data("hello world"))
+
+        try await filesystem.move(from: "/docs/replaced.txt", to: "/docs/moved.txt")
+        #expect(!(await filesystem.exists(path: "/docs/replaced.txt")))
+        #expect(await filesystem.exists(path: "/docs/moved.txt"))
+
+        try await filesystem.createSymlink(path: "/docs/link.txt", target: "note.txt")
+        #expect(try await filesystem.readSymlink(path: "/docs/link.txt") == "note.txt")
+        #expect(try await filesystem.resolveRealPath(path: "/docs/link.txt") == "/docs/note.txt")
+        #expect(try await filesystem.stat(path: "/docs/link.txt").kind == .symlink)
+
+        try await filesystem.createHardLink(path: "/docs/hard.txt", target: "/docs/note.txt")
+        #expect(try await filesystem.readFile(path: "/docs/hard.txt") == WorkspaceFilesystemTestSupport.data("hello world"))
+
+        try await filesystem.setPermissions(path: "/docs/note.txt", permissions: POSIXPermissions(0o600))
+        let updatedInfo = try await filesystem.stat(path: "/docs/note.txt")
+        #expect(updatedInfo.permissions == POSIXPermissions(0o600))
+
+        try await filesystem.createDirectory(path: "/tree/sub", recursive: true)
+        try await filesystem.writeFile(path: "/tree/sub/deep.txt", data: WorkspaceFilesystemTestSupport.data("nested"), append: false)
+        try await filesystem.copy(from: "/tree", to: "/tree-copy", recursive: true)
+        #expect(try await filesystem.readFile(path: "/tree-copy/sub/deep.txt") == WorkspaceFilesystemTestSupport.data("nested"))
+
+        let globbed = try await filesystem.glob(pattern: "/docs/*.txt", currentDirectory: "/")
+        #expect(globbed.contains("/docs/note.txt"))
+        #expect(globbed.contains("/docs/link.txt"))
+        #expect(globbed.contains("/docs/hard.txt"))
+        #expect(globbed.contains("/docs/moved.txt"))
+
+        try await filesystem.remove(path: "/docs/moved.txt", recursive: false)
+        try await filesystem.remove(path: "/tree-copy", recursive: true)
+
+        #expect(!(await filesystem.exists(path: "/docs/moved.txt")))
+        #expect(!(await filesystem.exists(path: "/tree-copy")))
+        #expect(await filesystem.exists(path: "/"))
+    }
+
+    @Test(.tags(.readWrite))
+    func `read-write filesystem reports configuration and directory operation errors`() async throws {
+        let unconfigured = ReadWriteFilesystem()
+
+        do {
+            _ = try await unconfigured.stat(path: "/")
+            Issue.record("expected unconfigured filesystem error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("filesystem is not configured"))
+        }
+
+        #expect(!(await unconfigured.exists(path: "/\u{0}")))
+
+        let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceReadWriteErrors")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.createDirectory(path: "/dir", recursive: false)
+        try await filesystem.writeFile(path: "/dir/file.txt", data: WorkspaceFilesystemTestSupport.data("x"), append: false)
+
+        do {
+            _ = try await filesystem.listDirectory(path: "/dir/file.txt")
+            Issue.record("expected ENOTDIR")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(ENOTDIR))
+        }
+
+        do {
+            try await filesystem.remove(path: "/dir", recursive: false)
+            Issue.record("expected ENOTEMPTY")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(ENOTEMPTY))
+        }
+
+        do {
+            try await filesystem.copy(from: "/dir", to: "/dir-copy", recursive: false)
+            Issue.record("expected EISDIR")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EISDIR))
+        }
+
+        try await filesystem.remove(path: "/missing", recursive: false)
+        #expect(try await filesystem.glob(pattern: "/missing.txt", currentDirectory: "/").isEmpty)
+    }
+
+    @Test(.tags(.overlay))
+    func `overlay filesystem imports disk state and proxies mutations`() async throws {
+        let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayCoverage")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
+
+        let dirURL = root.appendingPathComponent("dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+
+        let fileURL = dirURL.appendingPathComponent("file.txt")
+        try WorkspaceFilesystemTestSupport.data("disk").write(to: fileURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: fileURL.path)
+
+        let symlinkURL = root.appendingPathComponent("alias.txt")
+        try FileManager.default.createSymbolicLink(atPath: symlinkURL.path, withDestinationPath: "dir/file.txt")
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+
+        #expect((try await filesystem.listDirectory(path: "/")).map(\.name) == ["alias.txt", "dir"])
+        #expect((try await filesystem.listDirectory(path: "/dir")).map(\.name) == ["file.txt"])
+        #expect(try await filesystem.readFile(path: "/alias.txt") == WorkspaceFilesystemTestSupport.data("disk"))
+        #expect(try await filesystem.readSymlink(path: "/alias.txt") == "dir/file.txt")
+        #expect(try await filesystem.stat(path: "/dir/file.txt").permissions == POSIXPermissions(0o640))
+
+        try await filesystem.createDirectory(path: "/scratch", recursive: true)
+        try await filesystem.writeFile(path: "/scratch/note.txt", data: WorkspaceFilesystemTestSupport.data("hello"), append: false)
+        try await filesystem.copy(from: "/scratch/note.txt", to: "/scratch/copy.txt", recursive: false)
+        try await filesystem.move(from: "/scratch/copy.txt", to: "/scratch/moved.txt")
+        try await filesystem.createSymlink(path: "/scratch/link.txt", target: "note.txt")
+        try await filesystem.createHardLink(path: "/scratch/hard.txt", target: "/scratch/note.txt")
+        try await filesystem.setPermissions(path: "/scratch/note.txt", permissions: POSIXPermissions(0o600))
+
+        #expect(try await filesystem.readSymlink(path: "/scratch/link.txt") == "note.txt")
+        #expect(try await filesystem.resolveRealPath(path: "/scratch/link.txt") == "/scratch/note.txt")
+        #expect(try await filesystem.readFile(path: "/scratch/hard.txt") == WorkspaceFilesystemTestSupport.data("hello"))
+        #expect((try await filesystem.glob(pattern: "/scratch/*.txt", currentDirectory: "/")).contains("/scratch/moved.txt"))
+
+        try await filesystem.remove(path: "/scratch/moved.txt", recursive: false)
+        #expect(!(await filesystem.exists(path: "/scratch/moved.txt")))
+    }
+
+    @Test(.tags(.overlay))
+    func `overlay filesystem reload requires a configured root and treats missing roots as empty`() async throws {
+        let unconfigured = OverlayFilesystem()
+
+        do {
+            try await unconfigured.reload()
+            Issue.record("expected missing rootDirectory rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("requires rootDirectory"))
+        }
+
+        let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayMissingRoot")
+        try FileManager.default.removeItem(at: root)
+
+        let filesystem = OverlayFilesystem()
+        try await filesystem.configure(rootDirectory: root)
+
+        #expect(await filesystem.exists(path: "/"))
+        #expect(!(await filesystem.exists(path: "/missing.txt")))
+    }
+
+    @Test(.tags(.permissions))
+    func `permissioned filesystem forwards filesystem operations and normalized paths`() async throws {
+        let base = InMemoryFilesystem()
+        let recorder = PermissionRecorder()
+        let authorizer = PermissionAuthorizer { request in
+            await recorder.record(request)
+            return .allow
+        }
+        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
+
+        try await filesystem.writeFile(path: "/dir/../note.txt", data: WorkspaceFilesystemTestSupport.data("hello"), append: false)
+        try await filesystem.createDirectory(path: "/links", recursive: true)
+        try await filesystem.copy(from: "/note.txt", to: "/copy.txt", recursive: false)
+        try await filesystem.move(from: "/copy.txt", to: "/moved.txt")
+        try await filesystem.createSymlink(path: "/links/link.txt", target: "../note.txt")
+        try await filesystem.createHardLink(path: "/hard.txt", target: "/note.txt")
+
+        _ = try await filesystem.stat(path: "/note.txt")
+        _ = try await filesystem.listDirectory(path: "/")
+        _ = try await filesystem.readFile(path: "/note.txt")
+        _ = try await filesystem.readSymlink(path: "/links/link.txt")
+        try await filesystem.setPermissions(path: "/note.txt", permissions: POSIXPermissions(0o600))
+        _ = try await filesystem.resolveRealPath(path: "/links/link.txt")
+        #expect(await filesystem.exists(path: "/note.txt"))
+        _ = try await filesystem.glob(pattern: "*.txt", currentDirectory: "/")
+        try await filesystem.remove(path: "/hard.txt", recursive: false)
+
+        let requests = await recorder.snapshot()
+        #expect(requests.map(\.operation) == [
+            .writeFile,
+            .createDirectory,
+            .copy,
+            .move,
+            .createSymlink,
+            .createHardLink,
+            .stat,
+            .listDirectory,
+            .readFile,
+            .readSymlink,
+            .setPermissions,
+            .resolveRealPath,
+            .exists,
+            .glob,
+            .remove,
+        ])
+
+        let symlinkRequest = try #require(requests.first { $0.operation == .createSymlink })
+        #expect(symlinkRequest.path == "/links/link.txt")
+        #expect(symlinkRequest.destinationPath == "/note.txt")
+
+        let globRequest = try #require(requests.first { $0.operation == .glob })
+        #expect(globRequest.path == "/*.txt")
+        #expect(globRequest.destinationPath == "/")
+    }
+
+    @Test(.tags(.permissions))
+    func `permissioned filesystem forwards configuration and denied remove operations`() async throws {
+        let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspacePermissionedConfig")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
+
+        let base = ReadWriteFilesystem()
+        let filesystem = PermissionedFileSystem(
+            base: base,
+            authorizer: PermissionAuthorizer { request in
+                if request.operation == .remove {
+                    return .deny(message: nil)
+                }
+                return .allow
+            }
+        )
+
+        try await filesystem.configure(rootDirectory: root)
+        try await filesystem.writeFile(path: "/note.txt", data: WorkspaceFilesystemTestSupport.data("hello"), append: false)
+
+        do {
+            try await filesystem.remove(path: "/note.txt", recursive: false)
+            Issue.record("expected denied remove")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("workspace access denied: remove"))
+        }
+
+        let deniedExists = await PermissionedFileSystem(
+            base: base,
+            authorizer: PermissionAuthorizer { _ in .deny(message: "blocked") }
+        ).exists(path: "/note.txt")
+
+        #expect(!deniedExists)
+        #expect(!(await filesystem.exists(path: "/\u{0}")))
+    }
+
+    @Test(.tags(.sandbox))
+    func `sandbox filesystem rooted at a URL supports filesystem operations`() async throws {
+        let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceSandboxURL")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try SandboxFilesystem(root: .url(root))
+
+        try await filesystem.writeFile(path: "/note.txt", data: WorkspaceFilesystemTestSupport.data("hello"), append: false)
+        try await filesystem.createDirectory(path: "/dir", recursive: true)
+        try await filesystem.copy(from: "/note.txt", to: "/copy.txt", recursive: false)
+        try await filesystem.move(from: "/copy.txt", to: "/moved.txt")
+        try await filesystem.createSymlink(path: "/link.txt", target: "note.txt")
+        try await filesystem.createHardLink(path: "/hard.txt", target: "/note.txt")
+        try await filesystem.setPermissions(path: "/note.txt", permissions: POSIXPermissions(0o600))
+
+        #expect(try await filesystem.readFile(path: "/note.txt") == WorkspaceFilesystemTestSupport.data("hello"))
+        #expect(try await filesystem.readSymlink(path: "/link.txt") == "note.txt")
+        #expect(try await filesystem.resolveRealPath(path: "/link.txt") == "/note.txt")
+        #expect(try await filesystem.stat(path: "/note.txt").permissions == POSIXPermissions(0o600))
+        #expect(await filesystem.exists(path: "/hard.txt"))
+        #expect((try await filesystem.listDirectory(path: "/")).map(\.name).sorted() == ["dir", "hard.txt", "link.txt", "moved.txt", "note.txt"])
+        #expect((try await filesystem.glob(pattern: "/*.txt", currentDirectory: "/")).contains("/moved.txt"))
+
+        try await filesystem.remove(path: "/moved.txt", recursive: false)
+        #expect(!(await filesystem.exists(path: "/moved.txt")))
+    }
+
+    @Test(.tags(.sandbox))
+    func `sandbox filesystem supports standard roots configuration and app-group validation`() async throws {
+        let temporary = try SandboxFilesystem(root: .temporary)
+        #expect(await temporary.exists(path: "/"))
+
+        #if os(macOS)
+        let documents = try SandboxFilesystem(root: .documents)
+        let caches = try SandboxFilesystem(root: .caches)
+        #expect(await documents.exists(path: "/"))
+        #expect(await caches.exists(path: "/"))
+        #endif
+
+        do {
+            _ = try SandboxFilesystem(root: .appGroup("invalid-group"))
+            Issue.record("expected invalid app group identifier rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("invalid app group identifier"))
+        }
+
+        do {
+            _ = try SandboxFilesystem(
+                root: .appGroup("group.workspace.tests.missing"),
+                fileManager: NilAppGroupFileManager()
+            )
+            Issue.record("expected unavailable app group rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("app group container unavailable"))
+        }
+
+        let firstRoot = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceSandboxFirst")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(firstRoot) }
+
+        let secondRoot = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceSandboxSecond")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(secondRoot) }
+
+        let filesystem = try SandboxFilesystem(root: .url(firstRoot))
+        try await filesystem.configure(rootDirectory: secondRoot)
+        try await filesystem.writeFile(path: "/configured.txt", data: WorkspaceFilesystemTestSupport.data("configured"), append: false)
+
+        #expect(FileManager.default.fileExists(atPath: secondRoot.appendingPathComponent("configured.txt").path))
+    }
+
+    @Test(.tags(.bookmarks))
+    func `user defaults bookmark store persists and deletes suite values`() async throws {
+        let suiteName = WorkspaceFilesystemTestSupport.uniqueSuiteName()
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let store = UserDefaultsBookmarkStore(suiteName: suiteName, keyPrefix: "workspace.tests.")
+        let data = WorkspaceFilesystemTestSupport.data("bookmark")
+
+        try await store.saveBookmark(data, for: "demo")
+        #expect(try await store.loadBookmark(for: "demo") == data)
+
+        try await store.deleteBookmark(for: "demo")
+        #expect(try await store.loadBookmark(for: "demo") == nil)
+    }
+
+    @Test(.tags(.bookmarks))
+    func `user defaults bookmark store supports standard defaults`() async throws {
+        let id = "standard-\(UUID().uuidString)"
+        let store = UserDefaultsBookmarkStore(keyPrefix: "workspace.tests.standard.")
+        let data = WorkspaceFilesystemTestSupport.data("bookmark")
+        defer { UserDefaults.standard.removeObject(forKey: "workspace.tests.standard." + id) }
+
+        try await store.saveBookmark(data, for: id)
+        #expect(try await store.loadBookmark(for: id) == data)
+
+        try await store.deleteBookmark(for: id)
+        #expect(try await store.loadBookmark(for: id) == nil)
+    }
+
+    #if os(macOS)
+    @Test(.tags(.securityScoped))
+    func `security-scoped filesystem supports url access reconfiguration and read-only mode`() async throws {
+        let firstRoot = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceSecurityScopedFirst")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(firstRoot) }
+
+        let secondRoot = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceSecurityScopedSecond")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(secondRoot) }
+
+        let filesystem = try SecurityScopedFilesystem(url: firstRoot, mode: .readWrite)
+
+        try await filesystem.writeFile(path: "/note.txt", data: WorkspaceFilesystemTestSupport.data("hello"), append: false)
+        try await filesystem.createDirectory(path: "/dir", recursive: true)
+        try await filesystem.copy(from: "/note.txt", to: "/copy.txt", recursive: false)
+        try await filesystem.move(from: "/copy.txt", to: "/moved.txt")
+        try await filesystem.createSymlink(path: "/link.txt", target: "note.txt")
+        try await filesystem.createHardLink(path: "/hard.txt", target: "/note.txt")
+        try await filesystem.setPermissions(path: "/note.txt", permissions: POSIXPermissions(0o600))
+
+        #expect(try await filesystem.readFile(path: "/note.txt") == WorkspaceFilesystemTestSupport.data("hello"))
+        #expect(try await filesystem.readSymlink(path: "/link.txt") == "note.txt")
+        #expect(try await filesystem.resolveRealPath(path: "/link.txt") == "/note.txt")
+        #expect(try await filesystem.stat(path: "/note.txt").permissions == POSIXPermissions(0o600))
+        #expect(await filesystem.exists(path: "/hard.txt"))
+        #expect((try await filesystem.listDirectory(path: "/")).map(\.name).sorted() == ["dir", "hard.txt", "link.txt", "moved.txt", "note.txt"])
+        #expect((try await filesystem.glob(pattern: "/*.txt", currentDirectory: "/")).contains("/moved.txt"))
+
+        try await filesystem.remove(path: "/moved.txt", recursive: false)
+        #expect(!(await filesystem.exists(path: "/moved.txt")))
+
+        try await filesystem.configure(rootDirectory: secondRoot)
+        #expect(!(await filesystem.exists(path: "/note.txt")))
+
+        try await filesystem.writeFile(path: "/fresh.txt", data: WorkspaceFilesystemTestSupport.data("fresh"), append: false)
+        #expect(FileManager.default.fileExists(atPath: secondRoot.appendingPathComponent("fresh.txt").path))
+
+        let readOnly = try SecurityScopedFilesystem(url: secondRoot, mode: .readOnly)
+        #expect(try await readOnly.readFile(path: "/fresh.txt") == WorkspaceFilesystemTestSupport.data("fresh"))
+
+        do {
+            try await readOnly.writeFile(path: "/blocked.txt", data: WorkspaceFilesystemTestSupport.data("x"), append: false)
+            Issue.record("expected read-only rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("read-only"))
+        }
+    }
+
+    @Test(.tags(.securityScoped, .bookmarks))
+    func `security-scoped filesystem reports missing stored bookmarks`() async throws {
+        let suiteName = WorkspaceFilesystemTestSupport.uniqueSuiteName()
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let store = UserDefaultsBookmarkStore(suiteName: suiteName, keyPrefix: "workspace.tests.")
+
+        do {
+            _ = try await SecurityScopedFilesystem.loadBookmark(id: "missing", store: store)
+            Issue.record("expected missing bookmark rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("bookmark not found"))
+        }
+    }
+
+    @Test(.tags(.securityScoped, .bookmarks))
+    func `security-scoped filesystem rejects invalid stored bookmark data`() async throws {
+        let suiteName = WorkspaceFilesystemTestSupport.uniqueSuiteName()
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let store = UserDefaultsBookmarkStore(suiteName: suiteName, keyPrefix: "workspace.tests.")
+        try await store.saveBookmark(WorkspaceFilesystemTestSupport.data("not-a-bookmark"), for: "invalid")
+
+        do {
+            _ = try await SecurityScopedFilesystem.loadBookmark(id: "invalid", store: store)
+            Issue.record("expected invalid bookmark rejection")
+        } catch let error as NSError {
+            #expect(error.domain == NSCocoaErrorDomain)
+        } catch {
+            Issue.record("expected Cocoa bookmark error")
+        }
+    }
+
+    @Test(.tags(.securityScoped, .bookmarks))
+    func `security-scoped filesystem bookmark creation either saves or reports Cocoa errors`() async throws {
+        let root = try WorkspaceFilesystemTestSupport.makeTempDirectory(prefix: "WorkspaceSecurityScopedBookmark")
+        defer { WorkspaceFilesystemTestSupport.removeDirectory(root) }
+
+        let suiteName = WorkspaceFilesystemTestSupport.uniqueSuiteName()
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let filesystem = try SecurityScopedFilesystem(url: root, mode: .readWrite)
+        let store = UserDefaultsBookmarkStore(suiteName: suiteName, keyPrefix: "workspace.tests.")
+
+        do {
+            let bookmarkData = try filesystem.makeBookmarkData()
+            #expect(!bookmarkData.isEmpty)
+
+            try await filesystem.saveBookmark(id: "demo", store: store)
+            #expect(try await store.loadBookmark(for: "demo") == bookmarkData)
+        } catch let error as NSError {
+            #expect(error.domain == NSCocoaErrorDomain)
+        }
+    }
+    #endif
 }
