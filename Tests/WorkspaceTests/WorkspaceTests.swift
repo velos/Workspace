@@ -217,6 +217,61 @@ private final class MinimalFilesystem: FileSystem, @unchecked Sendable {
     }
 }
 
+private actor ChangeEventRecorder {
+    private var events: [ChangeEvent] = []
+
+    func append(_ event: ChangeEvent) {
+        events.append(event)
+    }
+
+    func snapshot() -> [ChangeEvent] {
+        events
+    }
+}
+
+private enum ChangeWatchTestError: Error {
+    case timeout(expected: Int, actual: Int)
+}
+
+private func startRecording(
+    _ stream: AsyncStream<ChangeEvent>,
+    into recorder: ChangeEventRecorder
+) -> Task<Void, Never> {
+    Task {
+        for await event in stream {
+            await recorder.append(event)
+        }
+    }
+}
+
+private func waitForRecordedEvents(
+    _ expectedCount: Int,
+    recorder: ChangeEventRecorder,
+    timeout: Duration = .seconds(1)
+) async throws -> [ChangeEvent] {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+
+    while clock.now < deadline {
+        let snapshot = await recorder.snapshot()
+        if snapshot.count >= expectedCount {
+            return Array(snapshot.prefix(expectedCount))
+        }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+
+    let snapshot = await recorder.snapshot()
+    throw ChangeWatchTestError.timeout(expected: expectedCount, actual: snapshot.count)
+}
+
+private func waitForSettledEvents(
+    recorder: ChangeEventRecorder,
+    settling: Duration = .milliseconds(50)
+) async throws -> [ChangeEvent] {
+    try await Task.sleep(for: settling)
+    return await recorder.snapshot()
+}
+
 private struct DemoConfig: Codable, Equatable, Sendable {
     var name: String
     var enabled: Bool
@@ -232,6 +287,29 @@ private func addedLineTexts(_ diff: TextDiff?) -> [String] {
 
 private func removedLineTexts(_ diff: TextDiff?) -> [String] {
     diffLines(diff).filter { $0.kind == .removed }.map(\.text)
+}
+
+private func assertBasicWatchSemantics(
+    workspace: Workspace,
+    watchedPath: WorkspacePath
+) async throws {
+    let recorder = ChangeEventRecorder()
+    let stream = await workspace.watchChanges(at: watchedPath, recursive: false)
+    let task = startRecording(stream, into: recorder)
+    defer { task.cancel() }
+
+    try await workspace.writeFile(watchedPath, content: "one")
+    try await workspace.writeFile(watchedPath, content: "two")
+    try await workspace.removeItem(at: watchedPath)
+
+    let events = try await waitForRecordedEvents(3, recorder: recorder)
+    #expect(
+        events == [
+            ChangeEvent(kind: .created, path: watchedPath, nodeKind: .file),
+            ChangeEvent(kind: .modified, path: watchedPath, nodeKind: .file),
+            ChangeEvent(kind: .deleted, path: watchedPath, nodeKind: .file),
+        ]
+    )
 }
 
 @Suite("Workspace")
@@ -260,6 +338,328 @@ struct WorkspaceTests {
     }
 
     @Test
+    func `workspace supports binary data appends directory listings and globbing`() async throws {
+        let state = Workspace(filesystem: InMemoryFilesystem())
+
+        try await state.createDirectory(at: "/", recursive: false)
+        try await state.createDirectory(at: "/docs", recursive: false)
+        try await state.writeData(Data([0xDE, 0xAD, 0xBE, 0xEF]), to: "/docs/blob.bin")
+        try await state.writeFile("/docs/note.txt", content: "one")
+        try await state.appendFile("/docs/note.txt", content: " two")
+
+        #expect(try await state.readData(from: "/docs/blob.bin") == Data([0xDE, 0xAD, 0xBE, 0xEF]))
+        #expect(try await state.readFile("/docs/note.txt") == "one two")
+
+        let info = try await state.fileInfo(at: "/docs/note.txt")
+        #expect(info.kind == .file)
+        #expect(info.size == 7)
+
+        let entries = try await state.listDirectory(at: "/docs")
+        #expect(entries.map(\.name) == ["blob.bin", "note.txt"])
+
+        let globbed = try await state.glob("/docs/*", currentDirectory: "/")
+        #expect(globbed == ["/docs/blob.bin", "/docs/note.txt"])
+        #expect(await state.exists("/docs/blob.bin"))
+
+        do {
+            _ = try await state.readFile("/docs/blob.bin")
+            Issue.record("expected invalid UTF-8 error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("not valid UTF-8"))
+        }
+    }
+
+    @Test(.tags(.watching))
+    func `watchChanges emits create modify and delete for a file`() async throws {
+        let state = Workspace(filesystem: InMemoryFilesystem())
+        let recorder = ChangeEventRecorder()
+        let stream = await state.watchChanges(at: "/note.txt", recursive: false)
+        let task = startRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        try await state.writeFile("/note.txt", content: "one")
+        try await state.writeFile("/note.txt", content: "one")
+        try await state.writeFile("/note.txt", content: "two")
+        try await state.removeItem(at: "/note.txt")
+
+        let events = try await waitForRecordedEvents(3, recorder: recorder)
+        #expect(
+            events == [
+                ChangeEvent(kind: .created, path: "/note.txt", nodeKind: .file),
+                ChangeEvent(kind: .modified, path: "/note.txt", nodeKind: .file),
+                ChangeEvent(kind: .deleted, path: "/note.txt", nodeKind: .file),
+            ]
+        )
+    }
+
+    @Test(.tags(.watching))
+    func `watchChanges recursively emits directory file and symlink copy events`() async throws {
+        let fs = InMemoryFilesystem()
+        try await fs.createDirectory(path: "/docs/archive", recursive: true)
+        try await fs.writeFile(path: "/docs/archive/file.txt", data: Data("hello".utf8), append: false)
+        try await fs.createSymlink(path: "/docs/archive/link.txt", target: "file.txt")
+        let state = Workspace(filesystem: fs)
+
+        let recorder = ChangeEventRecorder()
+        let stream = await state.watchChanges(at: "/docs")
+        let task = startRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        try await state.copyItem(from: "/docs/archive", to: "/docs/copy")
+
+        let events = try await waitForRecordedEvents(3, recorder: recorder)
+        #expect(
+            events == [
+                ChangeEvent(
+                    kind: .copied,
+                    path: "/docs/copy",
+                    sourcePath: "/docs/archive",
+                    nodeKind: .directory
+                ),
+                ChangeEvent(
+                    kind: .copied,
+                    path: "/docs/copy/file.txt",
+                    sourcePath: "/docs/archive/file.txt",
+                    nodeKind: .file
+                ),
+                ChangeEvent(
+                    kind: .copied,
+                    path: "/docs/copy/link.txt",
+                    sourcePath: "/docs/archive/link.txt",
+                    nodeKind: .symlink
+                ),
+            ]
+        )
+    }
+
+    @Test(.tags(.watching))
+    func `watchChanges emits missing directory creation and symlink deletion events`() async throws {
+        let fs = InMemoryFilesystem()
+        try await fs.writeFile(path: "/target.txt", data: Data("hello".utf8), append: false)
+        try await fs.createSymlink(path: "/link.txt", target: "target.txt")
+        let state = Workspace(filesystem: fs)
+
+        let directoryRecorder = ChangeEventRecorder()
+        let symlinkRecorder = ChangeEventRecorder()
+        let directoryTask = startRecording(await state.watchChanges(at: "/folder", recursive: false), into: directoryRecorder)
+        let symlinkTask = startRecording(await state.watchChanges(at: "/link.txt", recursive: false), into: symlinkRecorder)
+        defer {
+            directoryTask.cancel()
+            symlinkTask.cancel()
+        }
+
+        try await state.createDirectory(at: "/folder", recursive: false)
+        try await state.createDirectory(at: "/folder", recursive: true)
+        try await state.removeItem(at: "/link.txt", recursive: false)
+
+        let directoryEvents = try await waitForRecordedEvents(1, recorder: directoryRecorder)
+        let symlinkEvents = try await waitForRecordedEvents(1, recorder: symlinkRecorder)
+        #expect(directoryEvents == [ChangeEvent(kind: .created, path: "/folder", nodeKind: .directory)])
+        #expect(symlinkEvents == [ChangeEvent(kind: .deleted, path: "/link.txt", nodeKind: .symlink)])
+
+        let settledDirectoryEvents = try await waitForSettledEvents(recorder: directoryRecorder)
+        #expect(settledDirectoryEvents == directoryEvents)
+    }
+
+    @Test(.tags(.watching))
+    func `watchChanges matches move events by source and destination paths`() async throws {
+        let fs = InMemoryFilesystem()
+        try await fs.createDirectory(path: "/docs", recursive: true)
+        try await fs.createDirectory(path: "/archive", recursive: true)
+        try await fs.writeFile(path: "/docs/file.txt", data: Data("hello".utf8), append: false)
+        let state = Workspace(filesystem: fs)
+
+        let docsRecorder = ChangeEventRecorder()
+        let archiveRecorder = ChangeEventRecorder()
+        let docsTask = startRecording(await state.watchChanges(at: "/docs"), into: docsRecorder)
+        let archiveTask = startRecording(await state.watchChanges(at: "/archive"), into: archiveRecorder)
+        defer {
+            docsTask.cancel()
+            archiveTask.cancel()
+        }
+
+        try await state.moveItem(from: "/docs/file.txt", to: "/archive/file.txt")
+
+        let expected = ChangeEvent(
+            kind: .moved,
+            path: "/archive/file.txt",
+            sourcePath: "/docs/file.txt",
+            nodeKind: .file
+        )
+        let docsEvents = try await waitForRecordedEvents(1, recorder: docsRecorder)
+        let archiveEvents = try await waitForRecordedEvents(1, recorder: archiveRecorder)
+        #expect(docsEvents == [expected])
+        #expect(archiveEvents == [expected])
+    }
+
+    @Test(.tags(.edits, .watching))
+    func `applyEdits rollback emits no watch events`() async throws {
+        let state = Workspace(
+            filesystem: FailOnceFilesystem(
+                base: InMemoryFilesystem(),
+                failingWritePaths: ["/b.txt"]
+            )
+        )
+        let recorder = ChangeEventRecorder()
+        let stream = await state.watchChanges(at: "/")
+        let task = startRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        let result = try await state.applyEdits(
+            [
+                .writeFile(path: "/a.txt", content: "one"),
+                .writeFile(path: "/b.txt", content: "two"),
+            ],
+            failurePolicy: .rollback
+        )
+
+        #expect(result.rolledBack)
+        let events = try await waitForSettledEvents(recorder: recorder)
+        #expect(events.isEmpty)
+    }
+
+    @Test(.tags(.edits, .watching))
+    func `applyEdits fail-fast emits only persisted watch events`() async throws {
+        let state = Workspace(
+            filesystem: FailOnceFilesystem(
+                base: InMemoryFilesystem(),
+                failingWritePaths: ["/b.txt"]
+            )
+        )
+        let recorder = ChangeEventRecorder()
+        let stream = await state.watchChanges(at: "/")
+        let task = startRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        let result = try await state.applyEdits(
+            [
+                .writeFile(path: "/a.txt", content: "one"),
+                .writeFile(path: "/b.txt", content: "two"),
+                .writeFile(path: "/c.txt", content: "three"),
+            ],
+            failurePolicy: .failFast
+        )
+
+        #expect(!result.rolledBack)
+        let events = try await waitForRecordedEvents(1, recorder: recorder)
+        #expect(events == [ChangeEvent(kind: .created, path: "/a.txt", nodeKind: .file)])
+        let settled = try await waitForSettledEvents(recorder: recorder)
+        #expect(settled == events)
+    }
+
+    @Test(.tags(.edits, .watching))
+    func `applyEdits best-effort emits only applied watch events`() async throws {
+        let state = Workspace(
+            filesystem: FailOnceFilesystem(
+                base: InMemoryFilesystem(),
+                failingWritePaths: ["/b.txt"]
+            )
+        )
+        let recorder = ChangeEventRecorder()
+        let stream = await state.watchChanges(at: "/")
+        let task = startRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        let result = try await state.applyEdits(
+            [
+                .writeFile(path: "/a.txt", content: "one"),
+                .writeFile(path: "/b.txt", content: "two"),
+                .writeFile(path: "/c.txt", content: "three"),
+            ],
+            failurePolicy: .bestEffort
+        )
+
+        #expect(!result.rolledBack)
+        let events = try await waitForRecordedEvents(2, recorder: recorder)
+        #expect(
+            events == [
+                ChangeEvent(kind: .created, path: "/a.txt", nodeKind: .file),
+                ChangeEvent(kind: .created, path: "/c.txt", nodeKind: .file),
+            ]
+        )
+    }
+
+    @Test(.tags(.replacement, .watching))
+    func `applyReplacement emits only persisted watch events`() async throws {
+        let base = InMemoryFilesystem()
+        try await base.createDirectory(path: "/src", recursive: true)
+        try await base.writeFile(path: "/src/a.txt", data: Data("foo".utf8), append: false)
+        try await base.writeFile(path: "/src/b.txt", data: Data("foo".utf8), append: false)
+        let state = Workspace(
+            filesystem: FailOnceFilesystem(
+                base: base,
+                failingWritePaths: ["/src/b.txt"]
+            )
+        )
+        let recorder = ChangeEventRecorder()
+        let stream = await state.watchChanges(at: "/src")
+        let task = startRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        let result = try await state.applyReplacement(
+            ReplacementRequest(pattern: "/src/*.txt", search: "foo", replacement: "bar"),
+            failurePolicy: .bestEffort
+        )
+
+        #expect(!result.rolledBack)
+        let events = try await waitForRecordedEvents(1, recorder: recorder)
+        #expect(events == [ChangeEvent(kind: .modified, path: "/src/a.txt", nodeKind: .file)])
+        let settled = try await waitForSettledEvents(recorder: recorder)
+        #expect(settled == events)
+    }
+
+    @Test(.tags(.watching))
+    func `watchChanges behaves consistently for in-memory overlay and mounted workspaces`() async throws {
+        try await assertBasicWatchSemantics(
+            workspace: Workspace(filesystem: InMemoryFilesystem()),
+            watchedPath: "/note.txt"
+        )
+
+        let overlayRoot = try WorkspaceTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayWatch")
+        defer { WorkspaceTestSupport.removeDirectory(overlayRoot) }
+        let overlayWorkspace = Workspace(filesystem: try await OverlayFilesystem(rootDirectory: overlayRoot))
+        try await assertBasicWatchSemantics(
+            workspace: overlayWorkspace,
+            watchedPath: "/overlay.txt"
+        )
+
+        let mountedWorkspace = Workspace(
+            filesystem: MountableFilesystem(
+                base: InMemoryFilesystem(),
+                mounts: [
+                    .init(mountPoint: "/mounted", filesystem: InMemoryFilesystem()),
+                ]
+            )
+        )
+        try await assertBasicWatchSemantics(
+            workspace: mountedWorkspace,
+            watchedPath: "/mounted/note.txt"
+        )
+    }
+
+    @Test(.tags(.watching))
+    func `watchChanges unregisters cancelled streams`() async throws {
+        let state = Workspace(filesystem: InMemoryFilesystem())
+        let recorder = ChangeEventRecorder()
+
+        do {
+            let stream = await state.watchChanges(at: "/note.txt", recursive: false)
+            let task = startRecording(stream, into: recorder)
+
+            try await state.writeFile("/note.txt", content: "one")
+            _ = try await waitForRecordedEvents(1, recorder: recorder)
+
+            task.cancel()
+        }
+
+        try await Task.sleep(for: .milliseconds(50))
+        try await state.writeFile("/note.txt", content: "two")
+
+        let settled = try await waitForSettledEvents(recorder: recorder)
+        #expect(settled == [ChangeEvent(kind: .created, path: "/note.txt", nodeKind: .file)])
+    }
+
+    @Test
     func `nested Codable mutation metadata roundtrips`() throws {
         let original = MutationMode.execution
         let data = try JSONEncoder().encode(original)
@@ -267,7 +667,7 @@ struct WorkspaceTests {
         #expect(decoded == original)
     }
 
-    @Test
+    @Test(.tags(.replacement))
     func `replacement request and result roundtrip through Codable`() throws {
         let request = ReplacementRequest(
             scope: "/Sources",
@@ -335,6 +735,13 @@ struct WorkspaceTests {
         try await filesystem.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
 
         do {
+            try await filesystem.configure(rootDirectory: URL(fileURLWithPath: "/ignored"))
+            Issue.record("expected default configure error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("not configured"))
+        }
+
+        do {
             try await filesystem.createSymlink(path: "/alias.txt", target: "note.txt")
             Issue.record("expected unsupported createSymlink error")
         } catch let error as WorkspaceError {
@@ -384,7 +791,7 @@ struct WorkspaceTests {
         }
     }
 
-    @Test
+    @Test(.tags(.tree))
     func `walkTree and summarizeTree preserve stable ordering`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/src", recursive: true)
@@ -402,7 +809,7 @@ struct WorkspaceTests {
         #expect(summary.directoryCount == 2)
     }
 
-    @Test
+    @Test(.tags(.tree))
     func `walkTree and summarizeTree report symlink kinds`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
@@ -419,7 +826,7 @@ struct WorkspaceTests {
         #expect(summary.symlinkCount == 1)
     }
 
-    @Test
+    @Test(.tags(.replacement))
     func `previewReplacement previews without mutating files`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/src", recursive: true)
@@ -438,7 +845,7 @@ struct WorkspaceTests {
         #expect(try await state.readFile("/src/a.txt") == "foo")
     }
 
-    @Test
+    @Test(.tags(.replacement))
     func `applyReplacement rolls back on write failure`() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/src", recursive: true)
@@ -461,7 +868,7 @@ struct WorkspaceTests {
         #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
     }
 
-    @Test
+    @Test(.tags(.replacement))
     func `applyReplacement best effort reports failures without rollback`() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/src", recursive: true)
@@ -485,7 +892,7 @@ struct WorkspaceTests {
         #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
     }
 
-    @Test
+    @Test(.tags(.replacement))
     func `applyReplacement fail-fast stops after the first failure`() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/src", recursive: true)
@@ -512,7 +919,7 @@ struct WorkspaceTests {
         #expect(try await base.readFile(path: "/src/c.txt") == Data("foo".utf8))
     }
 
-    @Test
+    @Test(.tags(.replacement))
     func `applyReplacement returns an empty execution result when nothing matches`() async throws {
         let state = Workspace(filesystem: InMemoryFilesystem())
 
@@ -527,7 +934,7 @@ struct WorkspaceTests {
         #expect(!result.rolledBack)
     }
 
-    @Test
+    @Test(.tags(.replacement))
     func `previewReplacement respects scope excludes and case-insensitive matching`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/src/dir", recursive: true)
@@ -552,7 +959,7 @@ struct WorkspaceTests {
         #expect(addedLineTexts(result.changes.first?.diff) == ["bar"])
     }
 
-    @Test
+    @Test(.tags(.replacement))
     func `previewReplacement rejects invalid UTF-8 and empty search patterns`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.writeFile(path: "/binary.bin", data: Data([0xFF]), append: false)
@@ -599,7 +1006,7 @@ struct WorkspaceTests {
         }
     }
 
-    @Test
+    @Test(.tags(.edits))
     func `applyEdits succeeds across multiple files`() async throws {
         let fs = InMemoryFilesystem()
         let state = Workspace(filesystem: fs)
@@ -624,7 +1031,7 @@ struct WorkspaceTests {
         #expect(try await state.readFile("/src/c.txt") == "one two")
     }
 
-    @Test
+    @Test(.tags(.edits))
     func `applyEdits rolls back on failure`() async throws {
         let base = InMemoryFilesystem()
         try await base.writeFile(path: "/a.txt", data: Data("old".utf8), append: false)
@@ -647,7 +1054,7 @@ struct WorkspaceTests {
         #expect(!bExists)
     }
 
-    @Test
+    @Test(.tags(.edits))
     func `previewEdits reports change states and delete diffs`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/dir", recursive: true)
@@ -674,7 +1081,7 @@ struct WorkspaceTests {
         #expect(result.edits[2].fileChanges.isEmpty)
     }
 
-    @Test
+    @Test(.tags(.edits))
     func `applyEdits fail-fast keeps prior changes and reports non-workspace errors`() async throws {
         let base = InMemoryFilesystem()
         try await base.writeFile(path: "/old.txt", data: Data("gone".utf8), append: false)
@@ -698,7 +1105,7 @@ struct WorkspaceTests {
         #expect(!(await base.exists(path: "/after.txt")))
     }
 
-    @Test
+    @Test(.tags(.edits))
     func `applyEdits returns an empty execution result when given no edits`() async throws {
         let state = Workspace(filesystem: InMemoryFilesystem())
         let result = try await state.applyEdits([])
@@ -710,7 +1117,7 @@ struct WorkspaceTests {
         #expect(!result.rolledBack)
     }
 
-    @Test
+    @Test(.tags(.edits))
     func `previewEdits plans sequential text diffs across earlier edits`() async throws {
         let state = Workspace(filesystem: InMemoryFilesystem())
 
@@ -725,7 +1132,7 @@ struct WorkspaceTests {
         #expect(addedLineTexts(result.edits[1].fileChanges.first?.diff) == ["one two"])
     }
 
-    @Test
+    @Test(.tags(.edits))
     func `previewEdits expands recursive file changes and omits binary diffs`() async throws {
         let fs = InMemoryFilesystem()
         try await fs.createDirectory(path: "/src/nested", recursive: true)
@@ -746,6 +1153,19 @@ struct WorkspaceTests {
         #expect(deletePreview.edits[0].fileChanges.map(\.path) == ["/src/a.txt", "/src/nested/b.bin"])
         #expect(deletePreview.edits[0].fileChanges.first?.diff != nil)
         #expect(deletePreview.edits[0].fileChanges.last?.diff == nil)
+    }
+
+    @Test(.tags(.edits))
+    func `previewEdits preserves trailing newline metadata in diffs`() async throws {
+        let state = Workspace(filesystem: InMemoryFilesystem())
+
+        let result = try await state.previewEdits([
+            .writeFile(path: "/multi.txt", content: "a\nb\n"),
+        ])
+
+        let lines = diffLines(result.edits[0].fileChanges.first?.diff)
+        #expect(lines.map(\.text) == ["a", "b"])
+        #expect(lines.allSatisfy { $0.hasTrailingNewline })
     }
 
     @Test
@@ -774,7 +1194,7 @@ struct WorkspaceTests {
         #expect(fileInfo.path == "/file.txt")
     }
 
-    @Test
+    @Test(.tags(.edits))
     func `applyEdits works with overlay and mountable filesystems`() async throws {
         let workspaceRoot = try WorkspaceTestSupport.makeTempDirectory(prefix: "WorkspaceMountRoot")
         defer { WorkspaceTestSupport.removeDirectory(workspaceRoot) }

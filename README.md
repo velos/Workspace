@@ -27,6 +27,7 @@ Many agent and tooling flows need more than plain disk I/O:
 ## What It Provides
 
 - `Workspace`: high-level actor API for common file operations and batch edits
+- `ChangeEvent`: structured change notifications emitted by `Workspace.watchChanges(at:recursive:)`
 - `FileSystem`: low-level protocol for custom filesystem backends (see also `ReadableFileSystem` / `WritableFileSystem`)
 - `ReadWriteFilesystem`: real disk access rooted to a configured directory
 - `InMemoryFilesystem`: fully in-memory filesystem for isolated sessions and tests
@@ -96,6 +97,23 @@ try await workspace.writeJSON(Config(name: "demo", enabled: true), to: "/config.
 
 let config = try await workspace.readJSON(Config.self, from: "/config.json")
 print(config.enabled) // true
+```
+
+### Change Watching
+
+```swift
+import Workspace
+
+let workspace = Workspace(filesystem: InMemoryFilesystem())
+let changes = await workspace.watchChanges(at: "/notes")
+
+Task {
+    for await change in changes {
+        print(change.kind, change.path)
+    }
+}
+
+try await workspace.writeFile("/notes/todo.txt", content: "ship it")
 ```
 
 ## Common Patterns

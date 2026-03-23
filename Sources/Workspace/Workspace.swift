@@ -3,6 +3,13 @@ import Foundation
 /// A high-level API for reading, editing, and summarizing a workspace.
 public actor Workspace {
     private let filesystem: any FileSystem
+    private var watchers: [UUID: WatchedChangeStream] = [:]
+
+    private struct WatchedChangeStream {
+        var path: WorkspacePath
+        var recursive: Bool
+        var continuation: AsyncStream<ChangeEvent>.Continuation
+    }
 
     /// Creates a workspace backed by `filesystem`.
     public init(filesystem: any FileSystem) {
@@ -16,7 +23,9 @@ public actor Workspace {
 
     /// Writes raw file data to the workspace, replacing any existing contents.
     public func writeData(_ data: Data, to path: WorkspacePath) async throws {
+        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
         try await filesystem.writeFile(path: path, data: data, append: false)
+        emit(events)
     }
 
     /// Reads a UTF-8 file from the workspace.
@@ -30,12 +39,18 @@ public actor Workspace {
 
     /// Writes UTF-8 text to a file, replacing any existing contents.
     public func writeFile(_ path: WorkspacePath, content: String) async throws {
-        try await filesystem.writeFile(path: path, data: Data(content.utf8), append: false)
+        let data = Data(content.utf8)
+        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
+        try await filesystem.writeFile(path: path, data: data, append: false)
+        emit(events)
     }
 
     /// Appends UTF-8 text to a file.
     public func appendFile(_ path: WorkspacePath, content: String) async throws {
-        try await filesystem.writeFile(path: path, data: Data(content.utf8), append: true)
+        let data = Data(content.utf8)
+        let events = try await plannedWriteEvents(path: path, data: data, append: true, on: filesystem)
+        try await filesystem.writeFile(path: path, data: data, append: true)
+        emit(events)
     }
 
     /// Reads and decodes JSON from a UTF-8 file.
@@ -56,7 +71,34 @@ public actor Workspace {
         }
         var data = try encoder.encode(value)
         data.append(Data("\n".utf8))
+        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
         try await filesystem.writeFile(path: path, data: data, append: false)
+        emit(events)
+    }
+
+    /// Watches for future changes affecting `path`.
+    public func watchChanges(at path: WorkspacePath, recursive: Bool = true) -> AsyncStream<ChangeEvent> {
+        let id = UUID()
+        var continuation: AsyncStream<ChangeEvent>.Continuation?
+        let stream = AsyncStream<ChangeEvent> {
+            continuation = $0
+        }
+
+        guard let continuation else {
+            return stream
+        }
+
+        watchers[id] = WatchedChangeStream(
+            path: path,
+            recursive: recursive,
+            continuation: continuation
+        )
+        continuation.onTermination = { [weak self] _ in
+            Task {
+                await self?.removeWatcher(id: id)
+            }
+        }
+        return stream
     }
 
     /// Returns whether an entry exists at `path`.
@@ -84,31 +126,49 @@ public actor Workspace {
 
     /// Creates a directory at `path`.
     public func createDirectory(at path: WorkspacePath, recursive: Bool = true) async throws {
+        let events = try await plannedDirectoryCreationEvents(path: path, recursive: recursive, on: filesystem)
         try await filesystem.createDirectory(path: path, recursive: recursive)
+        emit(events)
     }
 
     /// Removes the entry at `path`.
     public func removeItem(at path: WorkspacePath, recursive: Bool = true) async throws {
+        let events = try await plannedDeletionEvents(at: path, on: filesystem)
         try await filesystem.remove(path: path, recursive: recursive)
+        emit(events)
     }
 
     /// Copies an entry from `source` to `destination`.
     public func copyItem(from source: WorkspacePath, to destination: WorkspacePath, recursive: Bool = true)
         async throws
     {
+        let events = try await plannedTransferEvents(
+            from: source,
+            to: destination,
+            kind: .copied,
+            on: filesystem
+        )
         try await filesystem.copy(
             from: source,
             to: destination,
             recursive: recursive
         )
+        emit(events)
     }
 
     /// Moves or renames an entry from `source` to `destination`.
     public func moveItem(from source: WorkspacePath, to destination: WorkspacePath) async throws {
+        let events = try await plannedTransferEvents(
+            from: source,
+            to: destination,
+            kind: .moved,
+            on: filesystem
+        )
         try await filesystem.move(
             from: source,
             to: destination
         )
+        emit(events)
     }
 
     /// Builds a recursive tree representation for the entry at `path`.
@@ -124,11 +184,13 @@ public actor Workspace {
     private struct PlannedReplacement {
         var change: ReplacementResult.Change
         var updatedContent: String
+        var nodeKind: FileTree.Kind
     }
 
     private struct PlannedBatchEdit {
         var edit: FileEdit
         var entry: FileEdit.Entry
+        var changeEvents: [ChangeEvent]
     }
 
     private struct DiffToken: Hashable {
@@ -159,6 +221,7 @@ public actor Workspace {
         let plannedChanges = try await plannedReplacementChanges(for: request)
         var changes = plannedChanges.map(\.change)
         let touchedPaths = canonicalizedTouchedPaths(for: changes)
+        var bufferedEvents: [ChangeEvent] = []
 
         guard !changes.isEmpty else {
             return ReplacementResult(
@@ -178,6 +241,7 @@ public actor Workspace {
                 try await write(change: plannedChange, to: filesystem)
                 changes[index].status = .applied
                 appliedIndices.append(index)
+                bufferedEvents += changeEvents(for: plannedChange)
             } catch {
                 changes[index].status = .failed
                 let failure = ReplacementResult.Failure(path: plannedChange.change.path, message: describe(error))
@@ -203,6 +267,7 @@ public actor Workspace {
                     for skippedIndex in changes.indices where skippedIndex > index {
                         changes[skippedIndex].status = .skipped
                     }
+                    emit(bufferedEvents)
                     return ReplacementResult(
                         mode: .execution,
                         touchedPaths: touchedPaths,
@@ -214,6 +279,7 @@ public actor Workspace {
             }
         }
 
+        emit(bufferedEvents)
         return ReplacementResult(
             mode: .execution,
             touchedPaths: touchedPaths,
@@ -246,6 +312,7 @@ public actor Workspace {
         let touchedPaths = canonicalizedTouchedPaths(for: edits)
         let plannedEdits = try await planBatchEdits(edits)
         var executionEntries = plannedEdits.map(\.entry)
+        var bufferedEvents: [ChangeEvent] = []
 
         guard !plannedEdits.isEmpty else {
             return FileEdit.BatchResult(
@@ -265,6 +332,7 @@ public actor Workspace {
                 try await apply(plannedEdit.edit, on: filesystem)
                 setStatus(.applied, for: &executionEntries[index])
                 appliedIndices.append(index)
+                bufferedEvents += plannedEdit.changeEvents
             } catch {
                 setStatus(.failed, for: &executionEntries[index])
                 let failure = FileEdit.Failure(
@@ -294,6 +362,7 @@ public actor Workspace {
                     for skippedIndex in executionEntries.indices where skippedIndex > index {
                         setStatus(.skipped, for: &executionEntries[skippedIndex])
                     }
+                    emit(bufferedEvents)
                     return FileEdit.BatchResult(
                         mode: .execution,
                         touchedPaths: touchedPaths,
@@ -305,6 +374,7 @@ public actor Workspace {
             }
         }
 
+        emit(bufferedEvents)
         return FileEdit.BatchResult(
             mode: .execution,
             touchedPaths: touchedPaths,
@@ -433,8 +503,49 @@ public actor Workspace {
         }
     }
 
-    private func statIfPresent(_ path: WorkspacePath) async throws -> FileInfo? {
-        try await statIfPresent(path, on: filesystem)
+    private func removeWatcher(id: UUID) {
+        watchers.removeValue(forKey: id)
+    }
+
+    private func emit(_ events: [ChangeEvent]) {
+        guard !events.isEmpty, !watchers.isEmpty else {
+            return
+        }
+
+        let activeWatchers = Array(watchers.values)
+        for event in events {
+            for watcher in activeWatchers where shouldDeliver(event, to: watcher) {
+                watcher.continuation.yield(event)
+            }
+        }
+    }
+
+    private func shouldDeliver(_ event: ChangeEvent, to watcher: WatchedChangeStream) -> Bool {
+        watchedPathMatches(event.path, watchedPath: watcher.path, recursive: watcher.recursive)
+            || watchedPathMatches(event.sourcePath, watchedPath: watcher.path, recursive: watcher.recursive)
+    }
+
+    private func watchedPathMatches(
+        _ candidate: WorkspacePath?,
+        watchedPath: WorkspacePath,
+        recursive: Bool
+    ) -> Bool {
+        guard let candidate else {
+            return false
+        }
+
+        if recursive {
+            return isEqualOrDescendant(candidate, of: watchedPath)
+        }
+
+        return candidate == watchedPath
+    }
+
+    private func isEqualOrDescendant(_ candidate: WorkspacePath, of ancestor: WorkspacePath) -> Bool {
+        if ancestor.isRoot {
+            return true
+        }
+        return candidate == ancestor || candidate.string.hasPrefix(ancestor.string + "/")
     }
 
     private func statIfPresent(_ path: WorkspacePath, on target: any FileSystem) async throws -> FileInfo? {
@@ -449,6 +560,7 @@ public actor Workspace {
         var changes: [PlannedReplacement] = []
 
         for path in paths {
+            let info = try await filesystem.stat(path: path)
             guard let originalContent = try await readUTF8IfPresent(path, on: filesystem) else {
                 continue
             }
@@ -469,7 +581,8 @@ public actor Workspace {
                         replacements: replacement.count,
                         diff: textDiff(from: originalContent, to: replacement.updatedContent)
                     ),
-                    updatedContent: replacement.updatedContent
+                    updatedContent: replacement.updatedContent,
+                    nodeKind: info.kind
                 )
             )
         }
@@ -553,7 +666,8 @@ public actor Workspace {
 
         for edit in edits {
             let entry = try await planEntry(for: edit, on: planningFilesystem)
-            plannedEdits.append(PlannedBatchEdit(edit: edit, entry: entry))
+            let changeEvents = try await plannedChangeEvents(for: edit, on: planningFilesystem)
+            plannedEdits.append(PlannedBatchEdit(edit: edit, entry: entry, changeEvents: changeEvents))
             try? await apply(edit, on: planningFilesystem)
         }
 
@@ -562,11 +676,27 @@ public actor Workspace {
 
     private func makePlanningFilesystem(for paths: [WorkspacePath]) async throws -> InMemoryFilesystem {
         let planningFilesystem = InMemoryFilesystem()
+        let ancestors = Set(paths.flatMap(ancestorPaths(for:))).sorted()
+        for ancestor in ancestors {
+            let snapshot = try await shallowSnapshot(path: ancestor, on: filesystem)
+            try await restore(snapshot, on: planningFilesystem)
+        }
+
         let snapshots = try await snapshotPaths(paths)
         for snapshot in snapshots {
             try await restore(snapshot, on: planningFilesystem)
         }
         return planningFilesystem
+    }
+
+    private func ancestorPaths(for path: WorkspacePath) -> [WorkspacePath] {
+        var ancestors: [WorkspacePath] = []
+        var current = path.dirname
+        while !current.isRoot {
+            ancestors.append(current)
+            current = current.dirname
+        }
+        return ancestors.reversed()
     }
 
     private func planEntry(
@@ -741,6 +871,235 @@ public actor Workspace {
                 effect: effect
             )
         ]
+    }
+
+    private func plannedChangeEvents(
+        for edit: FileEdit,
+        on target: any FileSystem
+    ) async throws -> [ChangeEvent] {
+        switch edit {
+        case let .writeFile(path, content):
+            return try await plannedWriteEvents(
+                path: path,
+                data: Data(content.utf8),
+                append: false,
+                on: target
+            )
+        case let .appendFile(path, content):
+            return try await plannedWriteEvents(
+                path: path,
+                data: Data(content.utf8),
+                append: true,
+                on: target
+            )
+        case let .delete(path, _):
+            return try await plannedDeletionEvents(at: path, on: target)
+        case let .createDirectory(path, recursive):
+            return try await plannedDirectoryCreationEvents(path: path, recursive: recursive, on: target)
+        case let .move(from, to):
+            return try await plannedTransferEvents(from: from, to: to, kind: .moved, on: target)
+        case let .copy(from, to, _):
+            return try await plannedTransferEvents(from: from, to: to, kind: .copied, on: target)
+        }
+    }
+
+    private func plannedWriteEvents(
+        path: WorkspacePath,
+        data: Data,
+        append: Bool,
+        on target: any FileSystem
+    ) async throws -> [ChangeEvent] {
+        guard let info = try await statIfPresent(path, on: target) else {
+            return [
+                ChangeEvent(
+                    kind: .created,
+                    path: path,
+                    nodeKind: .file
+                ),
+            ]
+        }
+
+        guard info.kind != .directory else {
+            return []
+        }
+
+        let existingData = try await target.readFile(path: path)
+        let updatedData = append ? existingData + data : data
+        guard existingData != updatedData else {
+            return []
+        }
+
+        return [
+            ChangeEvent(
+                kind: .modified,
+                path: path,
+                nodeKind: info.kind
+            ),
+        ]
+    }
+
+    private func plannedDirectoryCreationEvents(
+        path: WorkspacePath,
+        recursive: Bool,
+        on target: any FileSystem
+    ) async throws -> [ChangeEvent] {
+        guard !path.isRoot else {
+            return []
+        }
+
+        if recursive {
+            var events: [ChangeEvent] = []
+            var current = WorkspacePath.root
+            for component in path.components {
+                current = current.appending(component)
+                if try await statIfPresent(current, on: target) == nil {
+                    events.append(
+                        ChangeEvent(
+                            kind: .created,
+                            path: current,
+                            nodeKind: .directory
+                        )
+                    )
+                }
+            }
+            return events
+        }
+
+        guard try await statIfPresent(path, on: target) == nil else {
+            return []
+        }
+
+        return [
+            ChangeEvent(
+                kind: .created,
+                path: path,
+                nodeKind: .directory
+            ),
+        ]
+    }
+
+    private func plannedDeletionEvents(
+        at path: WorkspacePath,
+        on target: any FileSystem
+    ) async throws -> [ChangeEvent] {
+        let snapshot = try await snapshot(path: path, on: target)
+        return flattenDeletionEvents(from: snapshot)
+    }
+
+    private func plannedTransferEvents(
+        from sourcePath: WorkspacePath,
+        to destinationPath: WorkspacePath,
+        kind: ChangeEvent.Kind,
+        on target: any FileSystem
+    ) async throws -> [ChangeEvent] {
+        let snapshot = try await snapshot(path: sourcePath, on: target)
+        return flattenTransferEvents(
+            from: snapshot,
+            sourceRoot: sourcePath,
+            destinationRoot: destinationPath,
+            kind: kind
+        )
+    }
+
+    private func changeEvents(for replacement: PlannedReplacement) -> [ChangeEvent] {
+        guard !replacement.change.diff.hunks.isEmpty else {
+            return []
+        }
+
+        return [
+            ChangeEvent(
+                kind: .modified,
+                path: replacement.change.path,
+                nodeKind: replacement.nodeKind
+            ),
+        ]
+    }
+
+    private func flattenDeletionEvents(from snapshot: SnapshotEntry) -> [ChangeEvent] {
+        switch snapshot {
+        case .missing:
+            return []
+        case let .file(path, _, _):
+            return [ChangeEvent(kind: .deleted, path: path, nodeKind: .file)]
+        case let .symlink(path, _, _):
+            return [ChangeEvent(kind: .deleted, path: path, nodeKind: .symlink)]
+        case let .directory(path, _, children):
+            var events: [ChangeEvent] = []
+            for child in children {
+                events += flattenDeletionEvents(from: child)
+            }
+            events.append(
+                ChangeEvent(
+                    kind: .deleted,
+                    path: path,
+                    nodeKind: .directory
+                )
+            )
+            return events
+        }
+    }
+
+    private func flattenTransferEvents(
+        from snapshot: SnapshotEntry,
+        sourceRoot: WorkspacePath,
+        destinationRoot: WorkspacePath,
+        kind: ChangeEvent.Kind
+    ) -> [ChangeEvent] {
+        switch snapshot {
+        case .missing:
+            return []
+        case let .file(path, _, _):
+            return [
+                ChangeEvent(
+                    kind: kind,
+                    path: remappedPath(path, from: sourceRoot, to: destinationRoot),
+                    sourcePath: path,
+                    nodeKind: .file
+                ),
+            ]
+        case let .symlink(path, _, _):
+            return [
+                ChangeEvent(
+                    kind: kind,
+                    path: remappedPath(path, from: sourceRoot, to: destinationRoot),
+                    sourcePath: path,
+                    nodeKind: .symlink
+                ),
+            ]
+        case let .directory(path, _, children):
+            var events: [ChangeEvent] = [
+                ChangeEvent(
+                    kind: kind,
+                    path: remappedPath(path, from: sourceRoot, to: destinationRoot),
+                    sourcePath: path,
+                    nodeKind: .directory
+                ),
+            ]
+            for child in children {
+                events += flattenTransferEvents(
+                    from: child,
+                    sourceRoot: sourceRoot,
+                    destinationRoot: destinationRoot,
+                    kind: kind
+                )
+            }
+            return events
+        }
+    }
+
+    private func remappedPath(
+        _ path: WorkspacePath,
+        from sourceRoot: WorkspacePath,
+        to destinationRoot: WorkspacePath
+    ) -> WorkspacePath {
+        guard path != sourceRoot else {
+            return destinationRoot
+        }
+
+        let suffix = path.components.dropFirst(sourceRoot.components.count)
+        return suffix.reduce(destinationRoot) { partialResult, component in
+            partialResult.appending(component)
+        }
     }
 
     private func write(change: PlannedReplacement, to target: any FileSystem) async throws {
@@ -923,35 +1282,59 @@ public actor Workspace {
     }
 
     private func snapshotPaths(_ paths: [WorkspacePath]) async throws -> [SnapshotEntry] {
-        try await paths.asyncMap { [self] path in
-            try await self.snapshot(path: path)
+        try await snapshotPaths(paths, on: filesystem)
+    }
+
+    private func snapshotPaths(
+        _ paths: [WorkspacePath],
+        on target: any FileSystem
+    ) async throws -> [SnapshotEntry] {
+        try await paths.asyncMap { path in
+            try await self.snapshot(path: path, on: target)
         }
     }
 
-    private func snapshot(path: WorkspacePath) async throws -> SnapshotEntry {
-        guard await filesystem.exists(path: path) else {
+    private func shallowSnapshot(path: WorkspacePath, on target: any FileSystem) async throws -> SnapshotEntry {
+        guard await target.exists(path: path) else {
             return .missing(path: path)
         }
 
-        let info = try await filesystem.stat(path: path)
+        let info = try await target.stat(path: path)
+        switch info.kind {
+        case .directory:
+            return .directory(path: path, permissions: info.permissions, children: [])
+        case .symlink:
+            let symlinkTarget = try await target.readSymlink(path: path)
+            return .symlink(path: path, target: symlinkTarget, permissions: info.permissions)
+        case .file:
+            return .file(path: path, data: Data(), permissions: info.permissions)
+        }
+    }
+
+    private func snapshot(path: WorkspacePath, on target: any FileSystem) async throws -> SnapshotEntry {
+        guard await target.exists(path: path) else {
+            return .missing(path: path)
+        }
+
+        let info = try await target.stat(path: path)
         if info.kind == .directory {
-            let entries = try await filesystem.listDirectory(path: path)
+            let entries = try await target.listDirectory(path: path)
             let children = try await entries
                 .sorted { $0.name < $1.name }
                 .asyncMap { [self] entry in
-                    try await self.snapshot(path: path.appending(entry.name))
+                    try await self.snapshot(path: path.appending(entry.name), on: target)
                 }
             return .directory(path: path, permissions: info.permissions, children: children)
         }
 
         if info.kind == .symlink {
-            let target = try await filesystem.readSymlink(path: path)
-            return .symlink(path: path, target: target, permissions: info.permissions)
+            let symlinkTarget = try await target.readSymlink(path: path)
+            return .symlink(path: path, target: symlinkTarget, permissions: info.permissions)
         }
 
         return .file(
             path: path,
-            data: try await filesystem.readFile(path: path),
+            data: try await target.readFile(path: path),
             permissions: info.permissions
         )
     }

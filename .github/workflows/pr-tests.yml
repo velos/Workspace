@@ -1,0 +1,101 @@
+name: PR Tests
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  swift-tests:
+    name: Swift Tests
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v3
+        with:
+          swift-version: "6.2"
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Run test suite
+        shell: bash
+        run: |
+          mkdir -p .build/test-results
+          swift test \
+            --disable-xctest \
+            --enable-swift-testing \
+            --enable-code-coverage \
+            --xunit-output .build/test-results/xunit.xml
+
+      - name: Publish test report
+        if: ${{ !cancelled() }}
+        uses: dorny/test-reporter@v3
+        with:
+          name: Swift Test Report
+          path: .build/test-results/xunit.xml
+          reporter: swift-xunit
+          fail-on-error: false
+          use-actions-summary: true
+          badge-title: swift tests
+          list-suites: failed
+          list-tests: failed
+
+      - name: Publish coverage summary
+        if: always()
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+
+          summary_path = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          coverage_files = sorted(pathlib.Path(".build").glob("**/debug/codecov/*.json"))
+
+          if not coverage_files:
+              with summary_path.open("a", encoding="utf-8") as handle:
+                  handle.write("\n## Coverage\n\n- No coverage report was generated.\n")
+              raise SystemExit(0)
+
+          coverage = json.loads(coverage_files[0].read_text(encoding="utf-8"))
+          totals = coverage.get("data", [{}])[0].get("totals", {}).get("lines", {})
+          count = totals.get("count")
+          covered = totals.get("covered")
+          percent = totals.get("percent")
+
+          with summary_path.open("a", encoding="utf-8") as handle:
+              handle.write("\n## Coverage\n\n")
+              if count is None or covered is None or percent is None:
+                  handle.write("- Coverage totals were unavailable.\n")
+              else:
+                  handle.write(f"- Lines: {percent:.2f}% ({covered}/{count})\n")
+          PY
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pr-test-results-${{ github.event.pull_request.number }}
+          if-no-files-found: warn
+          include-hidden-files: true
+          path: |
+            .build/test-results/xunit.xml
+            .build/**/debug/codecov/*.json
