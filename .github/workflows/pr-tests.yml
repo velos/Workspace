@@ -1,0 +1,129 @@
+name: PR Tests
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  swift-tests:
+    name: Swift Tests
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Run test suite
+        shell: bash
+        run: |
+          mkdir -p .build/test-results
+          swift test \
+            --disable-xctest \
+            --enable-swift-testing \
+            --enable-code-coverage \
+            --xunit-output .build/test-results/xunit.xml
+
+      - name: Publish test summary
+        if: always()
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          summary_path = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          report_path = pathlib.Path(".build/test-results/xunit.xml")
+          lines = ["## Test Results", ""]
+
+          if report_path.exists():
+              root = ET.parse(report_path).getroot()
+              suites = root.findall("testsuite")
+              if not suites and root.tag == "testsuite":
+                  suites = [root]
+
+              tests = sum(int(suite.attrib.get("tests", 0)) for suite in suites)
+              failures = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
+              errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
+              skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
+              duration = sum(float(suite.attrib.get("time", 0.0)) for suite in suites)
+
+              lines.extend(
+                  [
+                      f"- Tests: {tests}",
+                      f"- Failures: {failures}",
+                      f"- Errors: {errors}",
+                      f"- Skipped: {skipped}",
+                      f"- Duration: {duration:.3f}s",
+                  ]
+              )
+
+              failed_tests = []
+              for case in root.iter("testcase"):
+                  if case.find("failure") is None and case.find("error") is None:
+                      continue
+
+                  classname = case.attrib.get("classname", "").strip()
+                  name = case.attrib.get("name", "unknown").strip()
+                  label = f"{classname}.{name}" if classname else name
+                  failed_tests.append(label)
+
+              if failed_tests:
+                  lines.extend(["", "### Failed Tests", ""])
+                  lines.extend(f"- `{label}`" for label in failed_tests[:20])
+                  if len(failed_tests) > 20:
+                      lines.append(f"- ...and {len(failed_tests) - 20} more")
+          else:
+              lines.append("- No xUnit report was generated.")
+
+          coverage_files = sorted(pathlib.Path(".build").glob("**/debug/codecov/*.json"))
+          if coverage_files:
+              coverage = json.loads(coverage_files[0].read_text(encoding="utf-8"))
+              totals = coverage.get("data", [{}])[0].get("totals", {}).get("lines", {})
+              count = totals.get("count")
+              covered = totals.get("covered")
+              percent = totals.get("percent")
+
+              if count is not None and covered is not None and percent is not None:
+                  lines.extend(
+                      [
+                          "",
+                          "## Coverage",
+                          "",
+                          f"- Lines: {percent:.2f}% ({covered}/{count})",
+                      ]
+                  )
+
+          summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-test-results-${{ github.event.pull_request.number }}
+          if-no-files-found: warn
+          path: |
+            .build/test-results/xunit.xml
+            .build/**/debug/codecov/*.json
