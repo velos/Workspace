@@ -124,6 +124,7 @@ jobs:
         with:
           name: pr-test-results-${{ github.event.pull_request.number }}
           if-no-files-found: warn
+          include-hidden-files: true
           path: |
             .build/test-results/xunit.xml
             .build/**/debug/codecov/*.json
