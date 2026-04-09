@@ -2,39 +2,26 @@ import Foundation
 
 /// A durable recursive snapshot of a workspace subtree.
 struct Snapshot: Sendable, Codable, Equatable {
-    /// A snapshot entry in the captured tree.
     indirect enum Entry: Sendable, Codable, Equatable {
-        /// The captured path did not exist.
         case missing(Missing)
-        /// A regular file with captured bytes.
         case file(File)
-        /// A directory with recursive children.
         case directory(Directory)
-        /// A symbolic link and its captured target.
         case symlink(Symlink)
     }
 
-    /// A missing path entry.
     struct Missing: Sendable, Codable, Equatable {
-        /// The missing path.
         var path: WorkspacePath
 
-        /// Creates a missing entry.
         init(path: WorkspacePath) {
             self.path = path
         }
     }
 
-    /// A file entry.
     struct File: Sendable, Codable, Equatable {
-        /// The file path.
         var path: WorkspacePath
-        /// The file contents.
         var data: Data
-        /// The file permissions.
         var permissions: POSIXPermissions
 
-        /// Creates a file entry.
         init(path: WorkspacePath, data: Data, permissions: POSIXPermissions) {
             self.path = path
             self.data = data
@@ -42,16 +29,11 @@ struct Snapshot: Sendable, Codable, Equatable {
         }
     }
 
-    /// A directory entry.
     struct Directory: Sendable, Codable, Equatable {
-        /// The directory path.
         var path: WorkspacePath
-        /// The directory permissions.
         var permissions: POSIXPermissions
-        /// The captured child entries.
         var children: [Entry]
 
-        /// Creates a directory entry.
         init(path: WorkspacePath, permissions: POSIXPermissions, children: [Entry]) {
             self.path = path
             self.permissions = permissions
@@ -59,16 +41,11 @@ struct Snapshot: Sendable, Codable, Equatable {
         }
     }
 
-    /// A symbolic link entry.
     struct Symlink: Sendable, Codable, Equatable {
-        /// The symlink path.
         var path: WorkspacePath
-        /// The symlink target string.
         var target: String
-        /// The symlink permissions.
         var permissions: POSIXPermissions
 
-        /// Creates a symlink entry.
         init(path: WorkspacePath, target: String, permissions: POSIXPermissions) {
             self.path = path
             self.target = target
@@ -76,20 +53,89 @@ struct Snapshot: Sendable, Codable, Equatable {
         }
     }
 
-    /// The snapshot identifier.
     var id: UUID
-    /// The root path represented by the snapshot.
     var rootPath: WorkspacePath
-    /// The captured entry tree at `rootPath`.
     var entry: Entry
 
-    /// Creates a workspace snapshot.
     init(id: UUID = UUID(), rootPath: WorkspacePath, entry: Entry) {
         self.id = id
         self.rootPath = rootPath
         self.entry = entry
     }
 }
+
+// MARK: - Summary
+
+extension Snapshot {
+    static func summary(comparing current: Snapshot, to previous: Snapshot?) -> History.Checkpoint.Summary {
+        let currentNodes = flattenNodes(current.entry)
+        let previousNodes = previous.map { flattenNodes($0.entry) } ?? [:]
+        let allPaths = Set(currentNodes.keys).union(previousNodes.keys).sorted()
+        let changedPaths = allPaths.filter { currentNodes[$0] != previousNodes[$0] }
+        let hasTextDiffs = changedPaths.contains { hasTextualChange(old: previousNodes[$0], new: currentNodes[$0]) }
+
+        return History.Checkpoint.Summary(
+            changeCount: changedPaths.count,
+            touchedPaths: changedPaths,
+            hasTextDiffs: hasTextDiffs
+        )
+    }
+
+    private struct FlatNode: Equatable {
+        var kind: FileTree.Kind
+        var permissions: POSIXPermissions
+        var fileData: Data?
+        var symlinkTarget: String?
+    }
+
+    private static func flattenNodes(_ entry: Entry) -> [WorkspacePath: FlatNode] {
+        var nodes: [WorkspacePath: FlatNode] = [:]
+        collectNodes(entry, into: &nodes)
+        nodes.removeValue(forKey: .root)
+        return nodes
+    }
+
+    private static func collectNodes(_ entry: Entry, into nodes: inout [WorkspacePath: FlatNode]) {
+        switch entry {
+        case .missing:
+            return
+        case let .file(f):
+            nodes[f.path] = FlatNode(kind: .file, permissions: f.permissions, fileData: f.data)
+        case let .symlink(s):
+            nodes[s.path] = FlatNode(kind: .symlink, permissions: s.permissions, symlinkTarget: s.target)
+        case let .directory(d):
+            nodes[d.path] = FlatNode(kind: .directory, permissions: d.permissions)
+            for child in d.children {
+                collectNodes(child, into: &nodes)
+            }
+        }
+    }
+
+    private static func hasTextualChange(old: FlatNode?, new: FlatNode?) -> Bool {
+        let oldText: String?
+        if let data = old?.fileData {
+            oldText = String(data: data, encoding: .utf8)
+        } else if old == nil {
+            oldText = ""
+        } else {
+            oldText = nil
+        }
+
+        let newText: String?
+        if let data = new?.fileData {
+            newText = String(data: data, encoding: .utf8)
+        } else if new == nil {
+            newText = ""
+        } else {
+            newText = nil
+        }
+
+        guard let oldText, let newText else { return false }
+        return oldText != newText
+    }
+}
+
+// MARK: - Capture / Restore
 
 extension Snapshot {
     static func capture(

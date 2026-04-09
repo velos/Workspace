@@ -8,8 +8,8 @@ public actor History {
         var lastCheckpointId: UUID?
     }
 
-    private struct EventWatcher {
-        var workspaceId: UUID
+    private struct CheckpointWatcher {
+        var deliveredCheckpointIds: Set<UUID>
         var continuation: AsyncStream<CheckpointEvent>.Continuation
     }
 
@@ -22,9 +22,20 @@ public actor History {
         }
     }
 
+    /// Where to persist checkpoint and snapshot data.
+    public enum Storage {
+        /// In-memory storage that does not survive process exit.
+        case inMemory
+        /// File-backed JSON storage at the given directory URL.
+        case directory(URL)
+    }
+
     public let workspaceId: UUID
 
-    private let sharedWorkspace: Workspace
+    /// The shared workspace backing this history coordinator.
+    /// Use this for all read operations (readFile, exists, walkTree, etc.).
+    public nonisolated let shared: Workspace
+
     private let store: any CheckpointStore
 
     private var didLoadStoreState = false
@@ -33,28 +44,29 @@ public actor History {
     private var mutations: [MutationRecord] = []
     private var sharedHeadCheckpointId: UUID?
     private var nextMutationSequence = 1
-    private var eventWatchers: [UUID: EventWatcher] = [:]
+    private var checkpointWatchers: [UUID: CheckpointWatcher] = [:]
+    private var checkpointPollingTask: Task<Void, Never>?
 
     /// Creates a history coordinator over `filesystem`.
     public init(
         workspaceId: UUID = UUID(),
         filesystem: any FileSystem,
-        historyDirectory: URL
+        storage: Storage = .inMemory
     ) {
         self.workspaceId = workspaceId
-        sharedWorkspace = Workspace(filesystem: filesystem)
-        store = FileCheckpointStore(rootDirectory: historyDirectory)
+        shared = Workspace(filesystem: filesystem)
+        store = Self.makeStore(for: storage)
     }
 
     /// Creates a history coordinator over an existing shared workspace.
     public init(
         workspaceId: UUID = UUID(),
         workspace: Workspace,
-        historyDirectory: URL
+        storage: Storage = .inMemory
     ) {
         self.workspaceId = workspaceId
-        sharedWorkspace = workspace
-        store = FileCheckpointStore(rootDirectory: historyDirectory)
+        shared = workspace
+        store = Self.makeStore(for: storage)
     }
 
     init(
@@ -63,7 +75,7 @@ public actor History {
         store: any CheckpointStore
     ) {
         self.workspaceId = workspaceId
-        sharedWorkspace = Workspace(filesystem: filesystem)
+        shared = Workspace(filesystem: filesystem)
         self.store = store
     }
 
@@ -73,81 +85,27 @@ public actor History {
         store: any CheckpointStore
     ) {
         self.workspaceId = workspaceId
-        sharedWorkspace = workspace
+        shared = workspace
         self.store = store
     }
 
-    /// Reads raw data from the shared workspace.
-    public func readData(from path: WorkspacePath) async throws -> Data {
-        try await ensureLoaded()
-        return try await sharedWorkspace.readData(from: path)
-    }
-
-    /// Reads UTF-8 text from the shared workspace.
-    public func readFile(_ path: WorkspacePath) async throws -> String {
-        try await ensureLoaded()
-        return try await sharedWorkspace.readFile(path)
-    }
-
-    /// Reads JSON from the shared workspace.
-    public func readJSON<T: Decodable & Sendable>(_ type: T.Type = T.self, from path: WorkspacePath) async throws -> T {
-        try await ensureLoaded()
-        return try await sharedWorkspace.readJSON(type, from: path)
-    }
-
-    /// Returns whether an entry exists in the shared workspace.
-    public func exists(_ path: WorkspacePath) async throws -> Bool {
-        try await ensureLoaded()
-        return await sharedWorkspace.exists(path)
-    }
-
-    /// Returns shared workspace metadata.
-    public func fileInfo(at path: WorkspacePath) async throws -> FileInfo {
-        try await ensureLoaded()
-        return try await sharedWorkspace.fileInfo(at: path)
-    }
-
-    /// Lists a shared workspace directory.
-    public func listDirectory(at path: WorkspacePath) async throws -> [DirectoryEntry] {
-        try await ensureLoaded()
-        return try await sharedWorkspace.listDirectory(at: path)
-    }
-
-    /// Expands a glob against the shared workspace.
-    public func glob(_ pattern: String, currentDirectory: WorkspacePath = .root) async throws -> [WorkspacePath] {
-        try await ensureLoaded()
-        return try await sharedWorkspace.glob(pattern, currentDirectory: currentDirectory)
-    }
-
-    /// Walks the shared workspace tree.
-    public func walkTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> FileTree {
-        try await ensureLoaded()
-        return try await sharedWorkspace.walkTree(path, maxDepth: maxDepth)
-    }
-
-    /// Summarizes the shared workspace tree.
-    public func summarizeTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> FileTreeSummary {
-        try await ensureLoaded()
-        return try await sharedWorkspace.summarizeTree(path, maxDepth: maxDepth)
-    }
-
-    /// Watches shared workspace filesystem changes.
-    public func watchChanges(at path: WorkspacePath, recursive: Bool = true) async throws -> AsyncStream<ChangeEvent> {
-        try await ensureLoaded()
-        return await sharedWorkspace.watchChanges(at: path, recursive: recursive)
-    }
-
-    /// Watches durable checkpoint events for `workspaceId`.
-    func watchCheckpointEvents(workspaceId: UUID) async throws -> AsyncStream<CheckpointEvent> {
-        try await ensureLoaded()
-
-        guard workspaceId == self.workspaceId else {
-            return AsyncStream { continuation in
-                continuation.finish()
-            }
+    private static func makeStore(for storage: Storage) -> any CheckpointStore {
+        switch storage {
+        case .inMemory:
+            InMemoryCheckpointStore()
+        case .directory(let url):
+            FileCheckpointStore(rootDirectory: url)
         }
+    }
+
+    // MARK: - Checkpoint watching
+
+    /// Watches for checkpoint events, including those created by other History instances sharing the same store.
+    public func watchCheckpointEvents() async throws -> AsyncStream<CheckpointEvent> {
+        try await ensureLoaded()
 
         let watcherId = UUID()
+        let deliveredIds = Set(checkpoints.map(\.id))
         var continuation: AsyncStream<CheckpointEvent>.Continuation?
         let stream = AsyncStream<CheckpointEvent> {
             continuation = $0
@@ -157,21 +115,27 @@ public actor History {
             return stream
         }
 
-        eventWatchers[watcherId] = EventWatcher(workspaceId: workspaceId, continuation: continuation)
+        checkpointWatchers[watcherId] = CheckpointWatcher(
+            deliveredCheckpointIds: deliveredIds,
+            continuation: continuation
+        )
         continuation.onTermination = { [weak self] _ in
             Task {
-                await self?.removeEventWatcher(id: watcherId)
+                await self?.removeCheckpointWatcher(id: watcherId)
             }
         }
+        ensureCheckpointPolling()
         return stream
     }
+
+    // MARK: - Sessions
 
     /// Creates a tracked session overlay from the current shared head.
     public func createSession() async throws -> Session {
         try await ensureLoaded()
 
         let sessionId = UUID()
-        let snapshot = try await sharedWorkspace.captureSnapshot()
+        let snapshot = try await shared.captureSnapshot()
         let overlay = InMemoryFilesystem()
         let sessionWorkspace = Workspace(filesystem: overlay)
         try await sessionWorkspace.restoreSnapshot(snapshot)
@@ -190,11 +154,13 @@ public actor History {
         )
     }
 
+    // MARK: - Shared write operations
+
     /// Writes UTF-8 text to the shared workspace.
     public func writeFile(_ path: WorkspacePath, content: String) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: sharedWorkspace,
+            on: shared,
             scope: .shared,
             sessionId: nil,
             kind: .writeFile,
@@ -208,7 +174,7 @@ public actor History {
     public func appendFile(_ path: WorkspacePath, content: String) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: sharedWorkspace,
+            on: shared,
             scope: .shared,
             sessionId: nil,
             kind: .appendFile,
@@ -222,7 +188,7 @@ public actor History {
     public func writeData(_ data: Data, to path: WorkspacePath) async throws {
         try await ensureLoaded()
         try await performBinaryWrite(
-            on: sharedWorkspace,
+            on: shared,
             scope: .shared,
             sessionId: nil,
             data: data,
@@ -239,7 +205,7 @@ public actor History {
         try await ensureLoaded()
         let content = try encodedJSONString(for: value, prettyPrinted: prettyPrinted)
         try await performDirectEdit(
-            on: sharedWorkspace,
+            on: shared,
             scope: .shared,
             sessionId: nil,
             kind: .writeJSON,
@@ -253,7 +219,7 @@ public actor History {
     public func createDirectory(at path: WorkspacePath, recursive: Bool = true) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: sharedWorkspace,
+            on: shared,
             scope: .shared,
             sessionId: nil,
             kind: .createDirectory,
@@ -267,7 +233,7 @@ public actor History {
     public func removeItem(at path: WorkspacePath, recursive: Bool = true) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: sharedWorkspace,
+            on: shared,
             scope: .shared,
             sessionId: nil,
             kind: .removeItem,
@@ -281,7 +247,7 @@ public actor History {
     public func copyItem(from source: WorkspacePath, to destination: WorkspacePath, recursive: Bool = true) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: sharedWorkspace,
+            on: shared,
             scope: .shared,
             sessionId: nil,
             kind: .copyItem,
@@ -295,7 +261,7 @@ public actor History {
     public func moveItem(from source: WorkspacePath, to destination: WorkspacePath) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: sharedWorkspace,
+            on: shared,
             scope: .shared,
             sessionId: nil,
             kind: .moveItem,
@@ -311,7 +277,7 @@ public actor History {
         failurePolicy: MutationFailurePolicy = .rollback
     ) async throws -> FileEdit.BatchResult {
         try await ensureLoaded()
-        let result = try await sharedWorkspace.applyEdits(edits, failurePolicy: failurePolicy)
+        let result = try await shared.applyEdits(edits, failurePolicy: failurePolicy)
         if !edits.isEmpty {
             try await appendMutation(
                 kind: .applyEdits,
@@ -331,7 +297,7 @@ public actor History {
         failurePolicy: MutationFailurePolicy = .rollback
     ) async throws -> ReplacementResult {
         try await ensureLoaded()
-        let result = try await sharedWorkspace.applyReplacement(request, failurePolicy: failurePolicy)
+        let result = try await shared.applyReplacement(request, failurePolicy: failurePolicy)
         if !result.changes.isEmpty || !result.failures.isEmpty {
             try await appendMutation(
                 kind: .applyReplacement,
@@ -353,10 +319,12 @@ public actor History {
         return result
     }
 
+    // MARK: - Checkpoints
+
     /// Creates a shared checkpoint.
     public func createCheckpoint(label: String? = nil) async throws -> Checkpoint {
         try await ensureLoaded()
-        let snapshot = try await sharedWorkspace.captureSnapshot()
+        let snapshot = try await shared.captureSnapshot()
         return try await persistCheckpoint(
             snapshot: snapshot,
             scope: .shared,
@@ -377,8 +345,9 @@ public actor History {
         guard checkpoint.scope == .shared else {
             throw HistoryError.checkpointScopeMismatch(expected: .shared, actual: checkpoint.scope)
         }
-        try await sharedWorkspace.restoreSnapshot(checkpoint.snapshot)
-        let restoredSnapshot = try await sharedWorkspace.captureSnapshot()
+        let targetSnapshot = try await loadSnapshotOrThrow(id: checkpoint.snapshotId)
+        try await shared.restoreSnapshot(targetSnapshot)
+        let restoredSnapshot = try await shared.captureSnapshot()
         return try await persistCheckpoint(
             snapshot: restoredSnapshot,
             scope: .shared,
@@ -405,11 +374,11 @@ public actor History {
             )
         }
 
-        let previousSharedSnapshot = try await sharedWorkspace.captureSnapshot()
+        let previousSharedSnapshot = try await shared.captureSnapshot()
         let sessionSnapshot = try await session.workspace.captureSnapshot()
         let delta = snapshotDelta(from: previousSharedSnapshot.entry, to: sessionSnapshot.entry)
 
-        try await sharedWorkspace.restoreSnapshot(sessionSnapshot)
+        try await shared.restoreSnapshot(sessionSnapshot)
 
         if delta.hasChanges {
             try await appendMutation(
@@ -478,6 +447,12 @@ public actor History {
         try await ensureLoaded()
         return checkpoints.first(where: { $0.id == id })
     }
+
+    func loadSnapshot(for checkpoint: Checkpoint) async throws -> Snapshot {
+        try await loadSnapshotOrThrow(id: checkpoint.snapshotId)
+    }
+
+    // MARK: - Session write operations (internal, called by Session)
 
     func sessionWriteFile(_ sessionId: UUID, path: WorkspacePath, content: String) async throws {
         try await ensureLoaded()
@@ -665,7 +640,8 @@ public actor History {
             )
         }
 
-        try await session.workspace.restoreSnapshot(checkpoint.snapshot)
+        let targetSnapshot = try await loadSnapshotOrThrow(id: checkpoint.snapshotId)
+        try await session.workspace.restoreSnapshot(targetSnapshot)
 
         switch checkpoint.scope {
         case .shared:
@@ -693,6 +669,8 @@ public actor History {
         try await ensureLoaded()
         return try sessionState(for: sessionId).baseSharedCheckpointId
     }
+
+    // MARK: - Private
 
     private func ensureLoaded() async throws {
         guard !didLoadStoreState else {
@@ -722,6 +700,13 @@ public actor History {
             throw HistoryError.checkpointNotFound(id)
         }
         return checkpoint
+    }
+
+    private func loadSnapshotOrThrow(id: UUID) async throws -> Snapshot {
+        guard let snapshot = try await store.loadSnapshot(id: id, workspaceId: workspaceId) else {
+            throw HistoryError.snapshotNotFound(id)
+        }
+        return snapshot
     }
 
     private func performSessionDirectEdit(
@@ -816,9 +801,20 @@ public actor History {
         rollbackSourceCheckpointId: UUID?,
         eventKind: CheckpointEvent.Kind
     ) async throws -> Checkpoint {
+        try await store.saveSnapshot(snapshot, workspaceId: workspaceId)
+
         let parentCheckpoint = parentCheckpointId.flatMap { id in
             checkpoints.first(where: { $0.id == id })
         }
+
+        let previousSnapshot: Snapshot?
+        if let parentCheckpoint {
+            previousSnapshot = try? await store.loadSnapshot(id: parentCheckpoint.snapshotId, workspaceId: workspaceId)
+        } else {
+            previousSnapshot = nil
+        }
+        let summary = Snapshot.summary(comparing: snapshot, to: previousSnapshot)
+
         let previousCursor = parentCheckpoint?.mutationCursor ?? 0
         let currentCursor = latestMutationSequence(scope: scope, sessionId: sessionId)
         let checkpointId = UUID()
@@ -837,7 +833,8 @@ public actor History {
             mutationCursor: currentCursor,
             originSessionId: originSessionId,
             rollbackSourceCheckpointId: rollbackSourceCheckpointId,
-            snapshot: snapshot
+            snapshotId: snapshot.id,
+            summary: summary
         )
 
         try await store.saveCheckpoint(checkpoint)
@@ -855,7 +852,7 @@ public actor History {
             }
         }
 
-        emit(CheckpointEvent(kind: eventKind, checkpoint: checkpoint))
+        emitCheckpointEvent(CheckpointEvent(kind: eventKind, checkpoint: checkpoint))
         return checkpoint
     }
 
@@ -920,6 +917,64 @@ public actor History {
             return copy
         }
     }
+
+    // MARK: - Checkpoint watching internals
+
+    private func removeCheckpointWatcher(id: UUID) {
+        checkpointWatchers.removeValue(forKey: id)
+        if checkpointWatchers.isEmpty {
+            checkpointPollingTask?.cancel()
+            checkpointPollingTask = nil
+        }
+    }
+
+    private func ensureCheckpointPolling() {
+        guard checkpointPollingTask == nil else {
+            return
+        }
+        checkpointPollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                await self?.pollCheckpointEvents()
+            }
+        }
+    }
+
+    private func pollCheckpointEvents() async {
+        guard !checkpointWatchers.isEmpty else {
+            return
+        }
+        guard let loaded = try? await store.listCheckpoints(workspaceId: workspaceId) else {
+            return
+        }
+
+        for cp in loaded where !checkpoints.contains(where: { $0.id == cp.id }) {
+            checkpoints.append(cp)
+        }
+        checkpoints.sort(by: checkpointSort)
+
+        for cp in loaded.sorted(by: checkpointSort) {
+            emitCheckpointEvent(CheckpointEvent(kind: cp.inferredEventKind, checkpoint: cp))
+        }
+    }
+
+    private func emitCheckpointEvent(_ event: CheckpointEvent) {
+        guard !checkpointWatchers.isEmpty else {
+            return
+        }
+
+        for id in Array(checkpointWatchers.keys) {
+            guard var watcher = checkpointWatchers[id] else {
+                continue
+            }
+            if watcher.deliveredCheckpointIds.insert(event.checkpoint.id).inserted {
+                watcher.continuation.yield(event)
+                checkpointWatchers[id] = watcher
+            }
+        }
+    }
+
+    // MARK: - Snapshot delta
 
     private func snapshotDelta(from original: Snapshot.Entry, to updated: Snapshot.Entry) -> SnapshotDelta {
         var delta = SnapshotDelta()
@@ -1061,17 +1116,6 @@ public actor History {
         }
     }
 
-    private func emit(_ event: CheckpointEvent) {
-        let watchers = eventWatchers.values.filter { $0.workspaceId == event.workspaceId }
-        for watcher in watchers {
-            watcher.continuation.yield(event)
-        }
-    }
-
-    private func removeEventWatcher(id: UUID) {
-        eventWatchers.removeValue(forKey: id)
-    }
-
     private func checkpointSort(lhs: Checkpoint, rhs: Checkpoint) -> Bool {
         if lhs.createdAt == rhs.createdAt {
             return lhs.id.uuidString < rhs.id.uuidString
@@ -1087,13 +1131,19 @@ public actor History {
     }
 }
 
+// MARK: - Session
+
 extension History {
     /// A tracked session-local editing overlay managed by `History`.
     public actor Session {
-        public let id: UUID
-        public let workspaceId: UUID
+        public nonisolated let id: UUID
+        public nonisolated let workspaceId: UUID
 
-        private let workspace: Workspace
+        /// The session's underlying workspace.
+        /// Use this for all read operations (readFile, exists, walkTree, etc.).
+        /// Use Session's write methods for tracked mutations.
+        public nonisolated let workspace: Workspace
+
         private let history: History
 
         init(id: UUID, workspaceId: UUID, workspace: Workspace, history: History) {
@@ -1101,56 +1151,6 @@ extension History {
             self.workspaceId = workspaceId
             self.workspace = workspace
             self.history = history
-        }
-
-        /// Reads raw data from the session overlay.
-        public func readData(from path: WorkspacePath) async throws -> Data {
-            try await workspace.readData(from: path)
-        }
-
-        /// Reads UTF-8 text from the session overlay.
-        public func readFile(_ path: WorkspacePath) async throws -> String {
-            try await workspace.readFile(path)
-        }
-
-        /// Reads JSON from the session overlay.
-        public func readJSON<T: Decodable & Sendable>(_ type: T.Type = T.self, from path: WorkspacePath) async throws -> T {
-            try await workspace.readJSON(type, from: path)
-        }
-
-        /// Returns whether an entry exists in the session overlay.
-        public func exists(_ path: WorkspacePath) async -> Bool {
-            await workspace.exists(path)
-        }
-
-        /// Returns session overlay metadata.
-        public func fileInfo(at path: WorkspacePath) async throws -> FileInfo {
-            try await workspace.fileInfo(at: path)
-        }
-
-        /// Lists a session overlay directory.
-        public func listDirectory(at path: WorkspacePath) async throws -> [DirectoryEntry] {
-            try await workspace.listDirectory(at: path)
-        }
-
-        /// Expands a glob against the session overlay.
-        public func glob(_ pattern: String, currentDirectory: WorkspacePath = .root) async throws -> [WorkspacePath] {
-            try await workspace.glob(pattern, currentDirectory: currentDirectory)
-        }
-
-        /// Walks the session overlay tree.
-        public func walkTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> FileTree {
-            try await workspace.walkTree(path, maxDepth: maxDepth)
-        }
-
-        /// Summarizes the session overlay tree.
-        public func summarizeTree(_ path: WorkspacePath, maxDepth: Int? = nil) async throws -> FileTreeSummary {
-            try await workspace.summarizeTree(path, maxDepth: maxDepth)
-        }
-
-        /// Watches session-local filesystem changes.
-        public func watchChanges(at path: WorkspacePath, recursive: Bool = true) async -> AsyncStream<ChangeEvent> {
-            await workspace.watchChanges(at: path, recursive: recursive)
         }
 
         /// Writes UTF-8 text into the session overlay.

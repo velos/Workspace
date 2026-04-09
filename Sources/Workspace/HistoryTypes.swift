@@ -11,6 +11,16 @@ extension History {
             case shared
         }
 
+        /// A lightweight summary of changes relative to the parent checkpoint.
+        public struct Summary: Sendable, Codable, Equatable {
+            /// The number of paths that differ from the parent checkpoint.
+            public var changeCount: Int
+            /// The paths that changed relative to the parent checkpoint.
+            public var touchedPaths: [WorkspacePath]
+            /// Whether any changed file paths involve UTF-8 decodable text.
+            public var hasTextDiffs: Bool
+        }
+
         /// The checkpoint identifier.
         public var id: UUID
         /// The managed workspace identifier.
@@ -23,24 +33,24 @@ extension History {
         public var label: String?
         /// The checkpoint creation timestamp.
         public var createdAt: Date
-        /// The prior checkpoint in the same scope lineage.
-        var parentCheckpointId: UUID?
-        /// The shared checkpoint the session was based on when this checkpoint was created.
-        var baseSharedCheckpointId: UUID?
-        /// The first mutation sequence captured by this checkpoint, if any.
-        var firstMutationSequence: Int?
-        /// The last mutation sequence captured by this checkpoint, if any.
-        var lastMutationSequence: Int?
-        /// The latest visible mutation sequence when the checkpoint was created.
-        var mutationCursor: Int
-        /// The originating session for shared publish checkpoints when available.
-        var originSessionId: UUID?
-        /// The source checkpoint for rollback checkpoints when available.
-        var rollbackSourceCheckpointId: UUID?
-        /// The captured restorable workspace state for this checkpoint.
-        var snapshot: Snapshot
+        /// A summary of what changed relative to the parent checkpoint.
+        public var summary: Summary
 
-        /// Creates a workspace checkpoint.
+        var parentCheckpointId: UUID?
+        var baseSharedCheckpointId: UUID?
+        var firstMutationSequence: Int?
+        var lastMutationSequence: Int?
+        var mutationCursor: Int
+        var originSessionId: UUID?
+        var rollbackSourceCheckpointId: UUID?
+        var snapshotId: UUID
+
+        var inferredEventKind: CheckpointEvent.Kind {
+            if rollbackSourceCheckpointId != nil { return .rolledBack }
+            if originSessionId != nil, scope == .shared { return .published }
+            return .created
+        }
+
         init(
             id: UUID = UUID(),
             workspaceId: UUID,
@@ -55,7 +65,8 @@ extension History {
             mutationCursor: Int,
             originSessionId: UUID? = nil,
             rollbackSourceCheckpointId: UUID? = nil,
-            snapshot: Snapshot
+            snapshotId: UUID,
+            summary: Summary
         ) {
             self.id = id
             self.workspaceId = workspaceId
@@ -70,14 +81,13 @@ extension History {
             self.mutationCursor = mutationCursor
             self.originSessionId = originSessionId
             self.rollbackSourceCheckpointId = rollbackSourceCheckpointId
-            self.snapshot = snapshot
+            self.snapshotId = snapshotId
+            self.summary = summary
         }
     }
 }
 
-/// A normalized mutation record stored between checkpoints.
 struct MutationRecord: Sendable, Codable, Equatable {
-    /// The tracked mutation kind.
     enum Kind: String, Sendable, Codable {
         case writeFile
         case appendFile
@@ -92,26 +102,16 @@ struct MutationRecord: Sendable, Codable, Equatable {
         case publishSessionHead
     }
 
-    /// The monotonically increasing mutation sequence.
     var sequence: Int
-    /// The managed workspace identifier.
     var workspaceId: UUID
-    /// The originating session when available.
     var sessionId: UUID?
-    /// Whether the mutation targeted a session overlay or the shared head.
     var scope: History.Checkpoint.Scope
-    /// The mutation timestamp.
     var timestamp: Date
-    /// The tracked mutation kind.
     var kind: Kind
-    /// The canonicalized paths touched by the mutation.
     var touchedPaths: [WorkspacePath]
-    /// The normalized file-level changes described by the mutation.
     var fileChanges: [FileEdit.FileChange]
-    /// A primary text diff when the mutation naturally maps to one.
     var diff: TextDiff?
 
-    /// Creates a workspace mutation record.
     init(
         sequence: Int,
         workspaceId: UUID,
@@ -135,61 +135,53 @@ struct MutationRecord: Sendable, Codable, Equatable {
     }
 }
 
-/// A durable checkpoint event emitted by `History`.
-struct CheckpointEvent: Sendable, Codable, Equatable {
+/// A checkpoint event emitted by `History`.
+public struct CheckpointEvent: Sendable, Codable, Equatable {
     /// The event kind.
-    enum Kind: String, Sendable, Codable {
-        /// A checkpoint was created manually.
+    public enum Kind: String, Sendable, Codable {
+        /// A checkpoint was created.
         case created
-        /// A rollback restored a prior checkpoint and emitted a new rollback checkpoint.
+        /// A rollback restored a prior checkpoint.
         case rolledBack
         /// A session head was published to the shared workspace.
         case published
     }
 
     /// The event kind.
-    var kind: Kind
-    /// The resulting checkpoint metadata.
-    var checkpoint: History.Checkpoint
+    public var kind: Kind
+    /// The checkpoint that triggered this event.
+    public var checkpoint: History.Checkpoint
 
     /// Creates a checkpoint event.
-    init(kind: Kind, checkpoint: History.Checkpoint) {
+    public init(kind: Kind, checkpoint: History.Checkpoint) {
         self.kind = kind
         self.checkpoint = checkpoint
     }
 
-    /// The managed workspace identifier.
-    var workspaceId: UUID {
-        checkpoint.workspaceId
-    }
-
-    /// The originating session identifier when available.
-    var sessionId: UUID? {
-        checkpoint.sessionId
-    }
-
     /// The checkpoint scope.
-    var scope: History.Checkpoint.Scope {
+    public var scope: History.Checkpoint.Scope {
         checkpoint.scope
     }
 }
 
-/// Errors produced by session-scoped checkpointing and publish flows.
-enum HistoryError: Error, CustomStringConvertible, Sendable {
+/// Errors produced by `History` operations.
+public enum HistoryError: Error, CustomStringConvertible, Sendable {
     case sessionNotFound(UUID)
     case checkpointNotFound(UUID)
+    case snapshotNotFound(UUID)
     case checkpointScopeMismatch(expected: History.Checkpoint.Scope, actual: History.Checkpoint.Scope)
     case checkpointSessionMismatch(checkpointId: UUID, expectedSessionId: UUID, actualSessionId: UUID?)
     case publishConflict(sessionId: UUID, expectedBaseSharedCheckpointId: UUID?, actualSharedCheckpointId: UUID?)
     case mutationFailed(String)
 
-    /// A human-readable description of the error.
-    var description: String {
+    public var description: String {
         switch self {
         case let .sessionNotFound(sessionId):
             return "workspace session not found: \(sessionId.uuidString)"
         case let .checkpointNotFound(checkpointId):
             return "workspace checkpoint not found: \(checkpointId.uuidString)"
+        case let .snapshotNotFound(snapshotId):
+            return "workspace snapshot not found: \(snapshotId.uuidString)"
         case let .checkpointScopeMismatch(expected, actual):
             return "checkpoint scope mismatch: expected \(expected.rawValue), got \(actual.rawValue)"
         case let .checkpointSessionMismatch(checkpointId, expectedSessionId, actualSessionId):
