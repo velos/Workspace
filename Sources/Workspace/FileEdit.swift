@@ -40,7 +40,7 @@ public enum FileEdit: Sendable, Equatable, Codable {
     }
 
     /// A file-level change contained within a batch edit result.
-    public struct FileChange: Sendable, Codable {
+    public struct FileChange: Sendable, Codable, Equatable {
         /// The affected file or symlink path.
         public var path: WorkspacePath
         /// The original path for move and copy operations when applicable.
@@ -73,7 +73,7 @@ public enum FileEdit: Sendable, Equatable, Codable {
     }
 
     /// A preview or result entry for a single batch edit operation.
-    public struct Entry: Sendable, Codable {
+    public struct Entry: Sendable, Codable, Equatable {
         /// The requested edit.
         public var edit: FileEdit
         /// Whether the requested edit materially changes the workspace.
@@ -102,7 +102,7 @@ public enum FileEdit: Sendable, Equatable, Codable {
     }
 
     /// A failure encountered while executing a single batch edit.
-    public struct Failure: Sendable, Codable {
+    public struct Failure: Sendable, Codable, Equatable {
         /// The index of the failed edit in the original request.
         public var index: Int
         /// The edit that failed.
@@ -119,7 +119,7 @@ public enum FileEdit: Sendable, Equatable, Codable {
     }
 
     /// The result of applying a batch of workspace edits.
-    public struct BatchResult: Sendable, Codable {
+    public struct BatchResult: Sendable, Codable, Equatable {
         /// Whether the operation was previewed or executed.
         public var mode: MutationMode
         /// Canonicalized paths touched by the batch.

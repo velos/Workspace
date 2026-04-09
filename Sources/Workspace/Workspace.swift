@@ -181,6 +181,14 @@ public actor Workspace {
         try await buildSummary(path: path, depth: 0, maxDepth: maxDepth)
     }
 
+    func captureSnapshot(at path: WorkspacePath = .root) async throws -> Snapshot {
+        try await Snapshot.capture(from: filesystem, at: path)
+    }
+
+    func restoreSnapshot(_ snapshot: Snapshot) async throws {
+        try await Snapshot.restore(snapshot, to: filesystem)
+    }
+
     private struct PlannedReplacement {
         var change: ReplacementResult.Change
         var updatedContent: String
