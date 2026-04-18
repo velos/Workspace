@@ -181,11 +181,19 @@ public actor Workspace {
         try await buildSummary(path: path, depth: 0, maxDepth: maxDepth)
     }
 
-    func captureSnapshot(at path: WorkspacePath = .root) async throws -> Snapshot {
+    /// Captures a durable snapshot of the subtree rooted at `path`.
+    ///
+    /// The returned ``Snapshot`` records file contents, symlinks, directory structure,
+    /// and POSIX permissions, and can later be replayed with ``restoreSnapshot(_:)``.
+    ///
+    /// - Parameter path: The subtree to capture. Defaults to the workspace root.
+    public func captureSnapshot(at path: WorkspacePath = .root) async throws -> Snapshot {
         try await Snapshot.capture(from: filesystem, at: path)
     }
 
-    func restoreSnapshot(_ snapshot: Snapshot) async throws {
+    /// Restores `snapshot` onto the workspace, removing any extra entries beneath the
+    /// snapshot's root so that the workspace exactly matches the captured tree.
+    public func restoreSnapshot(_ snapshot: Snapshot) async throws {
         try await Snapshot.restore(snapshot, to: filesystem)
     }
 

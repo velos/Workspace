@@ -1,63 +1,108 @@
 import Foundation
 
-/// A durable recursive snapshot of a workspace subtree.
-struct Snapshot: Sendable, Codable, Equatable {
-    indirect enum Entry: Sendable, Codable, Equatable {
+/// A durable, in-memory snapshot of a workspace subtree.
+///
+/// A snapshot captures the file contents, symbolic links, directory structure, and
+/// POSIX permissions of an entire tree at a single point in time. It is `Codable`
+/// so it can be persisted, transmitted, or compared to other snapshots.
+///
+/// Capture and restore snapshots through ``Workspace/captureSnapshot(at:)`` and
+/// ``Workspace/restoreSnapshot(_:)``. To inspect the tree captured by a checkpoint,
+/// use ``History/snapshot(for:)``.
+public struct Snapshot: Sendable, Codable, Equatable {
+    /// A node within a snapshot tree.
+    public indirect enum Entry: Sendable, Codable, Equatable {
+        /// A path that did not exist when the snapshot was captured.
         case missing(Missing)
+        /// A regular file with captured contents and permissions.
         case file(File)
+        /// A directory with captured permissions and recursively captured children.
         case directory(Directory)
+        /// A symbolic link pointing at `target`.
         case symlink(Symlink)
+
+        /// The workspace path of the entry.
+        public var path: WorkspacePath {
+            switch self {
+            case let .missing(entry): entry.path
+            case let .file(entry): entry.path
+            case let .directory(entry): entry.path
+            case let .symlink(entry): entry.path
+            }
+        }
     }
 
-    struct Missing: Sendable, Codable, Equatable {
-        var path: WorkspacePath
+    /// A snapshot entry representing a path that does not exist.
+    public struct Missing: Sendable, Codable, Equatable {
+        /// The captured path.
+        public var path: WorkspacePath
 
-        init(path: WorkspacePath) {
+        /// Creates a missing entry.
+        public init(path: WorkspacePath) {
             self.path = path
         }
     }
 
-    struct File: Sendable, Codable, Equatable {
-        var path: WorkspacePath
-        var data: Data
-        var permissions: POSIXPermissions
+    /// A snapshot entry representing a regular file.
+    public struct File: Sendable, Codable, Equatable {
+        /// The captured path.
+        public var path: WorkspacePath
+        /// The file's contents at the time of capture.
+        public var data: Data
+        /// The file's POSIX permissions at the time of capture.
+        public var permissions: POSIXPermissions
 
-        init(path: WorkspacePath, data: Data, permissions: POSIXPermissions) {
+        /// Creates a file entry.
+        public init(path: WorkspacePath, data: Data, permissions: POSIXPermissions) {
             self.path = path
             self.data = data
             self.permissions = permissions
         }
     }
 
-    struct Directory: Sendable, Codable, Equatable {
-        var path: WorkspacePath
-        var permissions: POSIXPermissions
-        var children: [Entry]
+    /// A snapshot entry representing a directory.
+    public struct Directory: Sendable, Codable, Equatable {
+        /// The captured path.
+        public var path: WorkspacePath
+        /// The directory's POSIX permissions at the time of capture.
+        public var permissions: POSIXPermissions
+        /// The directory's children, sorted by name.
+        public var children: [Entry]
 
-        init(path: WorkspacePath, permissions: POSIXPermissions, children: [Entry]) {
+        /// Creates a directory entry.
+        public init(path: WorkspacePath, permissions: POSIXPermissions, children: [Entry]) {
             self.path = path
             self.permissions = permissions
             self.children = children
         }
     }
 
-    struct Symlink: Sendable, Codable, Equatable {
-        var path: WorkspacePath
-        var target: String
-        var permissions: POSIXPermissions
+    /// A snapshot entry representing a symbolic link.
+    public struct Symlink: Sendable, Codable, Equatable {
+        /// The captured path.
+        public var path: WorkspacePath
+        /// The symbolic link's target string.
+        public var target: String
+        /// The symbolic link's POSIX permissions at the time of capture.
+        public var permissions: POSIXPermissions
 
-        init(path: WorkspacePath, target: String, permissions: POSIXPermissions) {
+        /// Creates a symlink entry.
+        public init(path: WorkspacePath, target: String, permissions: POSIXPermissions) {
             self.path = path
             self.target = target
             self.permissions = permissions
         }
     }
 
-    var id: UUID
-    var rootPath: WorkspacePath
-    var entry: Entry
+    /// A stable identifier for the snapshot.
+    public var id: UUID
+    /// The path that was used as the snapshot root.
+    public var rootPath: WorkspacePath
+    /// The captured root entry.
+    public var entry: Entry
 
-    init(id: UUID = UUID(), rootPath: WorkspacePath, entry: Entry) {
+    /// Creates a snapshot from a previously captured tree.
+    public init(id: UUID = UUID(), rootPath: WorkspacePath, entry: Entry) {
         self.id = id
         self.rootPath = rootPath
         self.entry = entry
@@ -67,12 +112,19 @@ struct Snapshot: Sendable, Codable, Equatable {
 // MARK: - Summary
 
 extension Snapshot {
-    static func summary(comparing current: Snapshot, to previous: Snapshot?) -> History.Checkpoint.Summary {
-        let currentNodes = flattenNodes(current.entry)
-        let previousNodes = previous.map { flattenNodes($0.entry) } ?? [:]
+    /// Returns a structural summary of the changes between this snapshot and `other`.
+    ///
+    /// Pass `nil` to summarize this snapshot as if every entry were newly created.
+    ///
+    /// - Parameter other: The snapshot to compare against, typically a parent checkpoint.
+    /// - Returns: A summary describing how many paths changed and whether any of those
+    ///   paths involve UTF-8 decodable text (and therefore have a meaningful textual diff).
+    public func summary(comparedTo other: Snapshot?) -> History.Checkpoint.Summary {
+        let currentNodes = Self.flattenNodes(entry, rootPath: rootPath)
+        let previousNodes = other.map { Self.flattenNodes($0.entry, rootPath: $0.rootPath) } ?? [:]
         let allPaths = Set(currentNodes.keys).union(previousNodes.keys).sorted()
         let changedPaths = allPaths.filter { currentNodes[$0] != previousNodes[$0] }
-        let hasTextDiffs = changedPaths.contains { hasTextualChange(old: previousNodes[$0], new: currentNodes[$0]) }
+        let hasTextDiffs = changedPaths.contains { Self.hasTextualChange(old: previousNodes[$0], new: currentNodes[$0]) }
 
         return History.Checkpoint.Summary(
             changeCount: changedPaths.count,
@@ -88,10 +140,10 @@ extension Snapshot {
         var symlinkTarget: String?
     }
 
-    private static func flattenNodes(_ entry: Entry) -> [WorkspacePath: FlatNode] {
+    private static func flattenNodes(_ entry: Entry, rootPath: WorkspacePath) -> [WorkspacePath: FlatNode] {
         var nodes: [WorkspacePath: FlatNode] = [:]
         collectNodes(entry, into: &nodes)
-        nodes.removeValue(forKey: .root)
+        nodes.removeValue(forKey: rootPath)
         return nodes
     }
 
@@ -152,19 +204,6 @@ extension Snapshot {
 
     static func restore(_ snapshot: Snapshot, to target: any FileSystem) async throws {
         try await restoreEntry(snapshot.entry, to: target)
-    }
-
-    static func path(of entry: Entry) -> WorkspacePath {
-        switch entry {
-        case let .missing(entry):
-            entry.path
-        case let .file(entry):
-            entry.path
-        case let .directory(entry):
-            entry.path
-        case let .symlink(entry):
-            entry.path
-        }
     }
 
     private static func captureEntry(from target: any FileSystem, at path: WorkspacePath) async throws -> Entry {
@@ -281,14 +320,14 @@ extension Snapshot {
         under parentPath: WorkspacePath,
         on target: any FileSystem
     ) async throws {
-        let expectedNames = Set(expectedChildren.map { path(of: $0).basename })
+        let expectedNames = Set(expectedChildren.map { $0.path.basename })
         let existingEntries = (try? await target.listDirectory(path: parentPath)) ?? []
 
         for entry in existingEntries where !expectedNames.contains(entry.name) {
             try await target.remove(path: parentPath.appending(entry.name), recursive: true)
         }
 
-        for child in expectedChildren.sorted(by: { path(of: $0) < path(of: $1) }) {
+        for child in expectedChildren.sorted(by: { $0.path < $1.path }) {
             try await restoreEntry(child, to: target)
         }
     }

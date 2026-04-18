@@ -41,7 +41,7 @@ struct SnapshotTests {
     func `empty root and missing subtree snapshots restore expected absence`() async throws {
         let source = InMemoryFilesystem()
         let emptyRoot = try await Snapshot.capture(from: source)
-        let emptySummary = Snapshot.summary(comparing: emptyRoot, to: nil)
+        let emptySummary = emptyRoot.summary(comparedTo: nil)
 
         let target = InMemoryFilesystem()
         try await target.writeFile(path: "/stale.txt", data: Data("stale".utf8), append: false)
@@ -75,13 +75,13 @@ struct SnapshotTests {
         let baseSnapshot = try await Snapshot.capture(from: base)
 
         let unchanged = try await Snapshot.capture(from: try await summaryFilesystem(text: "old", binary: Data([0xFF, 0xFE])))
-        let unchangedSummary = Snapshot.summary(comparing: unchanged, to: baseSnapshot)
+        let unchangedSummary = unchanged.summary(comparedTo: baseSnapshot)
 
         let textChanged = try await Snapshot.capture(from: try await summaryFilesystem(text: "new", binary: Data([0xFF, 0xFE])))
-        let textSummary = Snapshot.summary(comparing: textChanged, to: baseSnapshot)
+        let textSummary = textChanged.summary(comparedTo: baseSnapshot)
 
         let binaryChanged = try await Snapshot.capture(from: try await summaryFilesystem(text: "old", binary: Data([0x00, 0xFF])))
-        let binarySummary = Snapshot.summary(comparing: binaryChanged, to: baseSnapshot)
+        let binarySummary = binaryChanged.summary(comparedTo: baseSnapshot)
 
         #expect(unchangedSummary.changeCount == 0)
         #expect(unchangedSummary.touchedPaths.isEmpty)
@@ -94,6 +94,75 @@ struct SnapshotTests {
         #expect(binarySummary.changeCount == 1)
         #expect(binarySummary.touchedPaths == [WorkspacePath("/binary.dat")])
         #expect(binarySummary.hasTextDiffs == false)
+    }
+
+    @Test
+    func `entry path accessor reflects each captured node kind`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.createDirectory(path: "/dir", recursive: true)
+        try await filesystem.writeFile(path: "/dir/note.txt", data: Data("hi".utf8), append: false)
+        try await filesystem.createSymlink(path: "/dir/link", target: "/dir/note.txt")
+
+        let snapshot = try await Snapshot.capture(from: filesystem)
+        guard case let .directory(rootDir) = snapshot.entry else {
+            Issue.record("expected directory root entry")
+            return
+        }
+        guard case let .directory(dir) = rootDir.children.first(where: { $0.path == "/dir" }) ?? .missing(.init(path: .root)) else {
+            Issue.record("expected /dir directory entry")
+            return
+        }
+
+        #expect(snapshot.entry.path == .root)
+        #expect(rootDir.path == .root)
+        #expect(dir.children.map(\.path).sorted() == ["/dir/link", "/dir/note.txt"])
+
+        let missing = try await Snapshot.capture(from: filesystem, at: "/missing")
+        #expect(missing.entry.path == "/missing")
+    }
+
+    @Test
+    func `Workspace capture and restore round trips through the public API`() async throws {
+        let workspace = Workspace(filesystem: InMemoryFilesystem())
+        try await workspace.createDirectory(at: "/notes")
+        try await workspace.writeFile("/notes/a.txt", content: "alpha")
+        try await workspace.writeFile("/notes/b.txt", content: "beta")
+        try await workspace.createDirectory(at: "/empty")
+
+        let snapshot = try await workspace.captureSnapshot()
+
+        try await workspace.writeFile("/notes/a.txt", content: "alpha-updated")
+        try await workspace.removeItem(at: "/notes/b.txt")
+        try await workspace.writeFile("/notes/c.txt", content: "gamma")
+
+        try await workspace.restoreSnapshot(snapshot)
+
+        #expect(try await workspace.readFile("/notes/a.txt") == "alpha")
+        #expect(try await workspace.readFile("/notes/b.txt") == "beta")
+        #expect(!(await workspace.exists("/notes/c.txt")))
+        #expect(await workspace.exists("/empty"))
+    }
+
+    @Test
+    func `subtree snapshot summary excludes the captured root and Codable round-trips`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.createDirectory(path: "/proj/src", recursive: true)
+        try await filesystem.writeFile(path: "/proj/src/main.swift", data: Data("print(\"hi\")".utf8), append: false)
+        try await filesystem.writeFile(path: "/proj/README.md", data: Data("docs".utf8), append: false)
+
+        let baseSubtree = try await Snapshot.capture(from: filesystem, at: "/proj")
+        try await filesystem.writeFile(path: "/proj/src/main.swift", data: Data("print(\"updated\")".utf8), append: false)
+        let updatedSubtree = try await Snapshot.capture(from: filesystem, at: "/proj")
+        let summary = updatedSubtree.summary(comparedTo: baseSubtree)
+
+        let encoded = try JSONEncoder().encode(updatedSubtree)
+        let decoded = try JSONDecoder().decode(Snapshot.self, from: encoded)
+
+        #expect(summary.changeCount == 1)
+        #expect(summary.touchedPaths == [WorkspacePath("/proj/src/main.swift")])
+        #expect(summary.hasTextDiffs == true)
+        #expect(decoded == updatedSubtree)
+        #expect(decoded.rootPath == "/proj")
     }
 
     private func summaryFilesystem(text: String, binary: Data) async throws -> InMemoryFilesystem {

@@ -1,7 +1,16 @@
 import Foundation
 
 extension History {
-    /// A durable checkpoint over a managed workspace or session overlay.
+    /// A labeled, parented moment in workspace history.
+    ///
+    /// A `Checkpoint` is the *event* — when it happened, who created it, what scope it
+    /// belongs to, and a structural summary of what changed. The actual file contents at
+    /// that moment live in a separate ``Snapshot`` artifact, which can be loaded on
+    /// demand via ``History/snapshot(for:)``.
+    ///
+    /// The split mirrors the relationship between a git commit (this type) and a git
+    /// tree (``Snapshot``): commits are cheap to enumerate, trees are loaded only when
+    /// you actually need to inspect or restore the file contents.
     public struct Checkpoint: Sendable, Codable, Equatable {
         /// The checkpoint scope.
         public enum Scope: String, Sendable, Codable {
@@ -19,13 +28,18 @@ extension History {
             public var touchedPaths: [WorkspacePath]
             /// Whether any changed file paths involve UTF-8 decodable text.
             public var hasTextDiffs: Bool
+
+            /// Creates a checkpoint summary.
+            public init(changeCount: Int, touchedPaths: [WorkspacePath], hasTextDiffs: Bool) {
+                self.changeCount = changeCount
+                self.touchedPaths = touchedPaths
+                self.hasTextDiffs = hasTextDiffs
+            }
         }
 
         /// The checkpoint identifier.
         public var id: UUID
-        /// The managed workspace identifier.
-        var workspaceId: UUID
-        /// The session that created or owns the checkpoint when available.
+        /// The session that created or owns the checkpoint when applicable.
         public var sessionId: UUID?
         /// Whether the checkpoint belongs to a session overlay or the shared head.
         public var scope: Scope
@@ -35,14 +49,19 @@ extension History {
         public var createdAt: Date
         /// A summary of what changed relative to the parent checkpoint.
         public var summary: Summary
+        /// The previous checkpoint in the same scope/session, when present.
+        public var parentCheckpointId: UUID?
+        /// The shared checkpoint this checkpoint is based on (the head at session creation).
+        public var baseSharedCheckpointId: UUID?
+        /// The session that originated this checkpoint when it represents a publish.
+        public var originSessionId: UUID?
+        /// The source checkpoint a rollback restored from when applicable.
+        public var rollbackSourceCheckpointId: UUID?
 
-        var parentCheckpointId: UUID?
-        var baseSharedCheckpointId: UUID?
+        var workspaceId: UUID
         var firstMutationSequence: Int?
         var lastMutationSequence: Int?
         var mutationCursor: Int
-        var originSessionId: UUID?
-        var rollbackSourceCheckpointId: UUID?
         var snapshotId: UUID
 
         var inferredEventKind: CheckpointEvent.Kind {
@@ -135,7 +154,7 @@ struct MutationRecord: Sendable, Codable, Equatable {
     }
 }
 
-/// A checkpoint event emitted by `History`.
+/// A checkpoint event emitted by ``History``.
 public struct CheckpointEvent: Sendable, Codable, Equatable {
     /// The event kind.
     public enum Kind: String, Sendable, Codable {
@@ -164,7 +183,7 @@ public struct CheckpointEvent: Sendable, Codable, Equatable {
     }
 }
 
-/// Errors produced by `History` operations.
+/// Errors produced by ``History`` operations.
 public enum HistoryError: Error, CustomStringConvertible, Sendable {
     case sessionNotFound(UUID)
     case checkpointNotFound(UUID)

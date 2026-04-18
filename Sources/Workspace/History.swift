@@ -23,11 +23,11 @@ public actor History {
     }
 
     /// Where to persist checkpoint and snapshot data.
-    public enum Storage {
+    public enum Storage: Sendable {
         /// In-memory storage that does not survive process exit.
         case inMemory
-        /// File-backed JSON storage at the given directory URL.
-        case directory(URL)
+        /// File-backed JSON storage rooted at `url`.
+        case directory(at: URL)
     }
 
     public let workspaceId: UUID
@@ -46,6 +46,11 @@ public actor History {
     private var nextMutationSequence = 1
     private var checkpointWatchers: [UUID: CheckpointWatcher] = [:]
     private var checkpointPollingTask: Task<Void, Never>?
+
+    /// Creates an in-memory history coordinator suitable for tests and ephemeral work.
+    public init() {
+        self.init(filesystem: InMemoryFilesystem(), storage: .inMemory)
+    }
 
     /// Creates a history coordinator over `filesystem`.
     public init(
@@ -93,7 +98,7 @@ public actor History {
         switch storage {
         case .inMemory:
             InMemoryCheckpointStore()
-        case .directory(let url):
+        case .directory(at: let url):
             FileCheckpointStore(rootDirectory: url)
         }
     }
@@ -339,7 +344,7 @@ public actor History {
     }
 
     /// Rolls the shared workspace back to a prior shared checkpoint.
-    public func rollbackShared(to checkpointId: UUID, label: String? = nil) async throws -> Checkpoint {
+    public func rollback(to checkpointId: UUID, label: String? = nil) async throws -> Checkpoint {
         try await ensureLoaded()
         let checkpoint = try checkpointOrThrow(id: checkpointId)
         guard checkpoint.scope == .shared else {
@@ -426,7 +431,7 @@ public actor History {
     }
 
     /// Lists mutation records for the managed workspace.
-    func listMutationRecords(
+    func mutationRecords(
         scope: Checkpoint.Scope? = nil,
         sessionId: UUID? = nil
     ) async throws -> [MutationRecord] {
@@ -448,8 +453,14 @@ public actor History {
         return checkpoints.first(where: { $0.id == id })
     }
 
-    func loadSnapshot(for checkpoint: Checkpoint) async throws -> Snapshot {
-        try await loadSnapshotOrThrow(id: checkpoint.snapshotId)
+    /// Loads the snapshot artifact persisted alongside `checkpoint`.
+    ///
+    /// Use this to inspect prior workspace contents, render diffs against the current
+    /// shared head, or restore the captured tree onto a different ``Workspace`` or
+    /// ``FileSystem`` via ``Snapshot/restore(_:to:)``.
+    public func snapshot(for checkpoint: Checkpoint) async throws -> Snapshot {
+        try await ensureLoaded()
+        return try await loadSnapshotOrThrow(id: checkpoint.snapshotId)
     }
 
     // MARK: - Session write operations (internal, called by Session)
@@ -813,7 +824,7 @@ public actor History {
         } else {
             previousSnapshot = nil
         }
-        let summary = Snapshot.summary(comparing: snapshot, to: previousSnapshot)
+        let summary = snapshot.summary(comparedTo: previousSnapshot)
 
         let previousCursor = parentCheckpoint?.mutationCursor ?? 0
         let currentCursor = latestMutationSequence(scope: scope, sessionId: sessionId)
@@ -1026,8 +1037,8 @@ public actor History {
                 delta.touchedPaths.insert(rhs.path)
             }
 
-            let lhsChildren = Dictionary(uniqueKeysWithValues: lhs.children.map { (Snapshot.path(of: $0).basename, $0) })
-            let rhsChildren = Dictionary(uniqueKeysWithValues: rhs.children.map { (Snapshot.path(of: $0).basename, $0) })
+            let lhsChildren = Dictionary(uniqueKeysWithValues: lhs.children.map { ($0.path.basename, $0) })
+            let rhsChildren = Dictionary(uniqueKeysWithValues: rhs.children.map { ($0.path.basename, $0) })
             let names = Set(lhsChildren.keys).union(rhsChildren.keys).sorted()
 
             for name in names {
@@ -1223,8 +1234,10 @@ extension History {
             try await history.rollbackSession(sessionId: id, to: checkpointId, label: label)
         }
 
-        /// Publishes the current session head into the shared workspace.
-        public func publishHead(label: String? = nil) async throws -> Checkpoint {
+        /// Publishes this session's current state into the shared workspace.
+        ///
+        /// Conflicts with concurrent publishes raise ``HistoryError/publishConflict(sessionId:expectedBaseSharedCheckpointId:actualSharedCheckpointId:)``.
+        public func publish(label: String? = nil) async throws -> Checkpoint {
             try await history.publishSessionHead(sessionId: id, label: label)
         }
 
@@ -1242,8 +1255,8 @@ extension History {
         }
 
         /// Lists mutation records for this session.
-        func listMutationRecords() async throws -> [MutationRecord] {
-            try await history.listMutationRecords(scope: .session, sessionId: id)
+        func mutationRecords() async throws -> [MutationRecord] {
+            try await history.mutationRecords(scope: .session, sessionId: id)
         }
 
         /// Returns the shared checkpoint this session is currently based on.

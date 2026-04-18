@@ -60,7 +60,7 @@ struct HistoryTests {
         try await session.createDirectory(at: "/docs")
 
         let checkpoint = try await session.createCheckpoint(label: "draft")
-        let mutations = try await session.listMutationRecords()
+        let mutations = try await session.mutationRecords()
         let storeCheckpoints = try await history.listCheckpoints(scope: .session, sessionId: session.id)
 
         #expect(checkpoint.scope == .session)
@@ -110,7 +110,7 @@ struct HistoryTests {
         let task = startCheckpointRecording(stream, into: recorder)
         defer { task.cancel() }
 
-        let rollbackCheckpoint = try await history.rollbackShared(to: checkpoint.id, label: "revert")
+        let rollbackCheckpoint = try await history.rollback(to: checkpoint.id, label: "revert")
         let events = try await waitForCheckpointEvents(1, recorder: recorder)
 
         #expect(try await history.shared.readFile("/shared.txt") == "one")
@@ -133,7 +133,7 @@ struct HistoryTests {
 
         let checkpointA = try await sessionA.createCheckpoint(label: "a1")
         let checkpointB = try await sessionB.createCheckpoint(label: "b1")
-        let published = try await sessionA.publishHead(label: "publish a")
+        let published = try await sessionA.publish(label: "publish a")
 
         #expect(checkpointA.scope == .session)
         #expect(checkpointB.scope == .session)
@@ -147,7 +147,7 @@ struct HistoryTests {
         #expect(try await sessionA.baseSharedCheckpointId() == published.id)
 
         do {
-            _ = try await sessionB.publishHead(label: "publish b")
+            _ = try await sessionB.publish(label: "publish b")
             Issue.record("expected publish conflict")
         } catch let error as HistoryError {
             switch error {
@@ -195,17 +195,17 @@ struct HistoryTests {
         let history = History(
             workspaceId: workspaceId,
             filesystem: InMemoryFilesystem(),
-            storage: .directory(root)
+            storage: .directory(at: root)
         )
 
         let session = try await history.createSession()
         try await session.writeFile("/note.txt", content: "hello")
         let checkpoint = try await session.createCheckpoint(label: "draft")
-        let mutation = try #require((try await session.listMutationRecords()).first)
+        let mutation = try #require((try await session.mutationRecords()).first)
         let reloaded = History(
             workspaceId: workspaceId,
             filesystem: InMemoryFilesystem(),
-            storage: .directory(root)
+            storage: .directory(at: root)
         )
 
         let encoder = JSONEncoder()
@@ -222,7 +222,7 @@ struct HistoryTests {
         #expect(decodedMutation == mutation)
         #expect(decodedEvent == CheckpointEvent(kind: .created, checkpoint: checkpoint))
         #expect(try await reloaded.checkpoint(id: checkpoint.id) == checkpoint)
-        #expect(try await reloaded.listMutationRecords() == [mutation])
+        #expect(try await reloaded.mutationRecords() == [mutation])
     }
 
     @Test
@@ -234,7 +234,7 @@ struct HistoryTests {
         let history = History(
             workspaceId: workspaceId,
             filesystem: InMemoryFilesystem(),
-            storage: .directory(root)
+            storage: .directory(at: root)
         )
 
         try await history.writeFile("/note.txt", content: "checkpoint")
@@ -244,17 +244,17 @@ struct HistoryTests {
         let reloaded = History(
             workspaceId: workspaceId,
             filesystem: InMemoryFilesystem(),
-            storage: .directory(root)
+            storage: .directory(at: root)
         )
         let persistedCheckpoint = try #require(try await reloaded.checkpoint(id: checkpoint.id))
-        let snapshot = try await reloaded.loadSnapshot(for: persistedCheckpoint)
+        let snapshot = try await reloaded.snapshot(for: persistedCheckpoint)
         let restored = InMemoryFilesystem()
 
         try await Snapshot.restore(snapshot, to: restored)
 
         #expect(try await history.shared.readFile("/note.txt") == "current")
         #expect(try await restored.readFile(path: "/note.txt") == Data("checkpoint".utf8))
-        #expect(Snapshot.summary(comparing: snapshot, to: nil) == checkpoint.summary)
+        #expect(snapshot.summary(comparedTo: nil) == checkpoint.summary)
     }
 
     @Test
@@ -279,6 +279,108 @@ struct HistoryTests {
         #expect(try await history.shared.readFile("/workspace/file.txt") == "shared")
         #expect(checkpoint.scope == .session)
         #expect(checkpoint.sessionId == session.id)
+    }
+
+    @Test
+    func `convenience History init defaults to in-memory shared workspace`() async throws {
+        let history = History()
+
+        try await history.writeFile("/note.txt", content: "hello")
+        let checkpoint = try await history.createCheckpoint(label: "initial")
+
+        #expect(checkpoint.scope == .shared)
+        #expect(try await history.shared.readFile("/note.txt") == "hello")
+        #expect(try await history.mutationRecords(scope: .shared).map(\.kind) == [.writeFile])
+    }
+
+    @Test
+    func `mutationRecords filters by shared scope and snapshot(for:) loads checkpoint contents`() async throws {
+        let history = History()
+        let session = try await history.createSession()
+        try await session.writeFile("/session.txt", content: "session")
+
+        try await history.writeFile("/shared.txt", content: "shared-1")
+        let checkpoint = try await history.createCheckpoint(label: "shared")
+        try await history.writeFile("/shared.txt", content: "shared-2")
+
+        let sharedMutations = try await history.mutationRecords(scope: .shared)
+        let sessionMutations = try await history.mutationRecords(scope: .session, sessionId: session.id)
+        let snapshot = try await history.snapshot(for: checkpoint)
+
+        #expect(sharedMutations.map(\.kind) == [.writeFile, .writeFile])
+        #expect(sharedMutations.allSatisfy { $0.scope == .shared })
+        #expect(sessionMutations.map(\.kind) == [.writeFile])
+        #expect(sessionMutations.allSatisfy { $0.sessionId == session.id })
+        #expect(snapshot.id == checkpoint.snapshotId)
+
+        let restored = Workspace(filesystem: InMemoryFilesystem())
+        try await restored.restoreSnapshot(snapshot)
+        #expect(try await restored.readFile("/shared.txt") == "shared-1")
+        #expect(!(await restored.exists("/session.txt")))
+    }
+
+    @Test
+    func `rollback throws checkpointNotFound and rejects session checkpoints from shared scope`() async throws {
+        let history = History()
+        try await history.writeFile("/shared.txt", content: "v1")
+        let sharedCheckpoint = try await history.createCheckpoint(label: "shared-v1")
+
+        let session = try await history.createSession()
+        try await session.writeFile("/note.txt", content: "draft")
+        let sessionCheckpoint = try await session.createCheckpoint(label: "session-v1")
+
+        let bogusId = UUID()
+        do {
+            _ = try await history.rollback(to: bogusId)
+            Issue.record("expected checkpointNotFound")
+        } catch let error as HistoryError {
+            guard case let .checkpointNotFound(id) = error else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+            #expect(id == bogusId)
+        }
+
+        do {
+            _ = try await history.rollback(to: sessionCheckpoint.id)
+            Issue.record("expected checkpointScopeMismatch")
+        } catch let error as HistoryError {
+            guard case let .checkpointScopeMismatch(expected, actual) = error else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+            #expect(expected == .shared)
+            #expect(actual == .session)
+        }
+
+        let rolled = try await history.rollback(to: sharedCheckpoint.id)
+        #expect(rolled.rollbackSourceCheckpointId == sharedCheckpoint.id)
+    }
+
+    @Test
+    func `Storage directory(at:) round-trips checkpoints across History instances`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let history = History(
+            workspaceId: workspaceId,
+            filesystem: InMemoryFilesystem(),
+            storage: .directory(at: root)
+        )
+        try await history.writeFile("/state.json", content: "{}")
+        let checkpoint = try await history.createCheckpoint(label: "checkpoint-a")
+
+        let reopened = History(
+            workspaceId: workspaceId,
+            filesystem: InMemoryFilesystem(),
+            storage: .directory(at: root)
+        )
+        let reloaded = try #require(try await reopened.checkpoint(id: checkpoint.id))
+        let snapshot = try await reopened.snapshot(for: reloaded)
+
+        #expect(reloaded == checkpoint)
+        #expect(snapshot.entry.path == .root)
     }
 
     // MARK: - Helpers
