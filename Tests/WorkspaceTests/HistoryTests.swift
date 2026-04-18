@@ -226,6 +226,38 @@ struct HistoryTests {
     }
 
     @Test
+    func `file backed history reloads checkpoint snapshot artifact`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let history = History(
+            workspaceId: workspaceId,
+            filesystem: InMemoryFilesystem(),
+            storage: .directory(root)
+        )
+
+        try await history.writeFile("/note.txt", content: "checkpoint")
+        let checkpoint = try await history.createCheckpoint(label: "saved")
+        try await history.writeFile("/note.txt", content: "current")
+
+        let reloaded = History(
+            workspaceId: workspaceId,
+            filesystem: InMemoryFilesystem(),
+            storage: .directory(root)
+        )
+        let persistedCheckpoint = try #require(try await reloaded.checkpoint(id: checkpoint.id))
+        let snapshot = try await reloaded.loadSnapshot(for: persistedCheckpoint)
+        let restored = InMemoryFilesystem()
+
+        try await Snapshot.restore(snapshot, to: restored)
+
+        #expect(try await history.shared.readFile("/note.txt") == "current")
+        #expect(try await restored.readFile(path: "/note.txt") == Data("checkpoint".utf8))
+        #expect(Snapshot.summary(comparing: snapshot, to: nil) == checkpoint.summary)
+    }
+
+    @Test
     func `session creation and checkpointing work with mounted shared filesystems`() async throws {
         let mountedWorkspace = InMemoryFilesystem()
         try await mountedWorkspace.writeFile(path: "/file.txt", data: Data("shared".utf8), append: false)

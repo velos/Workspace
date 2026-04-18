@@ -240,7 +240,7 @@ public actor Workspace {
             )
         }
 
-        let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
+        let captures = failurePolicy == .rollback ? try await rollbackCaptures(for: touchedPaths) : []
         var failures: [ReplacementResult.Failure] = []
         var appliedIndices: [Int] = []
 
@@ -254,7 +254,7 @@ public actor Workspace {
                 changes[index].status = .failed
                 let failure = ReplacementResult.Failure(path: plannedChange.change.path, message: describe(error))
                 if failurePolicy == .rollback {
-                    try await rollback(snapshots)
+                    try await rollback(captures)
                     for appliedIndex in appliedIndices {
                         changes[appliedIndex].status = .rolledBack
                     }
@@ -331,7 +331,7 @@ public actor Workspace {
             )
         }
 
-        let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
+        let captures = failurePolicy == .rollback ? try await rollbackCaptures(for: touchedPaths) : []
         var failures: [FileEdit.Failure] = []
         var appliedIndices: [Int] = []
 
@@ -349,7 +349,7 @@ public actor Workspace {
                     message: describe(error)
                 )
                 if failurePolicy == .rollback {
-                    try await rollback(snapshots)
+                    try await rollback(captures)
                     for appliedIndex in appliedIndices {
                         setStatus(.rolledBack, for: &executionEntries[appliedIndex])
                     }
@@ -686,13 +686,13 @@ public actor Workspace {
         let planningFilesystem = InMemoryFilesystem()
         let ancestors = Set(paths.flatMap(ancestorPaths(for:))).sorted()
         for ancestor in ancestors {
-            let snapshot = try await shallowSnapshot(path: ancestor, on: filesystem)
-            try await restore(snapshot, on: planningFilesystem)
+            let capture = try await shallowRollbackCapture(path: ancestor, on: filesystem)
+            try await restore(capture, on: planningFilesystem)
         }
 
-        let snapshots = try await snapshotPaths(paths)
-        for snapshot in snapshots {
-            try await restore(snapshot, on: planningFilesystem)
+        let captures = try await rollbackCaptures(for: paths)
+        for capture in captures {
+            try await restore(capture, on: planningFilesystem)
         }
         return planningFilesystem
     }
@@ -990,8 +990,8 @@ public actor Workspace {
         at path: WorkspacePath,
         on target: any FileSystem
     ) async throws -> [ChangeEvent] {
-        let snapshot = try await snapshot(path: path, on: target)
-        return flattenDeletionEvents(from: snapshot)
+        let capture = try await rollbackCapture(path: path, on: target)
+        return flattenDeletionEvents(from: capture)
     }
 
     private func plannedTransferEvents(
@@ -1000,9 +1000,9 @@ public actor Workspace {
         kind: ChangeEvent.Kind,
         on target: any FileSystem
     ) async throws -> [ChangeEvent] {
-        let snapshot = try await snapshot(path: sourcePath, on: target)
+        let capture = try await rollbackCapture(path: sourcePath, on: target)
         return flattenTransferEvents(
-            from: snapshot,
+            from: capture,
             sourceRoot: sourcePath,
             destinationRoot: destinationPath,
             kind: kind
@@ -1023,8 +1023,8 @@ public actor Workspace {
         ]
     }
 
-    private func flattenDeletionEvents(from snapshot: SnapshotEntry) -> [ChangeEvent] {
-        switch snapshot {
+    private func flattenDeletionEvents(from capture: RollbackCapture) -> [ChangeEvent] {
+        switch capture {
         case .missing:
             return []
         case let .file(path, _, _):
@@ -1048,12 +1048,12 @@ public actor Workspace {
     }
 
     private func flattenTransferEvents(
-        from snapshot: SnapshotEntry,
+        from capture: RollbackCapture,
         sourceRoot: WorkspacePath,
         destinationRoot: WorkspacePath,
         kind: ChangeEvent.Kind
     ) -> [ChangeEvent] {
-        switch snapshot {
+        switch capture {
         case .missing:
             return []
         case let .file(path, _, _):
@@ -1282,27 +1282,28 @@ public actor Workspace {
         return String(describing: error)
     }
 
-    private enum SnapshotEntry: Sendable {
+    /// A short-lived capture used only to restore failed batched mutations.
+    private enum RollbackCapture: Sendable {
         case missing(path: WorkspacePath)
         case file(path: WorkspacePath, data: Data, permissions: POSIXPermissions)
-        case directory(path: WorkspacePath, permissions: POSIXPermissions, children: [SnapshotEntry])
+        case directory(path: WorkspacePath, permissions: POSIXPermissions, children: [RollbackCapture])
         case symlink(path: WorkspacePath, target: String, permissions: POSIXPermissions)
     }
 
-    private func snapshotPaths(_ paths: [WorkspacePath]) async throws -> [SnapshotEntry] {
-        try await snapshotPaths(paths, on: filesystem)
+    private func rollbackCaptures(for paths: [WorkspacePath]) async throws -> [RollbackCapture] {
+        try await rollbackCaptures(paths, on: filesystem)
     }
 
-    private func snapshotPaths(
+    private func rollbackCaptures(
         _ paths: [WorkspacePath],
         on target: any FileSystem
-    ) async throws -> [SnapshotEntry] {
+    ) async throws -> [RollbackCapture] {
         try await paths.asyncMap { path in
-            try await self.snapshot(path: path, on: target)
+            try await self.rollbackCapture(path: path, on: target)
         }
     }
 
-    private func shallowSnapshot(path: WorkspacePath, on target: any FileSystem) async throws -> SnapshotEntry {
+    private func shallowRollbackCapture(path: WorkspacePath, on target: any FileSystem) async throws -> RollbackCapture {
         guard await target.exists(path: path) else {
             return .missing(path: path)
         }
@@ -1319,7 +1320,7 @@ public actor Workspace {
         }
     }
 
-    private func snapshot(path: WorkspacePath, on target: any FileSystem) async throws -> SnapshotEntry {
+    private func rollbackCapture(path: WorkspacePath, on target: any FileSystem) async throws -> RollbackCapture {
         guard await target.exists(path: path) else {
             return .missing(path: path)
         }
@@ -1330,7 +1331,7 @@ public actor Workspace {
             let children = try await entries
                 .sorted { $0.name < $1.name }
                 .asyncMap { [self] entry in
-                    try await self.snapshot(path: path.appending(entry.name), on: target)
+                    try await self.rollbackCapture(path: path.appending(entry.name), on: target)
                 }
             return .directory(path: path, permissions: info.permissions, children: children)
         }
@@ -1347,14 +1348,14 @@ public actor Workspace {
         )
     }
 
-    private func rollback(_ snapshots: [SnapshotEntry]) async throws {
-        for snapshot in snapshots.sorted(by: { path(of: $0).string.count < path(of: $1).string.count }) {
-            try await restore(snapshot, on: filesystem)
+    private func rollback(_ captures: [RollbackCapture]) async throws {
+        for capture in captures.sorted(by: { path(of: $0).string.count < path(of: $1).string.count }) {
+            try await restore(capture, on: filesystem)
         }
     }
 
-    private func restore(_ snapshot: SnapshotEntry, on target: any FileSystem) async throws {
-        switch snapshot {
+    private func restore(_ capture: RollbackCapture, on target: any FileSystem) async throws {
+        switch capture {
         case let .missing(path):
             if await target.exists(path: path) {
                 try await target.remove(path: path, recursive: true)
@@ -1389,8 +1390,8 @@ public actor Workspace {
         }
     }
 
-    private func path(of snapshot: SnapshotEntry) -> WorkspacePath {
-        switch snapshot {
+    private func path(of capture: RollbackCapture) -> WorkspacePath {
+        switch capture {
         case let .missing(path),
              let .file(path, _, _),
              let .directory(path, _, _),
