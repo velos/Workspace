@@ -230,4 +230,67 @@ struct MountingTests {
         #expect(try await filesystem.readFile(path: "/root.txt") == MountingTestSupport.data("root"))
         #expect(try await memory.readFile(path: "/note.txt") == MountingTestSupport.data("memo"))
     }
+
+    @Test
+    func `mountable filesystem prefers the longest matching mount prefix`() async throws {
+        let outer = InMemoryFilesystem()
+        let inner = InMemoryFilesystem()
+        try await outer.writeFile(path: "/outer.txt", data: MountingTestSupport.data("outer"), append: false)
+        try await inner.writeFile(path: "/inner.txt", data: MountingTestSupport.data("inner"), append: false)
+
+        let filesystem = MountableFilesystem(
+            base: InMemoryFilesystem(),
+            mounts: [
+                .init(mountPoint: "/mnt", filesystem: outer),
+                .init(mountPoint: "/mnt/deep", filesystem: inner),
+            ]
+        )
+
+        #expect(try await filesystem.readFile(path: "/mnt/outer.txt") == MountingTestSupport.data("outer"))
+        #expect(try await filesystem.readFile(path: "/mnt/deep/inner.txt") == MountingTestSupport.data("inner"))
+    }
+
+    @Test
+    func `mountable filesystem exposes synthetic parents for nested mount points`() async throws {
+        let nested = InMemoryFilesystem()
+        try await nested.writeFile(path: "/leaf.txt", data: MountingTestSupport.data("leaf"), append: false)
+
+        let filesystem = MountableFilesystem(
+            base: InMemoryFilesystem(),
+            mounts: [.init(mountPoint: "/data/repo", filesystem: nested)]
+        )
+
+        #expect(await filesystem.exists(path: "/data"))
+        #expect(await filesystem.exists(path: "/data/repo"))
+
+        let dataInfo = try await filesystem.stat(path: "/data")
+        #expect(dataInfo.kind == .directory)
+        #expect(dataInfo.path == "/data")
+
+        let dataEntries = try await filesystem.listDirectory(path: "/data")
+        #expect(dataEntries.map(\.name) == ["repo"])
+
+        let repoEntries = try await filesystem.listDirectory(path: "/data/repo")
+        #expect(repoEntries.map(\.name) == ["leaf.txt"])
+
+        #expect(try await filesystem.readFile(path: "/data/repo/leaf.txt") == MountingTestSupport.data("leaf"))
+    }
+
+    @Test
+    func `mountable filesystem glob aggregates paths from base and mounts`() async throws {
+        let mounted = InMemoryFilesystem()
+        try await mounted.writeFile(path: "/b.txt", data: MountingTestSupport.data("mb"), append: false)
+
+        let base = InMemoryFilesystem()
+        try await base.writeFile(path: "/a.txt", data: MountingTestSupport.data("ba"), append: false)
+
+        let filesystem = MountableFilesystem(
+            base: base,
+            mounts: [.init(mountPoint: "/m", filesystem: mounted)]
+        )
+
+        let matches = try await filesystem.glob(pattern: "/*.txt", currentDirectory: "/")
+        #expect(matches.contains("/a.txt"))
+        #expect(matches.contains("/m/b.txt"))
+    }
 }

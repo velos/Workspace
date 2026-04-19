@@ -317,6 +317,67 @@ struct FilesystemTests {
         }
     }
 
+    @Test(.tags(.inMemory))
+    func `in-memory filesystem detects symlink cycles when resolving paths`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.createSymlink(path: "/loop", target: "/loop")
+
+        do {
+            _ = try await filesystem.readFile(path: "/loop")
+            Issue.record("expected ELOOP")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(ELOOP))
+        }
+    }
+
+    @Test(.tags(.inMemory))
+    func `in-memory filesystem move no-op when source and destination are identical`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.writeFile(path: "/a.txt", data: Data("x".utf8), append: false)
+        try await filesystem.move(from: "/a.txt", to: "/a.txt")
+        #expect(try await filesystem.readFile(path: "/a.txt") == Data("x".utf8))
+    }
+
+    @Test(.tags(.inMemory))
+    func `in-memory filesystem remove is silent when the path is missing`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.remove(path: "/missing.txt", recursive: false)
+        #expect(!(await filesystem.exists(path: "/missing.txt")))
+    }
+
+    @Test(.tags(.inMemory))
+    func `in-memory filesystem glob returns matching paths sorted`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.createDirectory(path: "/docs", recursive: true)
+        try await filesystem.writeFile(path: "/docs/a.txt", data: Data(), append: false)
+        try await filesystem.writeFile(path: "/docs/b.txt", data: Data(), append: false)
+        try await filesystem.writeFile(path: "/docs/readme.md", data: Data(), append: false)
+
+        let matches = try await filesystem.glob(pattern: "/docs/*.txt", currentDirectory: "/")
+        #expect(matches == ["/docs/a.txt", "/docs/b.txt"])
+    }
+
+    @Test(.tags(.inMemory))
+    func `in-memory filesystem setPermissions updates stat results`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.writeFile(path: "/x.txt", data: Data("y".utf8), append: false)
+
+        try await filesystem.setPermissions(path: "/x.txt", permissions: POSIXPermissions(0o600))
+        let info = try await filesystem.stat(path: "/x.txt")
+        #expect(info.permissions == POSIXPermissions(0o600))
+    }
+
+    @Test(.tags(.inMemory))
+    func `in-memory filesystem stat reports symlink kind for the link path`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.writeFile(path: "/target.txt", data: Data("z".utf8), append: false)
+        try await filesystem.createSymlink(path: "/link.txt", target: "target.txt")
+
+        let info = try await filesystem.stat(path: "/link.txt")
+        #expect(info.kind == .symlink)
+    }
+
     @Test(.tags(.readWrite))
     func `read-write filesystem supports file metadata links globbing and recursive copies`() async throws {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "ReadWriteRoot")

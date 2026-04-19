@@ -44,6 +44,47 @@ private func waitForCheckpointEvents(
     return await recorder.snapshot()
 }
 
+/// Delegates to ``InMemoryCheckpointStore`` but can force ``loadSnapshot`` to return nil for specific ids (exercises ``HistoryError/snapshotNotFound``).
+private actor FlakySnapshotCheckpointStore: CheckpointStore {
+    private let base = InMemoryCheckpointStore()
+    private var snapshotIdsReturningNil: Set<UUID> = []
+
+    func breakLoadingSnapshot(id: UUID) {
+        snapshotIdsReturningNil.insert(id)
+    }
+
+    func saveCheckpoint(_ checkpoint: History.Checkpoint) async throws {
+        try await base.saveCheckpoint(checkpoint)
+    }
+
+    func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> History.Checkpoint? {
+        try await base.loadCheckpoint(id: id, workspaceId: workspaceId)
+    }
+
+    func listCheckpoints(workspaceId: UUID) async throws -> [History.Checkpoint] {
+        try await base.listCheckpoints(workspaceId: workspaceId)
+    }
+
+    func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws {
+        try await base.saveSnapshot(snapshot, workspaceId: workspaceId)
+    }
+
+    func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
+        if snapshotIdsReturningNil.contains(id) {
+            return nil
+        }
+        return try await base.loadSnapshot(id: id, workspaceId: workspaceId)
+    }
+
+    func appendMutation(_ mutation: MutationRecord) async throws {
+        try await base.appendMutation(mutation)
+    }
+
+    func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
+        try await base.listMutationRecords(workspaceId: workspaceId)
+    }
+}
+
 @Suite("History")
 struct HistoryTests {
     @Test
@@ -381,6 +422,451 @@ struct HistoryTests {
 
         #expect(reloaded == checkpoint)
         #expect(snapshot.entry.path == .root)
+    }
+
+    @Test
+    func `shared mutations record append writeData writeJSON and tree operations`() async throws {
+        let history = History(filesystem: InMemoryFilesystem())
+
+        try await history.writeFile("/base.txt", content: "x")
+        try await history.appendFile("/base.txt", content: "y")
+        try await history.writeData(Data([0, 1, 2]), to: "/bin.dat")
+        try await history.writeJSON(["a": 1], to: "/config.json", prettyPrinted: false)
+        try await history.createDirectory(at: "/nested/deep", recursive: true)
+        try await history.writeFile("/nested/deep/a.txt", content: "a")
+        try await history.copyItem(from: "/nested/deep/a.txt", to: "/nested/deep/b.txt")
+        try await history.moveItem(from: "/nested/deep/b.txt", to: "/moved.txt")
+        try await history.removeItem(at: "/nested", recursive: true)
+
+        let kinds = try await history.mutationRecords(scope: .shared).map(\.kind)
+        #expect(
+            kinds == [
+                .writeFile,
+                .appendFile,
+                .writeData,
+                .writeJSON,
+                .createDirectory,
+                .writeFile,
+                .copyItem,
+                .moveItem,
+                .removeItem,
+            ]
+        )
+        #expect(try await history.shared.readFile("/base.txt") == "xy")
+        #expect(try await history.shared.readFile("/moved.txt") == "a")
+    }
+
+    @Test
+    func `shared applyEdits and applyReplacement append mutation records`() async throws {
+        let history = History(filesystem: InMemoryFilesystem())
+
+        let batch = try await history.applyEdits(
+            [
+                .writeFile(path: "/a.txt", content: "line\n"),
+                .writeFile(path: "/b.txt", content: "other\n"),
+            ]
+        )
+        #expect(batch.edits.count == 2)
+
+        try await history.writeFile("/replace.txt", content: "hello old world")
+        let replacement = try await history.applyReplacement(
+            ReplacementRequest(pattern: "*.txt", search: "old", replacement: "new")
+        )
+        #expect(replacement.changes.count == 1)
+
+        let mutations = try await history.mutationRecords(scope: .shared).map(\.kind)
+        #expect(mutations == [.applyEdits, .writeFile, .applyReplacement])
+        #expect(try await history.shared.readFile("/replace.txt") == "hello new world")
+    }
+
+    @Test
+    func `session rollback to shared checkpoint rewires base and rejects other session checkpoints`() async throws {
+        let history = History(filesystem: InMemoryFilesystem())
+        try await history.writeFile("/shared.txt", content: "v1")
+        let sharedCp = try await history.createCheckpoint(label: "shared-head")
+
+        let sessionA = try await history.createSession()
+        let sessionB = try await history.createSession()
+        try await sessionA.writeFile("/a.txt", content: "a")
+        try await sessionB.writeFile("/b.txt", content: "b")
+        let bCheckpoint = try await sessionB.createCheckpoint(label: "b-only")
+
+        let rolled = try await sessionA.rollback(to: sharedCp.id, label: "to-shared")
+        #expect(try await sessionA.baseSharedCheckpointId() == sharedCp.id)
+        #expect(!(await sessionA.workspace.exists("/a.txt")))
+        #expect(rolled.rollbackSourceCheckpointId == sharedCp.id)
+
+        do {
+            _ = try await sessionA.rollback(to: bCheckpoint.id)
+            Issue.record("expected checkpointSessionMismatch")
+        } catch let error as HistoryError {
+            guard case let .checkpointSessionMismatch(checkpointId, expectedSessionId, actualSessionId) = error else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+            #expect(checkpointId == bCheckpoint.id)
+            #expect(expectedSessionId == sessionA.id)
+            #expect(actualSessionId == sessionB.id)
+        }
+    }
+
+    @Test
+    func `watchCheckpointEvents emits created for new shared checkpoints after subscribing`() async throws {
+        let history = History(filesystem: InMemoryFilesystem())
+
+        let recorder = CheckpointEventRecorder()
+        let stream = try await history.watchCheckpointEvents()
+        let task = startCheckpointRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        try await history.writeFile("/tracked.txt", content: "v1")
+        let checkpoint = try await history.createCheckpoint(label: "snap")
+
+        let events = try await waitForCheckpointEvents(1, recorder: recorder)
+        #expect(events.count == 1)
+        #expect(events[0].kind == .created)
+        #expect(events[0].checkpoint.id == checkpoint.id)
+        #expect(events[0].checkpoint.label == "snap")
+    }
+
+    @Test
+    func `watchCheckpointEvents emits published when a session head is published`() async throws {
+        let history = History(filesystem: InMemoryFilesystem())
+        let session = try await history.createSession()
+        try await session.writeFile("/pub.txt", content: "content")
+
+        let recorder = CheckpointEventRecorder()
+        let stream = try await history.watchCheckpointEvents()
+        let task = startCheckpointRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        let published = try await session.publish(label: "out")
+
+        let events = try await waitForCheckpointEvents(1, recorder: recorder)
+        #expect(events.count == 1)
+        #expect(events[0].kind == .published)
+        #expect(events[0].checkpoint.id == published.id)
+        #expect(events[0].checkpoint.originSessionId == session.id)
+    }
+
+    @Test
+    func `publishSessionHead throws sessionNotFound for an unknown session id`() async throws {
+        let history = History()
+        let unknown = UUID()
+        do {
+            _ = try await history.publishSessionHead(sessionId: unknown)
+            Issue.record("expected sessionNotFound")
+        } catch let error as HistoryError {
+            guard case let .sessionNotFound(id) = error else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+            #expect(id == unknown)
+        }
+    }
+
+    @Test
+    func `shared applyEdits with an empty batch does not append a mutation`() async throws {
+        let history = History()
+        try await history.writeFile("/x.txt", content: "x")
+        let before = try await history.mutationRecords(scope: .shared).count
+
+        _ = try await history.applyEdits([])
+
+        let after = try await history.mutationRecords(scope: .shared).count
+        #expect(after == before)
+    }
+
+    @Test
+    func `session applyEdits and applyReplacement record session scoped mutations`() async throws {
+        let history = History()
+        let session = try await history.createSession()
+
+        _ = try await session.applyEdits(
+            [
+                .writeFile(path: "/batch.txt", content: "a\n"),
+            ]
+        )
+        try await session.writeFile("/replace.txt", content: "find me")
+        _ = try await session.applyReplacement(
+            ReplacementRequest(pattern: "*.txt", search: "find", replacement: "found")
+        )
+
+        let kinds = try await history.mutationRecords(scope: .session, sessionId: session.id).map(\.kind)
+        #expect(kinds == [.applyEdits, .writeFile, .applyReplacement])
+        #expect(try await session.workspace.readFile("/replace.txt") == "found me")
+    }
+
+    @Test
+    func `History init with an existing workspace uses it as shared`() async throws {
+        let fs = InMemoryFilesystem()
+        let workspace = Workspace(filesystem: fs)
+        try await workspace.writeFile("/seed.txt", content: "seed")
+
+        let history = History(workspace: workspace)
+
+        #expect(try await history.shared.readFile("/seed.txt") == "seed")
+        try await history.writeFile("/more.txt", content: "more")
+        #expect(try await workspace.readFile("/more.txt") == "more")
+    }
+
+    @Test
+    func `listCheckpoints with scope shared excludes session checkpoints`() async throws {
+        let history = History()
+        try await history.writeFile("/s.txt", content: "s")
+        let sharedCP = try await history.createCheckpoint(label: "shared-only")
+
+        let session = try await history.createSession()
+        try await session.writeFile("/sess.txt", content: "sess")
+        let sessionCP = try await session.createCheckpoint(label: "sess-only")
+
+        let sharedOnly = try await history.listCheckpoints(scope: .shared)
+        let forSession = try await history.listCheckpoints(scope: .session, sessionId: session.id)
+
+        #expect(sharedOnly.contains(where: { $0.id == sharedCP.id }))
+        #expect(sharedOnly.contains(where: { $0.id == sessionCP.id }) == false)
+        #expect(forSession == [sessionCP])
+    }
+
+    @Test
+    func `checkpoint id returns nil when no checkpoint exists`() async throws {
+        let history = History()
+        let missing = try await history.checkpoint(id: UUID())
+        #expect(missing == nil)
+    }
+
+    @Test
+    func `publish with no session edits still creates a published shared checkpoint`() async throws {
+        let history = History()
+        try await history.writeFile("/base.txt", content: "base")
+        let session = try await history.createSession()
+
+        let published = try await session.publish(label: "noop")
+
+        #expect(published.scope == .shared)
+        #expect(published.originSessionId == session.id)
+        #expect(published.inferredEventKind == .published)
+
+        let publishMutations = try await history.mutationRecords(scope: .shared).filter { $0.kind == .publishSessionHead }
+        #expect(publishMutations.isEmpty)
+
+        #expect(try await history.shared.readFile("/base.txt") == "base")
+    }
+
+    @Test
+    func `session writeData and writeJSON append session mutations`() async throws {
+        let history = History()
+        let session = try await history.createSession()
+
+        try await session.writeData(Data([9, 8]), to: "/raw.bin")
+        try await session.writeJSON(["k": true], to: "/cfg.json", prettyPrinted: true)
+
+        let kinds = try await history.mutationRecords(scope: .session, sessionId: session.id).map(\.kind)
+        #expect(kinds == [.writeData, .writeJSON])
+    }
+
+    @Test
+    func `snapshot for checkpoint throws snapshotNotFound when store drops the artifact`() async throws {
+        let store = FlakySnapshotCheckpointStore()
+        let workspace = Workspace(filesystem: InMemoryFilesystem())
+        let history = History(workspace: workspace, store: store)
+
+        try await history.writeFile("/a.txt", content: "a")
+        let checkpoint = try await history.createCheckpoint(label: "has-snapshot")
+
+        await store.breakLoadingSnapshot(id: checkpoint.snapshotId)
+
+        do {
+            _ = try await history.snapshot(for: checkpoint)
+            Issue.record("expected snapshotNotFound")
+        } catch let error as HistoryError {
+            guard case let .snapshotNotFound(id) = error else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+            #expect(id == checkpoint.snapshotId)
+        }
+    }
+
+    @Test
+    func `shared rollback throws snapshotNotFound when snapshot artifact is missing`() async throws {
+        let store = FlakySnapshotCheckpointStore()
+        let history = History(workspace: Workspace(filesystem: InMemoryFilesystem()), store: store)
+
+        try await history.writeFile("/x.txt", content: "x")
+        let checkpoint = try await history.createCheckpoint(label: "v1")
+        try await history.writeFile("/x.txt", content: "y")
+
+        await store.breakLoadingSnapshot(id: checkpoint.snapshotId)
+
+        do {
+            _ = try await history.rollback(to: checkpoint.id)
+            Issue.record("expected snapshotNotFound")
+        } catch let error as HistoryError {
+            guard case let .snapshotNotFound(id) = error else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+            #expect(id == checkpoint.snapshotId)
+        }
+    }
+
+    @Test
+    func `watchCheckpointEvents receives checkpoints created by another History sharing the store`() async throws {
+        let store = InMemoryCheckpointStore()
+        let workspaceId = UUID()
+
+        let observer = History(workspaceId: workspaceId, filesystem: InMemoryFilesystem(), store: store)
+        let producer = History(workspaceId: workspaceId, filesystem: InMemoryFilesystem(), store: store)
+
+        let recorder = CheckpointEventRecorder()
+        let stream = try await observer.watchCheckpointEvents()
+        let task = startCheckpointRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        try await producer.writeFile("/remote.txt", content: "r")
+        let created = try await producer.createCheckpoint(label: "other-instance")
+
+        let events = try await waitForCheckpointEvents(1, recorder: recorder, timeout: .seconds(2))
+        #expect(events.count >= 1)
+        let match = try #require(events.first(where: { $0.checkpoint.id == created.id }))
+        #expect(match.kind == .created)
+    }
+
+    @Test
+    func `session removeItem copyItem and moveItem record session mutations`() async throws {
+        let history = History()
+        let session = try await history.createSession()
+
+        try await session.writeFile("/a.txt", content: "a")
+        try await session.createDirectory(at: "/d", recursive: true)
+        try await session.writeFile("/d/inner.txt", content: "inner")
+        try await session.copyItem(from: "/a.txt", to: "/d/copy.txt")
+        try await session.moveItem(from: "/d/copy.txt", to: "/moved.txt")
+        try await session.removeItem(at: "/moved.txt")
+
+        let kinds = try await history.mutationRecords(scope: .session, sessionId: session.id).map(\.kind)
+        #expect(
+            kinds == [
+                .writeFile,
+                .createDirectory,
+                .writeFile,
+                .copyItem,
+                .moveItem,
+                .removeItem,
+            ]
+        )
+    }
+
+    @Test
+    func `shared writeData to an existing file is unchanged when bytes match`() async throws {
+        let history = History()
+        let data = Data([7, 7, 7])
+
+        try await history.writeData(data, to: "/bin.dat")
+        try await history.writeData(data, to: "/bin.dat")
+
+        let mutations = try await history.mutationRecords(scope: .shared)
+        #expect(mutations.count == 2)
+        #expect(mutations.allSatisfy { $0.kind == .writeData })
+        let effects = mutations.flatMap(\.fileChanges).map(\.effect)
+        #expect(effects == [.created, .unchanged])
+    }
+
+    @Test
+    func `shared writeData targets an existing directory before overwriting with file contents`() async throws {
+        let history = History()
+        try await history.createDirectory(at: "/bucket", recursive: true)
+
+        try await history.writeData(Data("blob".utf8), to: "/bucket")
+
+        let mutation = try #require((try await history.mutationRecords(scope: .shared)).last)
+        #expect(mutation.kind == .writeData)
+        let change = try #require(mutation.fileChanges.first)
+        #expect(change.kind == .directory)
+        #expect(change.effect == .unchanged)
+    }
+
+    @Test
+    func `publish records a publishSessionHead mutation when session replaces a file with a directory`() async throws {
+        let history = History()
+        try await history.writeFile("/shape.txt", content: "was-a-file")
+
+        let session = try await history.createSession()
+        try await session.removeItem(at: "/shape.txt")
+        try await session.createDirectory(at: "/shape.txt", recursive: true)
+        try await session.writeFile("/shape.txt/nested.txt", content: "now-tree")
+
+        _ = try await session.publish(label: "restructure")
+
+        let publishRows = try await history.mutationRecords(scope: .shared).filter { $0.kind == .publishSessionHead }
+        #expect(publishRows.count == 1)
+        #expect(try await history.shared.readFile("/shape.txt/nested.txt") == "now-tree")
+    }
+
+    @Test
+    func `session listCheckpoints includes shared checkpoints and session scoped rows`() async throws {
+        let history = History()
+        try await history.writeFile("/shared-only.txt", content: "s")
+        let sharedCP = try await history.createCheckpoint(label: "on-shared")
+
+        let session = try await history.createSession()
+        try await session.writeFile("/local.txt", content: "l")
+        let sessionCP = try await session.createCheckpoint(label: "on-session")
+
+        let visible = try await session.listCheckpoints()
+        #expect(visible.contains(where: { $0.id == sharedCP.id && $0.scope == .shared }))
+        #expect(visible.contains(where: { $0.id == sessionCP.id && $0.scope == .session }))
+    }
+
+    @Test
+    func `session applyEdits with an empty batch does not append mutations`() async throws {
+        let history = History()
+        let session = try await history.createSession()
+        try await session.writeFile("/z.txt", content: "z")
+
+        let before = try await history.mutationRecords(scope: .session, sessionId: session.id).count
+        _ = try await session.applyEdits([])
+        let after = try await history.mutationRecords(scope: .session, sessionId: session.id).count
+
+        #expect(after == before)
+    }
+
+    @Test
+    func `multiple watchCheckpointEvents subscriptions share one polling loop`() async throws {
+        let history = History(filesystem: InMemoryFilesystem())
+
+        _ = try await history.watchCheckpointEvents()
+        _ = try await history.watchCheckpointEvents()
+
+        try await history.writeFile("/multi-watch.txt", content: "mw")
+        let checkpoint = try await history.createCheckpoint(label: "mw")
+
+        #expect(checkpoint.label == "mw")
+    }
+
+    @Test
+    func `cancelling a checkpoint stream allows a new watch to receive subsequent events`() async throws {
+        let history = History()
+
+        let firstStream = try await history.watchCheckpointEvents()
+        let consumer = Task {
+            for await _ in firstStream {}
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        consumer.cancel()
+        try await Task.sleep(for: .milliseconds(120))
+
+        let recorder = CheckpointEventRecorder()
+        let secondStream = try await history.watchCheckpointEvents()
+        let recording = startCheckpointRecording(secondStream, into: recorder)
+        defer { recording.cancel() }
+
+        try await history.writeFile("/after-resubscribe.txt", content: "ar")
+        let checkpoint = try await history.createCheckpoint(label: "resubscribe")
+
+        let events = try await waitForCheckpointEvents(1, recorder: recorder)
+        #expect(events.contains(where: { $0.checkpoint.id == checkpoint.id && $0.kind == .created }))
     }
 
     // MARK: - Helpers
