@@ -10,7 +10,7 @@ struct CheckpointStoreTests {
         let workspaceA = UUID()
         let workspaceB = UUID()
         let snapshotId = UUID()
-        let summary = History.Checkpoint.Summary(changeCount: 0, touchedPaths: [], hasTextDiffs: false)
+        let summary = Checkpoint.Summary(changeCount: 0, touchedPaths: [], hasTextDiffs: false)
 
         let snapshot = Snapshot(
             id: snapshotId,
@@ -20,15 +20,12 @@ struct CheckpointStoreTests {
             )
         )
 
-        let cpEarly = History.Checkpoint(
+        let cpEarly = Checkpoint(
             id: UUID(),
             workspaceId: workspaceA,
-            sessionId: nil,
-            scope: .shared,
             label: "a",
             createdAt: Date(timeIntervalSince1970: 100),
             parentCheckpointId: nil,
-            baseSharedCheckpointId: nil,
             firstMutationSequence: nil,
             lastMutationSequence: nil,
             mutationCursor: 0,
@@ -36,15 +33,12 @@ struct CheckpointStoreTests {
             summary: summary
         )
 
-        let cpLate = History.Checkpoint(
+        let cpLate = Checkpoint(
             id: UUID(),
             workspaceId: workspaceA,
-            sessionId: nil,
-            scope: .shared,
             label: "b",
             createdAt: Date(timeIntervalSince1970: 200),
             parentCheckpointId: cpEarly.id,
-            baseSharedCheckpointId: nil,
             firstMutationSequence: 1,
             lastMutationSequence: 1,
             mutationCursor: 1,
@@ -70,8 +64,6 @@ struct CheckpointStoreTests {
         let m3 = MutationRecord(
             sequence: 3,
             workspaceId: workspaceA,
-            sessionId: nil,
-            scope: .shared,
             kind: .writeFile,
             touchedPaths: ["/x"],
             fileChanges: []
@@ -79,8 +71,6 @@ struct CheckpointStoreTests {
         let m1 = MutationRecord(
             sequence: 1,
             workspaceId: workspaceA,
-            sessionId: nil,
-            scope: .shared,
             kind: .writeFile,
             touchedPaths: ["/y"],
             fileChanges: []
@@ -103,7 +93,7 @@ struct CheckpointStoreTests {
 
         let workspaceId = UUID()
         let snapshotId = UUID()
-        let summary = History.Checkpoint.Summary(changeCount: 1, touchedPaths: ["/f"], hasTextDiffs: true)
+        let summary = Checkpoint.Summary(changeCount: 1, touchedPaths: ["/f"], hasTextDiffs: true)
 
         let snapshot = Snapshot(
             id: snapshotId,
@@ -113,13 +103,10 @@ struct CheckpointStoreTests {
             )
         )
 
-        let checkpoint = History.Checkpoint(
+        let checkpoint = Checkpoint(
             workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
             label: "disk",
             parentCheckpointId: nil,
-            baseSharedCheckpointId: nil,
             firstMutationSequence: 1,
             lastMutationSequence: 2,
             mutationCursor: 2,
@@ -130,8 +117,6 @@ struct CheckpointStoreTests {
         let mutation = MutationRecord(
             sequence: 1,
             workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
             kind: .writeFile,
             touchedPaths: ["/f"],
             fileChanges: []
@@ -189,17 +174,14 @@ struct CheckpointStoreTests {
         let workspaceId = UUID()
         let sharedId = UUID()
         let snapshotId = UUID()
-        let summary = History.Checkpoint.Summary(changeCount: 0, touchedPaths: [], hasTextDiffs: false)
+        let summary = Checkpoint.Summary(changeCount: 0, touchedPaths: [], hasTextDiffs: false)
 
-        let first = History.Checkpoint(
+        let first = Checkpoint(
             id: sharedId,
             workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
             label: "first",
             createdAt: Date(timeIntervalSince1970: 50),
             parentCheckpointId: nil,
-            baseSharedCheckpointId: nil,
             firstMutationSequence: nil,
             lastMutationSequence: nil,
             mutationCursor: 0,
@@ -232,8 +214,6 @@ struct CheckpointStoreTests {
         let m2 = MutationRecord(
             sequence: 2,
             workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
             kind: .writeFile,
             touchedPaths: ["/b"],
             fileChanges: []
@@ -241,8 +221,6 @@ struct CheckpointStoreTests {
         let m1 = MutationRecord(
             sequence: 1,
             workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
             kind: .writeFile,
             touchedPaths: ["/a"],
             fileChanges: []
@@ -259,8 +237,6 @@ struct CheckpointStoreTests {
         let m3 = MutationRecord(
             sequence: 3,
             workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
             kind: .appendFile,
             touchedPaths: ["/c"],
             fileChanges: []
@@ -279,16 +255,13 @@ struct CheckpointStoreTests {
         let workspaceId = UUID()
         let checkpointId = UUID()
         let snapshotId = UUID()
-        let summary = History.Checkpoint.Summary(changeCount: 0, touchedPaths: [], hasTextDiffs: false)
+        let summary = Checkpoint.Summary(changeCount: 0, touchedPaths: [], hasTextDiffs: false)
 
-        let first = History.Checkpoint(
+        let first = Checkpoint(
             id: checkpointId,
             workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
             label: "v1",
             parentCheckpointId: nil,
-            baseSharedCheckpointId: nil,
             firstMutationSequence: nil,
             lastMutationSequence: nil,
             mutationCursor: 0,
@@ -346,8 +319,6 @@ struct CheckpointStoreTests {
         let appended = MutationRecord(
             sequence: 1,
             workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
             kind: .writeFile,
             touchedPaths: ["/x"],
             fileChanges: []
@@ -378,8 +349,6 @@ struct CheckpointStoreTests {
                         let mutation = MutationRecord(
                             sequence: sequence,
                             workspaceId: workspaceId,
-                            sessionId: nil,
-                            scope: .shared,
                             kind: .writeFile,
                             touchedPaths: [path],
                             fileChanges: []

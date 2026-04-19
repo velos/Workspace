@@ -8,7 +8,7 @@ import Foundation
 ///
 /// Capture and restore snapshots through ``Workspace/captureSnapshot(at:)`` and
 /// ``Workspace/restoreSnapshot(_:)``. To inspect the tree captured by a checkpoint,
-/// use ``History/snapshot(for:)``.
+/// use ``Workspace/snapshot(for:)``.
 public struct Snapshot: Sendable, Codable, Equatable {
     /// A node within a snapshot tree.
     public indirect enum Entry: Sendable, Codable, Equatable {
@@ -122,14 +122,14 @@ extension Snapshot {
     /// - Parameter other: The snapshot to compare against, typically a parent checkpoint.
     /// - Returns: A summary describing how many paths changed and whether any of those
     ///   paths involve UTF-8 decodable text (and therefore have a meaningful textual diff).
-    public func summary(comparedTo other: Snapshot?) -> History.Checkpoint.Summary {
+    public func summary(comparedTo other: Snapshot?) -> Checkpoint.Summary {
         let currentNodes = Self.flattenNodes(entry, rootPath: rootPath)
         let previousNodes = other.map { Self.flattenNodes($0.entry, rootPath: $0.rootPath) } ?? [:]
         let allPaths = Set(currentNodes.keys).union(previousNodes.keys).sorted()
         let changedPaths = allPaths.filter { currentNodes[$0] != previousNodes[$0] }
         let hasTextDiffs = changedPaths.contains { Self.hasTextualChange(old: previousNodes[$0], new: currentNodes[$0]) }
 
-        return History.Checkpoint.Summary(
+        return Checkpoint.Summary(
             changeCount: changedPaths.count,
             touchedPaths: changedPaths,
             hasTextDiffs: hasTextDiffs

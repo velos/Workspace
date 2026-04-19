@@ -2,7 +2,38 @@ import Foundation
 
 /// A high-level API for reading, editing, and summarizing a workspace.
 public actor Workspace {
-    private let filesystem: any FileSystem
+    /// Where to persist checkpoint and snapshot data.
+    public enum Storage: Sendable {
+        /// In-memory storage that does not survive process exit.
+        case inMemory
+        /// File-backed JSON storage rooted at `url`.
+        ///
+        /// Mutation log appends are serialized through a `mutations.lock` sidecar using an advisory lock
+        /// where the OS supports it. Multiple processes should still treat the directory as a single writer
+        /// domain when the underlying filesystem does not honor advisory locks.
+        case directory(at: URL)
+    }
+
+    struct CheckpointWatcher {
+        var deliveredCheckpointIds: Set<UUID>
+        var continuation: AsyncStream<CheckpointEvent>.Continuation
+    }
+
+    public nonisolated let workspaceId: UUID
+
+    let filesystem: any FileSystem
+    let store: any CheckpointStore
+    let baseCheckpointId: UUID?
+
+    var loadTask: Task<Void, Error>?
+    var didLoadStoreState = false
+    var checkpoints: [Checkpoint] = []
+    var mutations: [MutationRecord] = []
+    var headCheckpointId: UUID?
+    var nextMutationSequence = 1
+    var checkpointWatchers: [UUID: CheckpointWatcher] = [:]
+    var checkpointPollingTask: Task<Void, Never>?
+
     private var watchers: [UUID: WatchedChangeStream] = [:]
 
     private struct WatchedChangeStream {
@@ -11,9 +42,44 @@ public actor Workspace {
         var continuation: AsyncStream<ChangeEvent>.Continuation
     }
 
+    /// Creates an in-memory workspace suitable for tests and ephemeral work.
+    public init() {
+        self.init(filesystem: InMemoryFilesystem())
+    }
+
     /// Creates a workspace backed by `filesystem`.
-    public init(filesystem: any FileSystem) {
+    public init(
+        workspaceId: UUID = UUID(),
+        filesystem: any FileSystem,
+        storage: Storage = .inMemory
+    ) {
+        self.init(
+            workspaceId: workspaceId,
+            filesystem: filesystem,
+            store: Self.makeStore(for: storage),
+            baseCheckpointId: nil
+        )
+    }
+
+    init(
+        workspaceId: UUID = UUID(),
+        filesystem: any FileSystem,
+        store: any CheckpointStore,
+        baseCheckpointId: UUID? = nil
+    ) {
+        self.workspaceId = workspaceId
         self.filesystem = filesystem
+        self.store = store
+        self.baseCheckpointId = baseCheckpointId
+    }
+
+    static func makeStore(for storage: Storage) -> any CheckpointStore {
+        switch storage {
+        case .inMemory:
+            InMemoryCheckpointStore()
+        case .directory(at: let url):
+            FileCheckpointStore(rootDirectory: url)
+        }
     }
 
     /// Reads raw file contents from the workspace.
@@ -23,8 +89,13 @@ public actor Workspace {
 
     /// Writes raw file data to the workspace, replacing any existing contents.
     public func writeData(_ data: Data, to path: WorkspacePath) async throws {
-        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
-        try await filesystem.writeFile(path: path, data: data, append: false)
+        try await ensureLoaded()
+        try await performBinaryWrite(data: data, path: path)
+    }
+
+    func untrackedWriteData(_ data: Data, to path: WorkspacePath, append: Bool = false) async throws {
+        let events = try await plannedWriteEvents(path: path, data: data, append: append, on: filesystem)
+        try await filesystem.writeFile(path: path, data: data, append: append)
         emit(events)
     }
 
@@ -39,14 +110,29 @@ public actor Workspace {
 
     /// Writes UTF-8 text to a file, replacing any existing contents.
     public func writeFile(_ path: WorkspacePath, content: String) async throws {
-        let data = Data(content.utf8)
-        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
-        try await filesystem.writeFile(path: path, data: data, append: false)
-        emit(events)
+        try await performDirectEdit(
+            kind: .writeFile,
+            edit: .writeFile(path: path, content: content)
+        ) {
+            try await self.untrackedWriteFile(path, content: content)
+        }
+    }
+
+    func untrackedWriteFile(_ path: WorkspacePath, content: String) async throws {
+        try await untrackedWriteData(Data(content.utf8), to: path, append: false)
     }
 
     /// Appends UTF-8 text to a file.
     public func appendFile(_ path: WorkspacePath, content: String) async throws {
+        try await performDirectEdit(
+            kind: .appendFile,
+            edit: .appendFile(path: path, content: content)
+        ) {
+            try await self.untrackedAppendFile(path, content: content)
+        }
+    }
+
+    func untrackedAppendFile(_ path: WorkspacePath, content: String) async throws {
         let data = Data(content.utf8)
         let events = try await plannedWriteEvents(path: path, data: data, append: true, on: filesystem)
         try await filesystem.writeFile(path: path, data: data, append: true)
@@ -65,15 +151,13 @@ public actor Workspace {
 
     /// Encodes a value as JSON and writes it to a file.
     public func writeJSON<T: Encodable>(_ value: T, to path: WorkspacePath, prettyPrinted: Bool = true) async throws {
-        let encoder = JSONEncoder()
-        if prettyPrinted {
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let content = try encodedJSONString(for: value, prettyPrinted: prettyPrinted)
+        try await performDirectEdit(
+            kind: .writeJSON,
+            edit: .writeFile(path: path, content: content)
+        ) {
+            try await self.untrackedWriteFile(path, content: content)
         }
-        var data = try encoder.encode(value)
-        data.append(Data("\n".utf8))
-        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
-        try await filesystem.writeFile(path: path, data: data, append: false)
-        emit(events)
     }
 
     /// Watches for future changes affecting `path`.
@@ -126,6 +210,15 @@ public actor Workspace {
 
     /// Creates a directory at `path`.
     public func createDirectory(at path: WorkspacePath, recursive: Bool = true) async throws {
+        try await performDirectEdit(
+            kind: .createDirectory,
+            edit: .createDirectory(path: path, recursive: recursive)
+        ) {
+            try await self.untrackedCreateDirectory(at: path, recursive: recursive)
+        }
+    }
+
+    func untrackedCreateDirectory(at path: WorkspacePath, recursive: Bool = true) async throws {
         let events = try await plannedDirectoryCreationEvents(path: path, recursive: recursive, on: filesystem)
         try await filesystem.createDirectory(path: path, recursive: recursive)
         emit(events)
@@ -133,6 +226,15 @@ public actor Workspace {
 
     /// Removes the entry at `path`.
     public func removeItem(at path: WorkspacePath, recursive: Bool = true) async throws {
+        try await performDirectEdit(
+            kind: .removeItem,
+            edit: .delete(path: path, recursive: recursive)
+        ) {
+            try await self.untrackedRemoveItem(at: path, recursive: recursive)
+        }
+    }
+
+    func untrackedRemoveItem(at path: WorkspacePath, recursive: Bool = true) async throws {
         let events = try await plannedDeletionEvents(at: path, on: filesystem)
         try await filesystem.remove(path: path, recursive: recursive)
         emit(events)
@@ -140,6 +242,17 @@ public actor Workspace {
 
     /// Copies an entry from `source` to `destination`.
     public func copyItem(from source: WorkspacePath, to destination: WorkspacePath, recursive: Bool = true)
+        async throws
+    {
+        try await performDirectEdit(
+            kind: .copyItem,
+            edit: .copy(from: source, to: destination, recursive: recursive)
+        ) {
+            try await self.untrackedCopyItem(from: source, to: destination, recursive: recursive)
+        }
+    }
+
+    func untrackedCopyItem(from source: WorkspacePath, to destination: WorkspacePath, recursive: Bool = true)
         async throws
     {
         let events = try await plannedTransferEvents(
@@ -158,6 +271,15 @@ public actor Workspace {
 
     /// Moves or renames an entry from `source` to `destination`.
     public func moveItem(from source: WorkspacePath, to destination: WorkspacePath) async throws {
+        try await performDirectEdit(
+            kind: .moveItem,
+            edit: .move(from: source, to: destination)
+        ) {
+            try await self.untrackedMoveItem(from: source, to: destination)
+        }
+    }
+
+    func untrackedMoveItem(from source: WorkspacePath, to destination: WorkspacePath) async throws {
         let events = try await plannedTransferEvents(
             from: source,
             to: destination,
@@ -194,7 +316,18 @@ public actor Workspace {
     /// Restores `snapshot` onto the workspace, removing any extra entries beneath the
     /// snapshot's root so that the workspace exactly matches the captured tree.
     public func restoreSnapshot(_ snapshot: Snapshot) async throws {
-        try await Snapshot.restore(snapshot, to: filesystem)
+        try await ensureLoaded()
+        let previousSnapshot = try await captureSnapshot()
+        try await untrackedRestore(snapshot)
+        let restoredSnapshot = try await captureSnapshot()
+        let delta = snapshotDelta(from: previousSnapshot.entry, to: restoredSnapshot.entry)
+        let topDiff: TextDiff? = delta.fileChanges.count == 1 ? delta.fileChanges[0].diff : nil
+        try await appendMutation(
+            kind: .restoreSnapshot,
+            touchedPaths: Array(delta.touchedPaths).sorted(),
+            fileChanges: delta.fileChanges,
+            diff: topDiff
+        )
     }
 
     private struct PlannedReplacement {
@@ -226,6 +359,31 @@ public actor Workspace {
     ///   - request: The replacement request to execute.
     ///   - failurePolicy: The behavior to use when a write fails.
     public func applyReplacement(
+        _ request: ReplacementRequest,
+        failurePolicy: MutationFailurePolicy = .rollback
+    ) async throws -> ReplacementResult {
+        try await ensureLoaded()
+        let result = try await untrackedApplyReplacement(request, failurePolicy: failurePolicy)
+        if !result.changes.isEmpty || !result.failures.isEmpty {
+            try await appendMutation(
+                kind: .applyReplacement,
+                touchedPaths: result.touchedPaths,
+                fileChanges: result.changes.map {
+                    FileEdit.FileChange(
+                        path: $0.path,
+                        kind: .file,
+                        effect: .modified,
+                        status: $0.status,
+                        diff: $0.diff
+                    )
+                },
+                diff: result.changes.count == 1 ? result.changes[0].diff : nil
+            )
+        }
+        return result
+    }
+
+    func untrackedApplyReplacement(
         _ request: ReplacementRequest,
         failurePolicy: MutationFailurePolicy = .rollback
     ) async throws -> ReplacementResult {
@@ -317,6 +475,29 @@ public actor Workspace {
     ///   - edits: The edits to execute.
     ///   - failurePolicy: The behavior to use when an edit fails.
     public func applyEdits(
+        _ edits: [FileEdit],
+        failurePolicy: MutationFailurePolicy = .rollback
+    ) async throws -> FileEdit.BatchResult {
+        try await ensureLoaded()
+        let result = try await untrackedApplyEdits(edits, failurePolicy: failurePolicy)
+        if !edits.isEmpty {
+            let topDiff: TextDiff? =
+                if result.edits.count == 1, let single = result.edits.first, single.fileChanges.count == 1 {
+                    single.fileChanges[0].diff
+                } else {
+                    nil
+                }
+            try await appendMutation(
+                kind: .applyEdits,
+                touchedPaths: result.touchedPaths,
+                fileChanges: result.edits.flatMap(\.fileChanges),
+                diff: topDiff
+            )
+        }
+        return result
+    }
+
+    func untrackedApplyEdits(
         _ edits: [FileEdit],
         failurePolicy: MutationFailurePolicy = .rollback
     ) async throws -> FileEdit.BatchResult {
@@ -1253,6 +1434,20 @@ public actor Workspace {
             try await target.createSymlink(path: path, target: symlinkTarget)
             try await target.setPermissions(path: path, permissions: permissions)
         case let .directory(path, permissions, children):
+            if path.isRoot {
+                if await target.exists(path: path) {
+                    let entries = try await target.listDirectory(path: path)
+                    for entry in entries {
+                        try await target.remove(path: path.appending(entry.name), recursive: true)
+                    }
+                }
+                try await target.setPermissions(path: path, permissions: permissions)
+                for child in children {
+                    try await restore(child, on: target)
+                }
+                return
+            }
+
             if await target.exists(path: path) {
                 try await target.remove(path: path, recursive: true)
             }
