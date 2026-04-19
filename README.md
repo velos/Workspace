@@ -38,6 +38,7 @@ Many agent and tooling flows need more than plain disk I/O:
 - `SecurityScopedFilesystem`: security-scoped URL and bookmark-backed access
 - `WorkspacePath`: path normalization and joining helpers
 - `History`: tracks a shared workspace, optional session overlays, checkpoints, snapshots, mutation logs, rollback, and publish flows
+- `WorkspaceReading`: read-only protocol exposed by `History.shared` and `Session.workspace` so writes cannot bypass history tracking through those handles
 - `Snapshot`: durable capture/restore of a subtree (also used by checkpoints)
 - `CheckpointStore`: persist checkpoints and mutations (`InMemoryCheckpointStore`, `FileCheckpointStore`)
 
@@ -124,8 +125,8 @@ try await workspace.writeFile("/notes/todo.txt", content: "ship it")
 `History` wraps a **`shared`** ``Workspace`` (usually your canonical tree) plus optional **`Session`** overlays cloned from the current shared head. Sessions edit in isolation, create **session checkpoints**, optionally **publish** back to shared (with optimistic concurrency when the shared head advances), or **rollback** to prior shared or session checkpoints.
 
 - **Snapshots** store full subtree state; **checkpoints** store labels, scope, lineage, summaries, and point at a snapshot id.
-- Use **`History.writeFile`** / **`Session.writeFile`** / **`applyEdits`** etc. so every change is journaled. Calling **`history.shared.writeFile`** or **`session.workspace.writeFile`** skips mutation recording and checkpoints will stop lining up with the mutation log—only use ``History.shared`` / ``Session.workspace`` for reads unless you deliberately accept that mismatch.
-- **`History.Storage.directory(at:)`** writes JSON under your URL. `mutations.json` updates use an advisory file lock where the OS supports it; coordinating multiple hosts or quirky network disks may still require your own synchronization.
+- **`History.shared`** and **`Session.workspace`** are typed as `any WorkspaceReading`, so write APIs are unreachable through them. Use **`History.writeFile`** / **`Session.writeFile`** / **`applyEdits`** etc. for any change you want journaled, checkpointed, or published.
+- **`History.Storage.directory(at:)`** writes JSON under your URL. Mutation log appends are serialized through a `mutations.lock` sidecar using `flock` where the OS supports it; coordinating multiple hosts or network disks that don't honor `flock` may still require your own synchronization.
 
 Quick outline:
 

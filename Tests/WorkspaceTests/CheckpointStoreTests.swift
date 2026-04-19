@@ -311,6 +311,94 @@ struct CheckpointStoreTests {
         #expect(listed[0].label == "v2")
     }
 
+    @Test
+    func `FileCheckpointStore listMutationRecords returns empty array when no log file exists`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let store = FileCheckpointStore(rootDirectory: root)
+
+        let mutations = try await store.listMutationRecords(workspaceId: workspaceId)
+        #expect(mutations.isEmpty)
+
+        let workspaceRoot = root.appendingPathComponent(workspaceId.uuidString, isDirectory: true)
+        let mutationsFile = workspaceRoot.appendingPathComponent("mutations.json")
+        #expect(!FileManager.default.fileExists(atPath: mutationsFile.path))
+    }
+
+    @Test
+    func `FileCheckpointStore listMutationRecords treats an empty mutations file as no records`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let workspaceRoot = root.appendingPathComponent(workspaceId.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceRoot, withIntermediateDirectories: true)
+        let mutationsFile = workspaceRoot.appendingPathComponent("mutations.json")
+        try Data().write(to: mutationsFile)
+
+        let store = FileCheckpointStore(rootDirectory: root)
+
+        let mutations = try await store.listMutationRecords(workspaceId: workspaceId)
+        #expect(mutations.isEmpty)
+
+        let appended = MutationRecord(
+            sequence: 1,
+            workspaceId: workspaceId,
+            sessionId: nil,
+            scope: .shared,
+            kind: .writeFile,
+            touchedPaths: ["/x"],
+            fileChanges: []
+        )
+        try await store.appendMutation(appended)
+
+        let after = try await store.listMutationRecords(workspaceId: workspaceId)
+        #expect(after == [appended])
+    }
+
+    @Test
+    func `FileCheckpointStore appendMutation serializes concurrent writers without losing records`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let writerCount = 8
+        let perWriter = 25
+        let stores = (0..<writerCount).map { _ in FileCheckpointStore(rootDirectory: root) }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for writerIndex in 0..<writerCount {
+                let store = stores[writerIndex]
+                group.addTask {
+                    for stepIndex in 0..<perWriter {
+                        let sequence = writerIndex * perWriter + stepIndex + 1
+                        let path = WorkspacePath(normalizing: "/w\(writerIndex)/s\(stepIndex)")
+                        let mutation = MutationRecord(
+                            sequence: sequence,
+                            workspaceId: workspaceId,
+                            sessionId: nil,
+                            scope: .shared,
+                            kind: .writeFile,
+                            touchedPaths: [path],
+                            fileChanges: []
+                        )
+                        try await store.appendMutation(mutation)
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let reader = FileCheckpointStore(rootDirectory: root)
+        let mutations = try await reader.listMutationRecords(workspaceId: workspaceId)
+
+        #expect(mutations.count == writerCount * perWriter)
+        let expectedSequences = Array(1...(writerCount * perWriter))
+        #expect(mutations.map(\.sequence) == expectedSequences)
+    }
+
     private func makeTempDirectory() throws -> URL {
         let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         let url = base.appendingPathComponent("CheckpointStoreTests-\(UUID().uuidString)", isDirectory: true)

@@ -36,13 +36,18 @@ public actor History {
 
     public let workspaceId: UUID
 
-    /// The shared workspace backing this history coordinator.
+    /// The shared workspace backing this history coordinator, exposed as a read-only handle.
     ///
-    /// Use this handle for **reads** (``Workspace/readFile``, ``Workspace/exists``, ``Workspace/walkTree``, etc.).
-    /// Writes must go through ``History`` APIs (for example ``writeFile(_:content:)``, ``applyEdits(_:failurePolicy:)``)
-    /// so checkpoints and mutation logs stay consistent. Calling write APIs on ``shared`` directly bypasses history
-    /// tracking and yields state that later checkpoints cannot explain from the mutation log alone.
-    public nonisolated let shared: Workspace
+    /// Reads (``WorkspaceReading/readFile(_:)``, ``WorkspaceReading/exists(_:)``,
+    /// ``WorkspaceReading/walkTree(_:)``, ``WorkspaceReading/captureSnapshot()``, etc.) are always safe.
+    /// All writes must go through ``History`` (for example ``writeFile(_:content:)``,
+    /// ``applyEdits(_:failurePolicy:)``) so checkpoints and mutation logs stay consistent.
+    /// The read-only type prevents accidentally bypassing history tracking through this property.
+    public nonisolated let shared: any WorkspaceReading
+
+    /// Internal full-access view onto the same shared workspace as ``shared``. Used by ``History`` itself for
+    /// tracked write operations and snapshot restore.
+    private nonisolated let sharedWorkspace: Workspace
 
     private let store: any CheckpointStore
 
@@ -67,9 +72,11 @@ public actor History {
         filesystem: any FileSystem,
         storage: Storage = .inMemory
     ) {
+        let workspace = Workspace(filesystem: filesystem)
         self.workspaceId = workspaceId
-        shared = Workspace(filesystem: filesystem)
-        store = Self.makeStore(for: storage)
+        self.sharedWorkspace = workspace
+        self.shared = workspace
+        self.store = Self.makeStore(for: storage)
     }
 
     /// Creates a history coordinator over an existing shared workspace.
@@ -79,8 +86,9 @@ public actor History {
         storage: Storage = .inMemory
     ) {
         self.workspaceId = workspaceId
-        shared = workspace
-        store = Self.makeStore(for: storage)
+        self.sharedWorkspace = workspace
+        self.shared = workspace
+        self.store = Self.makeStore(for: storage)
     }
 
     /// Creates a history coordinator with a custom ``CheckpointStore`` (for example a persistent or remote backend).
@@ -89,8 +97,10 @@ public actor History {
         filesystem: any FileSystem,
         store: any CheckpointStore
     ) {
+        let workspace = Workspace(filesystem: filesystem)
         self.workspaceId = workspaceId
-        shared = Workspace(filesystem: filesystem)
+        self.sharedWorkspace = workspace
+        self.shared = workspace
         self.store = store
     }
 
@@ -101,7 +111,8 @@ public actor History {
         store: any CheckpointStore
     ) {
         self.workspaceId = workspaceId
-        shared = workspace
+        self.sharedWorkspace = workspace
+        self.shared = workspace
         self.store = store
     }
 
@@ -151,7 +162,7 @@ public actor History {
         try await ensureLoaded()
 
         let sessionId = UUID()
-        let snapshot = try await shared.captureSnapshot()
+        let snapshot = try await sharedWorkspace.captureSnapshot()
         let overlay = InMemoryFilesystem()
         let sessionWorkspace = Workspace(filesystem: overlay)
         try await sessionWorkspace.restoreSnapshot(snapshot)
@@ -176,7 +187,7 @@ public actor History {
     public func writeFile(_ path: WorkspacePath, content: String) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: shared,
+            on: sharedWorkspace,
             scope: .shared,
             sessionId: nil,
             kind: .writeFile,
@@ -190,7 +201,7 @@ public actor History {
     public func appendFile(_ path: WorkspacePath, content: String) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: shared,
+            on: sharedWorkspace,
             scope: .shared,
             sessionId: nil,
             kind: .appendFile,
@@ -204,7 +215,7 @@ public actor History {
     public func writeData(_ data: Data, to path: WorkspacePath) async throws {
         try await ensureLoaded()
         try await performBinaryWrite(
-            on: shared,
+            on: sharedWorkspace,
             scope: .shared,
             sessionId: nil,
             data: data,
@@ -221,7 +232,7 @@ public actor History {
         try await ensureLoaded()
         let content = try encodedJSONString(for: value, prettyPrinted: prettyPrinted)
         try await performDirectEdit(
-            on: shared,
+            on: sharedWorkspace,
             scope: .shared,
             sessionId: nil,
             kind: .writeJSON,
@@ -235,7 +246,7 @@ public actor History {
     public func createDirectory(at path: WorkspacePath, recursive: Bool = true) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: shared,
+            on: sharedWorkspace,
             scope: .shared,
             sessionId: nil,
             kind: .createDirectory,
@@ -249,7 +260,7 @@ public actor History {
     public func removeItem(at path: WorkspacePath, recursive: Bool = true) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: shared,
+            on: sharedWorkspace,
             scope: .shared,
             sessionId: nil,
             kind: .removeItem,
@@ -263,7 +274,7 @@ public actor History {
     public func copyItem(from source: WorkspacePath, to destination: WorkspacePath, recursive: Bool = true) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: shared,
+            on: sharedWorkspace,
             scope: .shared,
             sessionId: nil,
             kind: .copyItem,
@@ -277,7 +288,7 @@ public actor History {
     public func moveItem(from source: WorkspacePath, to destination: WorkspacePath) async throws {
         try await ensureLoaded()
         try await performDirectEdit(
-            on: shared,
+            on: sharedWorkspace,
             scope: .shared,
             sessionId: nil,
             kind: .moveItem,
@@ -293,7 +304,7 @@ public actor History {
         failurePolicy: MutationFailurePolicy = .rollback
     ) async throws -> FileEdit.BatchResult {
         try await ensureLoaded()
-        let result = try await shared.applyEdits(edits, failurePolicy: failurePolicy)
+        let result = try await sharedWorkspace.applyEdits(edits, failurePolicy: failurePolicy)
         if !edits.isEmpty {
             let topDiff: TextDiff? =
                 if result.edits.count == 1, let single = result.edits.first, single.fileChanges.count == 1 {
@@ -319,7 +330,7 @@ public actor History {
         failurePolicy: MutationFailurePolicy = .rollback
     ) async throws -> ReplacementResult {
         try await ensureLoaded()
-        let result = try await shared.applyReplacement(request, failurePolicy: failurePolicy)
+        let result = try await sharedWorkspace.applyReplacement(request, failurePolicy: failurePolicy)
         if !result.changes.isEmpty || !result.failures.isEmpty {
             try await appendMutation(
                 kind: .applyReplacement,
@@ -346,7 +357,7 @@ public actor History {
     /// Creates a shared checkpoint.
     public func createCheckpoint(label: String? = nil) async throws -> Checkpoint {
         try await ensureLoaded()
-        let snapshot = try await shared.captureSnapshot()
+        let snapshot = try await sharedWorkspace.captureSnapshot()
         return try await persistCheckpoint(
             snapshot: snapshot,
             scope: .shared,
@@ -368,8 +379,8 @@ public actor History {
             throw HistoryError.checkpointScopeMismatch(expected: .shared, actual: checkpoint.scope)
         }
         let targetSnapshot = try await loadSnapshotOrThrow(id: checkpoint.snapshotId)
-        try await shared.restoreSnapshot(targetSnapshot)
-        let restoredSnapshot = try await shared.captureSnapshot()
+        try await sharedWorkspace.restoreSnapshot(targetSnapshot)
+        let restoredSnapshot = try await sharedWorkspace.captureSnapshot()
         return try await persistCheckpoint(
             snapshot: restoredSnapshot,
             scope: .shared,
@@ -396,11 +407,11 @@ public actor History {
             )
         }
 
-        let previousSharedSnapshot = try await shared.captureSnapshot()
+        let previousSharedSnapshot = try await sharedWorkspace.captureSnapshot()
         let sessionSnapshot = try await session.workspace.captureSnapshot()
         let delta = snapshotDelta(from: previousSharedSnapshot.entry, to: sessionSnapshot.entry)
 
-        try await shared.restoreSnapshot(sessionSnapshot)
+        try await sharedWorkspace.restoreSnapshot(sessionSnapshot)
 
         if delta.hasChanges {
             let topDiff: TextDiff? =
@@ -1225,12 +1236,13 @@ extension History {
         public nonisolated let id: UUID
         public nonisolated let workspaceId: UUID
 
-        /// The session's underlying workspace (an isolated in-memory overlay).
+        /// The session's underlying workspace overlay, exposed as a read-only handle.
         ///
-        /// Use this handle for **reads**. All writes should go through ``Session`` methods such as
-        /// ``writeFile(_:content:)`` or ``applyEdits(_:failurePolicy:)`` so session checkpoints and mutation
-        /// records stay accurate. Writing through ``workspace`` directly skips history tracking.
-        public nonisolated let workspace: Workspace
+        /// Reads are always safe. All writes must go through ``Session`` methods (for example
+        /// ``writeFile(_:content:)`` or ``applyEdits(_:failurePolicy:)``) so session checkpoints and
+        /// mutation records stay accurate. The read-only type prevents accidentally bypassing history
+        /// tracking through this property.
+        public nonisolated let workspace: any WorkspaceReading
 
         private let history: History
 

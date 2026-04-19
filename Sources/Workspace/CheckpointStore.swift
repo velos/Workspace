@@ -67,10 +67,11 @@ public actor InMemoryCheckpointStore: CheckpointStore {
 
 /// A JSON file-backed checkpoint store.
 ///
-/// Mutations are appended to `mutations.json` under an advisory exclusive lock when supported
-/// by the platform (`flock`), so concurrent processes using separate store instances against
-/// the same root are less likely to corrupt that file. Checkpoint and snapshot writes remain
-/// per-artifact atomic replaces; coordinating writers on network filesystems may still require
+/// Mutation log writes (`mutations.json`) are serialized through a persistent sidecar lockfile
+/// (`mutations.lock`) using an advisory exclusive lock when supported by the platform (`flock`),
+/// so concurrent ``FileCheckpointStore`` instances within the same process and across cooperating
+/// processes do not lose appends. Checkpoint and snapshot writes are per-artifact atomic replaces.
+/// Coordinating writers on network filesystems that do not honor `flock` may still require
 /// application-level serialization.
 public actor FileCheckpointStore: CheckpointStore {
     private let rootDirectory: URL
@@ -139,7 +140,8 @@ public actor FileCheckpointStore: CheckpointStore {
     public func appendMutation(_ mutation: MutationRecord) async throws {
         try ensureWorkspaceDirectories(for: mutation.workspaceId)
         let url = mutationsURL(workspaceId: mutation.workspaceId)
-        try Self.withMutationsExclusiveLock(at: url) {
+        let lockURL = mutationsLockURL(workspaceId: mutation.workspaceId)
+        try Self.withMutationsExclusiveLock(at: lockURL) {
             var records = try loadMutations(from: url)
             records.append(mutation)
             try write(records.sorted(by: { $0.sequence < $1.sequence }), to: url)
@@ -151,7 +153,9 @@ public actor FileCheckpointStore: CheckpointStore {
         guard fileManager.fileExists(atPath: url.path) else {
             return []
         }
-        return try Self.withMutationsExclusiveLock(at: url) {
+        try ensureWorkspaceDirectories(for: workspaceId)
+        let lockURL = mutationsLockURL(workspaceId: workspaceId)
+        return try Self.withMutationsExclusiveLock(at: lockURL) {
             try loadMutations(from: url).sorted(by: { $0.sequence < $1.sequence })
         }
     }
@@ -195,6 +199,15 @@ public actor FileCheckpointStore: CheckpointStore {
 
     private func mutationsURL(workspaceId: UUID) -> URL {
         workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.json", isDirectory: false)
+    }
+
+    /// A persistent sidecar lockfile used by ``withMutationsExclusiveLock(at:_:)``.
+    ///
+    /// `mutations.json` itself is atomically replaced on every append, which would invalidate any
+    /// `flock` taken on its file descriptor (the on-disk inode changes at each rename). We therefore
+    /// take the advisory lock on this stable sidecar that nobody renames or unlinks.
+    private func mutationsLockURL(workspaceId: UUID) -> URL {
+        workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.lock", isDirectory: false)
     }
 
     private func write<T: Encodable>(_ value: T, to url: URL) throws {

@@ -898,6 +898,102 @@ struct HistoryTests {
         #expect(events.contains(where: { $0.checkpoint.id == checkpoint.id && $0.kind == .created }))
     }
 
+    @Test
+    func `applyEdits with one batch touching multiple files clears the top-level mutation diff`() async throws {
+        let history = History()
+        try await history.writeFile("/a.txt", content: "alpha\n")
+        try await history.writeFile("/b.txt", content: "bravo\n")
+
+        let beforeCount = try await history.mutationRecords(scope: .shared).count
+
+        let result = try await history.applyEdits([
+            .writeFile(path: "/a.txt", content: "alpha-2\n"),
+            .writeFile(path: "/b.txt", content: "bravo-2\n")
+        ])
+        #expect(result.edits.count == 2)
+
+        let after = try await history.mutationRecords(scope: .shared)
+        #expect(after.count == beforeCount + 1)
+        let mutation = try #require(after.last)
+        #expect(mutation.kind == .applyEdits)
+        #expect(mutation.diff == nil)
+        #expect(mutation.fileChanges.count == 2)
+        #expect(mutation.fileChanges.allSatisfy { $0.diff != nil })
+    }
+
+    @Test
+    func `applyEdits with one batch touching one file keeps the top-level mutation diff`() async throws {
+        let history = History()
+        try await history.writeFile("/only.txt", content: "first\n")
+
+        let result = try await history.applyEdits([
+            .writeFile(path: "/only.txt", content: "second\n")
+        ])
+        #expect(result.edits.count == 1)
+
+        let mutation = try #require((try await history.mutationRecords(scope: .shared)).last)
+        #expect(mutation.kind == .applyEdits)
+        #expect(mutation.fileChanges.count == 1)
+        #expect(mutation.diff != nil)
+        #expect(mutation.diff == mutation.fileChanges[0].diff)
+    }
+
+    @Test
+    func `publishSessionHead emits per-file UTF-8 diffs in the recorded mutation`() async throws {
+        let history = History()
+        try await history.writeFile("/notes.txt", content: "one\n")
+        try await history.writeFile("/keep.txt", content: "keep\n")
+
+        let session = try await history.createSession()
+        try await session.writeFile("/notes.txt", content: "one\ntwo\n")
+        try await session.writeFile("/new.txt", content: "fresh\n")
+
+        _ = try await session.publish(label: "publish-with-diffs")
+
+        let publishMutation = try #require(
+            (try await history.mutationRecords(scope: .shared))
+                .last(where: { $0.kind == .publishSessionHead })
+        )
+
+        let changesByPath = Dictionary(uniqueKeysWithValues: publishMutation.fileChanges.map { ($0.path, $0) })
+        let modified = try #require(changesByPath["/notes.txt"])
+        #expect(modified.effect == .modified)
+        #expect(modified.diff != nil)
+        #expect(modified.diff?.hunks.isEmpty == false)
+
+        let created = try #require(changesByPath["/new.txt"])
+        #expect(created.effect == .created)
+        #expect(created.diff != nil)
+        #expect(created.diff?.hunks.isEmpty == false)
+
+        // Top-level diff is set only when there is exactly one file change in the delta.
+        #expect(publishMutation.diff == nil)
+    }
+
+    @Test
+    func `publishSessionHead emits a delete diff when the session removes a UTF-8 file`() async throws {
+        let history = History()
+        try await history.writeFile("/gone.txt", content: "going-away\n")
+
+        let session = try await history.createSession()
+        try await session.removeItem(at: "/gone.txt")
+
+        _ = try await session.publish(label: "publish-with-deletion")
+
+        let publishMutation = try #require(
+            (try await history.mutationRecords(scope: .shared))
+                .last(where: { $0.kind == .publishSessionHead })
+        )
+        let deleted = try #require(publishMutation.fileChanges.first { $0.path == "/gone.txt" })
+        #expect(deleted.effect == .deleted)
+        #expect(deleted.diff != nil)
+        #expect(deleted.diff?.hunks.isEmpty == false)
+
+        // Single-change delta -> top-level diff equals the only file change's diff.
+        #expect(publishMutation.fileChanges.count == 1)
+        #expect(publishMutation.diff == deleted.diff)
+    }
+
     // MARK: - Helpers
 
     private func makeTempDirectory() throws -> URL {
