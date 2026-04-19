@@ -959,10 +959,30 @@ public actor History {
             return
         }
 
-        for cp in loaded where !checkpoints.contains(where: { $0.id == cp.id }) {
-            checkpoints.append(cp)
+        let newCheckpoints = loaded.filter { cp in
+            !checkpoints.contains(where: { $0.id == cp.id })
         }
-        checkpoints.sort(by: checkpointSort)
+
+        if !newCheckpoints.isEmpty {
+            checkpoints.append(contentsOf: newCheckpoints)
+            checkpoints.sort(by: checkpointSort)
+
+            // Re-derive the shared head from the merged checkpoint set so a
+            // subsequent write on this instance anchors to the latest known
+            // shared checkpoint instead of its stale local head.
+            sharedHeadCheckpointId = checkpoints
+                .filter { $0.scope == .shared }
+                .last?
+                .id
+
+            // Refresh the mutation log and sequence cursor so this instance
+            // does not reuse sequence numbers another writer has already
+            // claimed against the same store.
+            if let refreshedMutations = try? await store.listMutationRecords(workspaceId: workspaceId) {
+                mutations = refreshedMutations.sorted { $0.sequence < $1.sequence }
+                nextMutationSequence = (mutations.map(\.sequence).max() ?? 0) + 1
+            }
+        }
 
         for cp in loaded.sorted(by: checkpointSort) {
             emitCheckpointEvent(CheckpointEvent(kind: cp.inferredEventKind, checkpoint: cp))

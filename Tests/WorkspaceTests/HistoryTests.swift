@@ -734,6 +734,35 @@ struct HistoryTests {
     }
 
     @Test
+    func `observed checkpoints from another instance update the shared head and mutation cursor`() async throws {
+        let store = InMemoryCheckpointStore()
+        let workspaceId = UUID()
+        let sharedFilesystem = InMemoryFilesystem()
+
+        let observer = History(workspaceId: workspaceId, filesystem: sharedFilesystem, store: store)
+        let producer = History(workspaceId: workspaceId, filesystem: sharedFilesystem, store: store)
+
+        let recorder = CheckpointEventRecorder()
+        let stream = try await observer.watchCheckpointEvents()
+        let task = startCheckpointRecording(stream, into: recorder)
+        defer { task.cancel() }
+
+        try await producer.writeFile("/remote.txt", content: "r")
+        let producerCheckpoint = try await producer.createCheckpoint(label: "from-producer")
+
+        _ = try await waitForCheckpointEvents(1, recorder: recorder, timeout: .seconds(2))
+
+        try await observer.writeFile("/observer.txt", content: "o")
+        let observerCheckpoint = try await observer.createCheckpoint(label: "from-observer")
+
+        #expect(observerCheckpoint.parentCheckpointId == producerCheckpoint.id)
+
+        let storedMutations = try await store.listMutationRecords(workspaceId: workspaceId)
+        let sequences = storedMutations.map(\.sequence)
+        #expect(sequences.count == Set(sequences).count)
+    }
+
+    @Test
     func `session removeItem copyItem and moveItem record session mutations`() async throws {
         let history = History()
         let session = try await history.createSession()
