@@ -184,7 +184,7 @@ struct CheckpointStoreTests {
     }
 
     @Test
-    func `InMemoryCheckpointStore loadCheckpoint returns the first saved match when ids collide`() async throws {
+    func `InMemoryCheckpointStore saveCheckpoint overwrites an existing checkpoint id`() async throws {
         let store = InMemoryCheckpointStore()
         let workspaceId = UUID()
         let sharedId = UUID()
@@ -206,30 +206,19 @@ struct CheckpointStoreTests {
             snapshotId: snapshotId,
             summary: summary
         )
-        let second = History.Checkpoint(
-            id: sharedId,
-            workspaceId: workspaceId,
-            sessionId: nil,
-            scope: .shared,
-            label: "second",
-            createdAt: Date(timeIntervalSince1970: 150),
-            parentCheckpointId: nil,
-            baseSharedCheckpointId: nil,
-            firstMutationSequence: nil,
-            lastMutationSequence: nil,
-            mutationCursor: 0,
-            snapshotId: snapshotId,
-            summary: summary
-        )
+        var second = first
+        second.label = "second"
+        second.createdAt = Date(timeIntervalSince1970: 150)
 
         try await store.saveCheckpoint(first)
         try await store.saveCheckpoint(second)
 
         let loaded = try await store.loadCheckpoint(id: sharedId, workspaceId: workspaceId)
-        #expect(loaded == first)
+        #expect(loaded == second)
 
         let listed = try await store.listCheckpoints(workspaceId: workspaceId)
-        #expect(listed.count == 2)
+        #expect(listed.count == 1)
+        #expect(listed[0].label == "second")
     }
 
     @Test

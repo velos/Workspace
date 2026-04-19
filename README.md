@@ -37,6 +37,9 @@ Many agent and tooling flows need more than plain disk I/O:
 - `SandboxFilesystem`: convenience wrapper for app sandbox roots
 - `SecurityScopedFilesystem`: security-scoped URL and bookmark-backed access
 - `WorkspacePath`: path normalization and joining helpers
+- `History`: tracks a shared workspace, optional session overlays, checkpoints, snapshots, mutation logs, rollback, and publish flows
+- `Snapshot`: durable capture/restore of a subtree (also used by checkpoints)
+- `CheckpointStore`: persist checkpoints and mutations (`InMemoryCheckpointStore`, `FileCheckpointStore`)
 
 ## Installation
 
@@ -115,6 +118,41 @@ Task {
 
 try await workspace.writeFile("/notes/todo.txt", content: "ship it")
 ```
+
+## History & checkpoints
+
+`History` wraps a **`shared`** ``Workspace`` (usually your canonical tree) plus optional **`Session`** overlays cloned from the current shared head. Sessions edit in isolation, create **session checkpoints**, optionally **publish** back to shared (with optimistic concurrency when the shared head advances), or **rollback** to prior shared or session checkpoints.
+
+- **Snapshots** store full subtree state; **checkpoints** store labels, scope, lineage, summaries, and point at a snapshot id.
+- Use **`History.writeFile`** / **`Session.writeFile`** / **`applyEdits`** etc. so every change is journaled. Calling **`history.shared.writeFile`** or **`session.workspace.writeFile`** skips mutation recording and checkpoints will stop lining up with the mutation log—only use ``History.shared`` / ``Session.workspace`` for reads unless you deliberately accept that mismatch.
+- **`History.Storage.directory(at:)`** writes JSON under your URL. `mutations.json` updates use an advisory file lock where the OS supports it; coordinating multiple hosts or quirky network disks may still require your own synchronization.
+
+Quick outline:
+
+```swift
+import Foundation
+import Workspace
+
+let history = History(filesystem: InMemoryFilesystem())
+
+try await history.writeFile("/readme.txt", content: "hello")
+let sharedCP = try await history.createCheckpoint(label: "before agent")
+
+let session = try await history.createSession()
+try await session.writeFile("/draft.txt", content: "wip")
+try await session.createCheckpoint(label: "scratch")
+
+try await session.publish(label: "landed")
+
+let diskRoot = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("workspace-history")
+let persisted = History(
+    workspaceId: history.workspaceId,
+    filesystem: InMemoryFilesystem(),
+    storage: .directory(at: diskRoot)
+)
+```
+
+Implement a custom **`CheckpointStore`** for non-file backends using the **`History(workspaceId:filesystem:store:)`** initializer.
 
 ## Common Patterns
 

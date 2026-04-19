@@ -116,6 +116,9 @@ extension Snapshot {
     ///
     /// Pass `nil` to summarize this snapshot as if every entry were newly created.
     ///
+    /// This walks every node under the snapshot root twice (current and prior trees). For very large trees,
+    /// prefer caching summaries at checkpoint creation time rather than recomputing on hot paths.
+    ///
     /// - Parameter other: The snapshot to compare against, typically a parent checkpoint.
     /// - Returns: A summary describing how many paths changed and whether any of those
     ///   paths involve UTF-8 decodable text (and therefore have a meaningful textual diff).

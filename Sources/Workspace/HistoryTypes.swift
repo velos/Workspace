@@ -106,8 +106,10 @@ extension History {
     }
 }
 
-struct MutationRecord: Sendable, Codable, Equatable {
-    enum Kind: String, Sendable, Codable {
+/// A recorded filesystem mutation emitted by ``History``.
+public struct MutationRecord: Sendable, Codable, Equatable {
+    /// The coarse operation kind for filtering and tooling.
+    public enum Kind: String, Sendable, Codable {
         case writeFile
         case appendFile
         case writeData
@@ -121,17 +123,18 @@ struct MutationRecord: Sendable, Codable, Equatable {
         case publishSessionHead
     }
 
-    var sequence: Int
-    var workspaceId: UUID
-    var sessionId: UUID?
-    var scope: History.Checkpoint.Scope
-    var timestamp: Date
-    var kind: Kind
-    var touchedPaths: [WorkspacePath]
-    var fileChanges: [FileEdit.FileChange]
-    var diff: TextDiff?
+    public var sequence: Int
+    public var workspaceId: UUID
+    public var sessionId: UUID?
+    public var scope: History.Checkpoint.Scope
+    public var timestamp: Date
+    public var kind: Kind
+    public var touchedPaths: [WorkspacePath]
+    public var fileChanges: [FileEdit.FileChange]
+    public var diff: TextDiff?
 
-    init(
+    /// Creates a mutation record (primarily for tests and custom ``CheckpointStore`` implementations).
+    public init(
         sequence: Int,
         workspaceId: UUID,
         sessionId: UUID?,

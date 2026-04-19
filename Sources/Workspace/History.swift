@@ -27,17 +27,26 @@ public actor History {
         /// In-memory storage that does not survive process exit.
         case inMemory
         /// File-backed JSON storage rooted at `url`.
+        ///
+        /// ``FileCheckpointStore`` uses per-file atomic writes and locks `mutations.json` while mutating it
+        /// on Darwin and Linux. Multiple processes should still treat the directory as a single writer domain;
+        /// some network filesystems may not honor advisory locks.
         case directory(at: URL)
     }
 
     public let workspaceId: UUID
 
     /// The shared workspace backing this history coordinator.
-    /// Use this for all read operations (readFile, exists, walkTree, etc.).
+    ///
+    /// Use this handle for **reads** (``Workspace/readFile``, ``Workspace/exists``, ``Workspace/walkTree``, etc.).
+    /// Writes must go through ``History`` APIs (for example ``writeFile(_:content:)``, ``applyEdits(_:failurePolicy:)``)
+    /// so checkpoints and mutation logs stay consistent. Calling write APIs on ``shared`` directly bypasses history
+    /// tracking and yields state that later checkpoints cannot explain from the mutation log alone.
     public nonisolated let shared: Workspace
 
     private let store: any CheckpointStore
 
+    private var loadTask: Task<Void, Error>?
     private var didLoadStoreState = false
     private var sessions: [UUID: SessionState] = [:]
     private var checkpoints: [Checkpoint] = []
@@ -74,7 +83,8 @@ public actor History {
         store = Self.makeStore(for: storage)
     }
 
-    init(
+    /// Creates a history coordinator with a custom ``CheckpointStore`` (for example a persistent or remote backend).
+    public init(
         workspaceId: UUID = UUID(),
         filesystem: any FileSystem,
         store: any CheckpointStore
@@ -84,7 +94,8 @@ public actor History {
         self.store = store
     }
 
-    init(
+    /// Creates a history coordinator over an existing shared workspace and custom ``CheckpointStore``.
+    public init(
         workspaceId: UUID = UUID(),
         workspace: Workspace,
         store: any CheckpointStore
@@ -284,13 +295,19 @@ public actor History {
         try await ensureLoaded()
         let result = try await shared.applyEdits(edits, failurePolicy: failurePolicy)
         if !edits.isEmpty {
+            let topDiff: TextDiff? =
+                if result.edits.count == 1, let single = result.edits.first, single.fileChanges.count == 1 {
+                    single.fileChanges[0].diff
+                } else {
+                    nil
+                }
             try await appendMutation(
                 kind: .applyEdits,
                 scope: .shared,
                 sessionId: nil,
                 touchedPaths: result.touchedPaths,
                 fileChanges: result.edits.flatMap(\.fileChanges),
-                diff: result.edits.count == 1 ? result.edits[0].fileChanges.first?.diff : nil
+                diff: topDiff
             )
         }
         return result
@@ -386,13 +403,15 @@ public actor History {
         try await shared.restoreSnapshot(sessionSnapshot)
 
         if delta.hasChanges {
+            let topDiff: TextDiff? =
+                if delta.fileChanges.count == 1 { delta.fileChanges[0].diff } else { nil }
             try await appendMutation(
                 kind: .publishSessionHead,
                 scope: .shared,
                 sessionId: sessionId,
                 touchedPaths: Array(delta.touchedPaths).sorted(),
                 fileChanges: delta.fileChanges,
-                diff: nil
+                diff: topDiff
             )
         }
 
@@ -571,13 +590,19 @@ public actor History {
         let workspace = try sessionState(for: sessionId).workspace
         let result = try await workspace.applyEdits(edits, failurePolicy: failurePolicy)
         if !edits.isEmpty {
+            let topDiff: TextDiff? =
+                if result.edits.count == 1, let single = result.edits.first, single.fileChanges.count == 1 {
+                    single.fileChanges[0].diff
+                } else {
+                    nil
+                }
             try await appendMutation(
                 kind: .applyEdits,
                 scope: .session,
                 sessionId: sessionId,
                 touchedPaths: result.touchedPaths,
                 fileChanges: result.edits.flatMap(\.fileChanges),
-                diff: result.edits.count == 1 ? result.edits[0].fileChanges.first?.diff : nil
+                diff: topDiff
             )
         }
         return result
@@ -684,13 +709,30 @@ public actor History {
     // MARK: - Private
 
     private func ensureLoaded() async throws {
-        guard !didLoadStoreState else {
+        if didLoadStoreState {
             return
         }
+        if let loadTask {
+            try await loadTask.value
+            return
+        }
+        let task = Task<Void, Error> {
+            try await self.loadStoreState()
+        }
+        loadTask = task
+        do {
+            try await task.value
+            loadTask = nil
+        } catch {
+            loadTask = nil
+            throw error
+        }
+    }
 
+    private func loadStoreState() async throws {
         checkpoints = try await store.listCheckpoints(workspaceId: workspaceId)
         mutations = try await store.listMutationRecords(workspaceId: workspaceId)
-        nextMutationSequence = (mutations.map(\.sequence).max() ?? 0) + 1
+        nextMutationSequence = (mutations.last?.sequence ?? 0) + 1
         sharedHeadCheckpointId = checkpoints
             .filter { $0.scope == .shared }
             .sorted(by: checkpointSort)
@@ -916,7 +958,7 @@ public actor History {
         var data = try encoder.encode(value)
         data.append(Data("\n".utf8))
         guard let string = String(data: data, encoding: .utf8) else {
-            throw WorkspaceError.invalidEncoding(.root)
+            throw HistoryError.mutationFailed("encoded JSON is not valid UTF-8")
         }
         return string
     }
@@ -980,11 +1022,11 @@ public actor History {
             // claimed against the same store.
             if let refreshedMutations = try? await store.listMutationRecords(workspaceId: workspaceId) {
                 mutations = refreshedMutations.sorted { $0.sequence < $1.sequence }
-                nextMutationSequence = (mutations.map(\.sequence).max() ?? 0) + 1
+                nextMutationSequence = (mutations.last?.sequence ?? 0) + 1
             }
         }
 
-        for cp in loaded.sorted(by: checkpointSort) {
+        for cp in newCheckpoints.sorted(by: checkpointSort) {
             emitCheckpointEvent(CheckpointEvent(kind: cp.inferredEventKind, checkpoint: cp))
         }
     }
@@ -1006,6 +1048,16 @@ public actor History {
     }
 
     // MARK: - Snapshot delta
+
+    private func utf8TextFileDiff(oldData: Data, newData: Data) -> TextDiff? {
+        guard let oldStr = String(data: oldData, encoding: .utf8),
+              let newStr = String(data: newData, encoding: .utf8)
+        else {
+            return nil
+        }
+        let diff = TextDiff.lineBased(from: oldStr, to: newStr)
+        return diff.hunks.isEmpty ? nil : diff
+    }
 
     private func snapshotDelta(from original: Snapshot.Entry, to updated: Snapshot.Entry) -> SnapshotDelta {
         var delta = SnapshotDelta()
@@ -1029,13 +1081,14 @@ public actor History {
         case let (.file(lhs), .file(rhs)):
             if lhs.data != rhs.data || lhs.permissions != rhs.permissions {
                 delta.touchedPaths.insert(rhs.path)
+                let diff = lhs.data != rhs.data ? utf8TextFileDiff(oldData: lhs.data, newData: rhs.data) : nil
                 delta.fileChanges.append(
                     FileEdit.FileChange(
                         path: rhs.path,
                         kind: .file,
                         effect: .modified,
                         status: .applied,
-                        diff: nil
+                        diff: diff
                     )
                 )
             }
@@ -1053,6 +1106,8 @@ public actor History {
                 )
             }
         case let (.directory(lhs), .directory(rhs)):
+            // Permission-only directory updates are surfaced via `touchedPaths` (and thus checkpoint summaries)
+            // but do not emit a leaf `FileChange`, matching how directory nodes are not individual files.
             if lhs.permissions != rhs.permissions {
                 delta.touchedPaths.insert(rhs.path)
             }
@@ -1091,7 +1146,7 @@ public actor History {
                     kind: .file,
                     effect: .created,
                     status: .applied,
-                    diff: nil
+                    diff: utf8TextFileDiff(oldData: Data(), newData: entry.data)
                 )
             )
         case let .directory(entry):
@@ -1125,7 +1180,7 @@ public actor History {
                     kind: .file,
                     effect: .deleted,
                     status: .applied,
-                    diff: nil
+                    diff: utf8TextFileDiff(oldData: entry.data, newData: Data())
                 )
             )
         case let .directory(entry):
@@ -1170,9 +1225,11 @@ extension History {
         public nonisolated let id: UUID
         public nonisolated let workspaceId: UUID
 
-        /// The session's underlying workspace.
-        /// Use this for all read operations (readFile, exists, walkTree, etc.).
-        /// Use Session's write methods for tracked mutations.
+        /// The session's underlying workspace (an isolated in-memory overlay).
+        ///
+        /// Use this handle for **reads**. All writes should go through ``Session`` methods such as
+        /// ``writeFile(_:content:)`` or ``applyEdits(_:failurePolicy:)`` so session checkpoints and mutation
+        /// records stay accurate. Writing through ``workspace`` directly skips history tracking.
         public nonisolated let workspace: Workspace
 
         private let history: History

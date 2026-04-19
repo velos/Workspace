@@ -209,11 +209,6 @@ public actor Workspace {
         var changeEvents: [ChangeEvent]
     }
 
-    private struct DiffToken: Hashable {
-        var text: String
-        var hasTrailingNewline: Bool
-    }
-
     /// Returns a preview of a replacement request without mutating the workspace.
     public func previewReplacement(_ request: ReplacementRequest) async throws -> ReplacementResult {
         let changes = try await plannedReplacementChanges(for: request).map(\.change)
@@ -1151,136 +1146,7 @@ public actor Workspace {
     }
 
     private func textDiff(from originalContent: String, to updatedContent: String) -> TextDiff {
-        let originalLines = diffTokens(in: originalContent)
-        let updatedLines = diffTokens(in: updatedContent)
-        let changes = Array(updatedLines.difference(from: originalLines))
-
-        let removals = Dictionary(grouping: changes.compactMap { change in
-            if case let .remove(offset, element, _) = change {
-                return (offset, element)
-            }
-            return nil
-        }, by: \.0)
-
-        let insertions = Dictionary(grouping: changes.compactMap { change in
-            if case let .insert(offset, element, _) = change {
-                return (offset, element)
-            }
-            return nil
-        }, by: \.0)
-
-        var lines: [TextDiff.Line] = []
-        var originalIndex = 0
-        var updatedIndex = 0
-        var originalLineNumber = 1
-        var updatedLineNumber = 1
-
-        while originalIndex < originalLines.count || updatedIndex < updatedLines.count {
-            if let removed = removals[originalIndex] {
-                for (_, token) in removed {
-                    lines.append(
-                        TextDiff.Line(
-                            kind: .removed,
-                            text: token.text,
-                            hasTrailingNewline: token.hasTrailingNewline,
-                            oldLineNumber: originalLineNumber
-                        )
-                    )
-                    originalIndex += 1
-                    originalLineNumber += 1
-                }
-                continue
-            }
-
-            if let inserted = insertions[updatedIndex] {
-                for (_, token) in inserted {
-                    lines.append(
-                        TextDiff.Line(
-                            kind: .added,
-                            text: token.text,
-                            hasTrailingNewline: token.hasTrailingNewline,
-                            newLineNumber: updatedLineNumber
-                        )
-                    )
-                    updatedIndex += 1
-                    updatedLineNumber += 1
-                }
-                continue
-            }
-
-            guard originalIndex < originalLines.count, updatedIndex < updatedLines.count else {
-                break
-            }
-
-            let updatedLine = updatedLines[updatedIndex]
-            lines.append(
-                TextDiff.Line(
-                    kind: .context,
-                    text: updatedLine.text,
-                    hasTrailingNewline: updatedLine.hasTrailingNewline,
-                    oldLineNumber: originalLineNumber,
-                    newLineNumber: updatedLineNumber
-                )
-            )
-            originalIndex += 1
-            updatedIndex += 1
-            originalLineNumber += 1
-            updatedLineNumber += 1
-        }
-
-        let changedIndices = lines.indices.filter { lines[$0].kind != .context }
-        guard !changedIndices.isEmpty else {
-            return TextDiff(hunks: [])
-        }
-
-        var ranges: [Range<Int>] = []
-        for index in changedIndices {
-            let lowerBound = max(0, index - 3)
-            let upperBound = min(lines.count, index + 4)
-            if let last = ranges.last, lowerBound <= last.upperBound {
-                ranges[ranges.count - 1] = last.lowerBound..<max(last.upperBound, upperBound)
-            } else {
-                ranges.append(lowerBound..<upperBound)
-            }
-        }
-
-        let hunks = ranges.map { range in
-            let hunkLines = Array(lines[range])
-            let originalLineNumbers = hunkLines.compactMap(\.oldLineNumber)
-            let updatedLineNumbers = hunkLines.compactMap(\.newLineNumber)
-            return TextDiff.Hunk(
-                oldStartLine: originalLineNumbers.first ?? 1,
-                oldLineCount: originalLineNumbers.count,
-                newStartLine: updatedLineNumbers.first ?? 1,
-                newLineCount: updatedLineNumbers.count,
-                lines: hunkLines
-            )
-        }
-
-        return TextDiff(hunks: hunks)
-    }
-
-    private func diffTokens(in text: String) -> [DiffToken] {
-        guard !text.isEmpty else {
-            return []
-        }
-
-        var tokens: [DiffToken] = []
-        var current = ""
-        for character in text {
-            if character == "\n" {
-                tokens.append(DiffToken(text: current, hasTrailingNewline: true))
-                current.removeAll(keepingCapacity: true)
-            } else {
-                current.append(character)
-            }
-        }
-
-        if !current.isEmpty || text.last != "\n" {
-            tokens.append(DiffToken(text: current, hasTrailingNewline: false))
-        }
-
-        return tokens
+        TextDiff.lineBased(from: originalContent, to: updatedContent)
     }
 
     private func describe(_ error: any Error) -> String {

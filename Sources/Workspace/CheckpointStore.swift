@@ -1,7 +1,13 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Persistence for workspace checkpoints, snapshots, and mutation logs.
-protocol CheckpointStore: AnyObject, Sendable {
+public protocol CheckpointStore: AnyObject, Sendable {
     func saveCheckpoint(_ checkpoint: History.Checkpoint) async throws
     func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> History.Checkpoint?
     func listCheckpoints(workspaceId: UUID) async throws -> [History.Checkpoint]
@@ -12,20 +18,28 @@ protocol CheckpointStore: AnyObject, Sendable {
 }
 
 /// An in-memory checkpoint store for tests and ephemeral sessions.
-actor InMemoryCheckpointStore: CheckpointStore {
+public actor InMemoryCheckpointStore: CheckpointStore {
     private var checkpointsByWorkspace: [UUID: [History.Checkpoint]] = [:]
     private var snapshotsByWorkspace: [UUID: [UUID: Snapshot]] = [:]
     private var mutationsByWorkspace: [UUID: [MutationRecord]] = [:]
 
-    func saveCheckpoint(_ checkpoint: History.Checkpoint) async throws {
-        checkpointsByWorkspace[checkpoint.workspaceId, default: []].append(checkpoint)
+    public init() {}
+
+    public func saveCheckpoint(_ checkpoint: History.Checkpoint) async throws {
+        var list = checkpointsByWorkspace[checkpoint.workspaceId] ?? []
+        if let index = list.firstIndex(where: { $0.id == checkpoint.id }) {
+            list[index] = checkpoint
+        } else {
+            list.append(checkpoint)
+        }
+        checkpointsByWorkspace[checkpoint.workspaceId] = list
     }
 
-    func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> History.Checkpoint? {
+    public func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> History.Checkpoint? {
         checkpointsByWorkspace[workspaceId]?.first { $0.id == id }
     }
 
-    func listCheckpoints(workspaceId: UUID) async throws -> [History.Checkpoint] {
+    public func listCheckpoints(workspaceId: UUID) async throws -> [History.Checkpoint] {
         (checkpointsByWorkspace[workspaceId] ?? []).sorted {
             if $0.createdAt == $1.createdAt {
                 return $0.id.uuidString < $1.id.uuidString
@@ -34,31 +48,37 @@ actor InMemoryCheckpointStore: CheckpointStore {
         }
     }
 
-    func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws {
+    public func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws {
         snapshotsByWorkspace[workspaceId, default: [:]][snapshot.id] = snapshot
     }
 
-    func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
+    public func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
         snapshotsByWorkspace[workspaceId]?[id]
     }
 
-    func appendMutation(_ mutation: MutationRecord) async throws {
+    public func appendMutation(_ mutation: MutationRecord) async throws {
         mutationsByWorkspace[mutation.workspaceId, default: []].append(mutation)
     }
 
-    func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
+    public func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
         (mutationsByWorkspace[workspaceId] ?? []).sorted { $0.sequence < $1.sequence }
     }
 }
 
 /// A JSON file-backed checkpoint store.
-actor FileCheckpointStore: CheckpointStore {
+///
+/// Mutations are appended to `mutations.json` under an advisory exclusive lock when supported
+/// by the platform (`flock`), so concurrent processes using separate store instances against
+/// the same root are less likely to corrupt that file. Checkpoint and snapshot writes remain
+/// per-artifact atomic replaces; coordinating writers on network filesystems may still require
+/// application-level serialization.
+public actor FileCheckpointStore: CheckpointStore {
     private let rootDirectory: URL
     private let fileManager: FileManager
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(rootDirectory: URL, fileManager: FileManager = .default) {
+    public init(rootDirectory: URL, fileManager: FileManager = .default) {
         self.rootDirectory = rootDirectory.standardizedFileURL
         self.fileManager = fileManager
 
@@ -68,12 +88,12 @@ actor FileCheckpointStore: CheckpointStore {
         self.decoder = JSONDecoder()
     }
 
-    func saveCheckpoint(_ checkpoint: History.Checkpoint) async throws {
+    public func saveCheckpoint(_ checkpoint: History.Checkpoint) async throws {
         try ensureWorkspaceDirectories(for: checkpoint.workspaceId)
         try write(checkpoint, to: checkpointURL(id: checkpoint.id, workspaceId: checkpoint.workspaceId))
     }
 
-    func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> History.Checkpoint? {
+    public func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> History.Checkpoint? {
         let url = checkpointURL(id: id, workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: url.path) else {
             return nil
@@ -81,7 +101,7 @@ actor FileCheckpointStore: CheckpointStore {
         return try read(History.Checkpoint.self, from: url)
     }
 
-    func listCheckpoints(workspaceId: UUID) async throws -> [History.Checkpoint] {
+    public func listCheckpoints(workspaceId: UUID) async throws -> [History.Checkpoint] {
         let directoryURL = checkpointsDirectoryURL(workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: directoryURL.path) else {
             return []
@@ -103,12 +123,12 @@ actor FileCheckpointStore: CheckpointStore {
             }
     }
 
-    func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws {
+    public func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws {
         try ensureWorkspaceDirectories(for: workspaceId)
         try write(snapshot, to: snapshotURL(id: snapshot.id, workspaceId: workspaceId))
     }
 
-    func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
+    public func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
         let url = snapshotURL(id: id, workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: url.path) else {
             return nil
@@ -116,23 +136,35 @@ actor FileCheckpointStore: CheckpointStore {
         return try read(Snapshot.self, from: url)
     }
 
-    func appendMutation(_ mutation: MutationRecord) async throws {
+    public func appendMutation(_ mutation: MutationRecord) async throws {
         try ensureWorkspaceDirectories(for: mutation.workspaceId)
         let url = mutationsURL(workspaceId: mutation.workspaceId)
-        var records = try loadMutations(from: url)
-        records.append(mutation)
-        try write(records.sorted(by: { $0.sequence < $1.sequence }), to: url)
+        try Self.withMutationsExclusiveLock(at: url) {
+            var records = try loadMutations(from: url)
+            records.append(mutation)
+            try write(records.sorted(by: { $0.sequence < $1.sequence }), to: url)
+        }
     }
 
-    func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
-        try loadMutations(from: mutationsURL(workspaceId: workspaceId)).sorted(by: { $0.sequence < $1.sequence })
+    public func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
+        let url = mutationsURL(workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: url.path) else {
+            return []
+        }
+        return try Self.withMutationsExclusiveLock(at: url) {
+            try loadMutations(from: url).sorted(by: { $0.sequence < $1.sequence })
+        }
     }
 
     private func loadMutations(from url: URL) throws -> [MutationRecord] {
         guard fileManager.fileExists(atPath: url.path) else {
             return []
         }
-        return try read([MutationRecord].self, from: url)
+        let data = try Data(contentsOf: url)
+        if data.isEmpty {
+            return []
+        }
+        return try decoder.decode([MutationRecord].self, from: data)
     }
 
     private func ensureWorkspaceDirectories(for workspaceId: UUID) throws {
@@ -172,4 +204,30 @@ actor FileCheckpointStore: CheckpointStore {
     private func read<T: Decodable>(_ type: T.Type, from url: URL) throws -> T {
         try decoder.decode(type, from: Data(contentsOf: url))
     }
+
+    private struct MutationsFileError: Error {
+        var message: String
+    }
+
+#if canImport(Darwin) || canImport(Glibc)
+    private static func withMutationsExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
+        let path = url.path
+        let fd = open(path, O_RDWR | O_CREAT, 0o644)
+        guard fd >= 0 else {
+            throw MutationsFileError(message: "could not open mutations file at \(path)")
+        }
+        defer { close(fd) }
+        while flock(fd, LOCK_EX) != 0 {
+            if errno != EINTR {
+                throw MutationsFileError(message: "could not acquire exclusive lock on mutations file at \(path)")
+            }
+        }
+        defer { _ = flock(fd, LOCK_UN) }
+        return try body()
+    }
+#else
+    private static func withMutationsExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
+        try body()
+    }
+#endif
 }
