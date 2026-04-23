@@ -34,9 +34,44 @@ extension Workspace {
     func loadStoreState() async throws {
         checkpoints = try await store.listCheckpoints(workspaceId: workspaceId)
         mutations = try await store.listMutationRecords(workspaceId: workspaceId)
-        nextMutationSequence = (mutations.last?.sequence ?? 0) + 1
-        headCheckpointId = checkpoints.sorted(by: checkpointSort).last?.id
+        nextMutationSequence = (mutations.map(\.sequence).max() ?? 0) + 1
+        headCheckpointId = Self.lineageHeadId(in: checkpoints)
         didLoadStoreState = true
+    }
+
+    /// Merges in-memory checkpoint state with the shared store, then recomputes the head from the
+    /// parent chain (leaves) instead of wall-clock order alone, so a remote checkpoint does not
+    /// silently reorder lineage when `createdAt` is skewed.
+    func reconcileCheckpointsWithStore() async throws {
+        try await ensureLoaded()
+        let fromStore = try await store.listCheckpoints(workspaceId: workspaceId)
+        checkpoints = fromStore.sorted(by: checkpointSort)
+        headCheckpointId = Self.lineageHeadId(in: checkpoints)
+    }
+
+    /// Picks the current checkpoint "tip": checkpoints whose ids never appear as
+    /// ``Checkpoint/parentCheckpointId`` (DAG leaves). If the graph is forked, the leaf with the
+    /// latest `(createdAt, id)` is used.
+    static func lineageHeadId(in checkpoints: [Checkpoint]) -> UUID? {
+        guard !checkpoints.isEmpty else {
+            return nil
+        }
+        let parentReferences = Set(checkpoints.compactMap(\.parentCheckpointId))
+        let tips = checkpoints.filter { !parentReferences.contains($0.id) }
+        if tips.isEmpty {
+            return checkpoints.max(by: orderCheckpoints)?.id
+        }
+        if tips.count == 1 {
+            return tips[0].id
+        }
+        return tips.max(by: orderCheckpoints)?.id
+    }
+
+    private static func orderCheckpoints(_ lhs: Checkpoint, _ rhs: Checkpoint) -> Bool {
+        if lhs.createdAt == rhs.createdAt {
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        return lhs.createdAt < rhs.createdAt
     }
 
     func checkpointOrThrow(id: UUID) throws -> Checkpoint {
@@ -168,19 +203,18 @@ extension Workspace {
         fileChanges: [FileEdit.FileChange],
         diff: TextDiff?
     ) async throws {
-        let mutation = MutationRecord(
-            sequence: nextMutationSequence,
+        let provisional = MutationRecord(
+            sequence: 0,
             workspaceId: workspaceId,
             kind: kind,
             touchedPaths: Array(Set(touchedPaths)).sorted(),
             fileChanges: fileChanges.sorted(by: fileChangeSort),
             diff: diff
         )
-
-        nextMutationSequence += 1
-        mutations.append(mutation)
+        let persisted = try await store.appendMutation(provisional)
+        mutations.append(persisted)
         mutations.sort { $0.sequence < $1.sequence }
-        try await store.appendMutation(mutation)
+        nextMutationSequence = (mutations.map(\.sequence).max() ?? 0) + 1
     }
 
     func latestMutationSequence() -> Int {
@@ -253,11 +287,11 @@ extension Workspace {
         if !newCheckpoints.isEmpty {
             checkpoints.append(contentsOf: newCheckpoints)
             checkpoints.sort(by: checkpointSort)
-            headCheckpointId = checkpoints.last?.id
+            headCheckpointId = Self.lineageHeadId(in: checkpoints)
 
             if let refreshedMutations = try? await store.listMutationRecords(workspaceId: workspaceId) {
                 mutations = refreshedMutations.sorted { $0.sequence < $1.sequence }
-                nextMutationSequence = (mutations.last?.sequence ?? 0) + 1
+                nextMutationSequence = (mutations.map(\.sequence).max() ?? 0) + 1
             }
         }
 
@@ -434,10 +468,7 @@ extension Workspace {
     }
 
     func checkpointSort(lhs: Checkpoint, rhs: Checkpoint) -> Bool {
-        if lhs.createdAt == rhs.createdAt {
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
-        return lhs.createdAt < rhs.createdAt
+        Self.orderCheckpoints(lhs, rhs)
     }
 
     func fileChangeSort(lhs: FileEdit.FileChange, rhs: FileEdit.FileChange) -> Bool {

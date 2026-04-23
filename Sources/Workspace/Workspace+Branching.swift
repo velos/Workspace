@@ -5,12 +5,20 @@ extension Workspace {
     ///
     /// Branches share only the checkpoint store with their parent. Filesystem state, watchers, and mutation
     /// sequences are isolated to the returned workspace.
-    public func branch(label: String? = nil) async throws -> Workspace {
+    /// - Parameters:
+    ///   - label: Optional label for the branch's seed checkpoint.
+    ///   - filesystem: Filesystem the branch will use; defaults to a new `InMemoryFilesystem` when
+    ///     you omit this value.
+    public func branch(
+        label: String? = nil,
+        filesystem: (any FileSystem)? = nil
+    ) async throws -> Workspace {
         try await ensureLoaded()
+        try await reconcileCheckpointsWithStore()
 
         let baseCheckpointId = headCheckpointId
         let snapshot = try await captureSnapshot()
-        let branchFilesystem = InMemoryFilesystem()
+        let branchFilesystem = filesystem ?? InMemoryFilesystem()
         try await Snapshot.restore(snapshot, to: branchFilesystem)
 
         let branch = Workspace(
@@ -30,6 +38,8 @@ extension Workspace {
     /// Merges another workspace into this workspace when this workspace still points at the other's base.
     public func merge(_ other: Workspace, label: String? = nil) async throws -> Checkpoint {
         try await ensureLoaded()
+        try await reconcileCheckpointsWithStore()
+        try await other.reconcileCheckpointsWithStore()
 
         let expectedBase = await other.mergeBaseCheckpointId()
         guard headCheckpointId == expectedBase else {

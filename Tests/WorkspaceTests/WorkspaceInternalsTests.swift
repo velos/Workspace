@@ -37,7 +37,9 @@ private actor CountingCheckpointStore: CheckpointStore {
         snapshots[id]
     }
 
-    func appendMutation(_ mutation: MutationRecord) async throws {}
+    func appendMutation(_ mutation: MutationRecord) async throws -> MutationRecord {
+        mutation
+    }
 
     func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
         mutationListCount += 1

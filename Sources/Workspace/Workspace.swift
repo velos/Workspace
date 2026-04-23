@@ -8,9 +8,12 @@ public actor Workspace {
         case inMemory
         /// File-backed JSON storage rooted at `url`.
         ///
-        /// Mutation log appends are serialized through a `mutations.lock` sidecar using an advisory lock
-        /// where the OS supports it. Multiple processes should still treat the directory as a single writer
-        /// domain when the underlying filesystem does not honor advisory locks.
+        /// Checkpoints and snapshots are individual JSON files; mutations are recorded in
+        /// `mutations.jsonl` (append-friendly, one record per line). A legacy `mutations.json` array is
+        /// migrated automatically. The store assigns monotonic `MutationRecord.sequence` values under
+        /// `mutations.lock` using an advisory lock where the OS supports it, so writers sharing a
+        /// `workspaceId` do not reuse sequence numbers. Multiple processes should still treat the
+        /// directory as a single-writer domain when the underlying filesystem does not honor advisory locks.
         case directory(at: URL)
     }
 

@@ -4,6 +4,7 @@ extension Workspace {
     /// Creates a checkpoint for the workspace's current filesystem state.
     public func createCheckpoint(label: String? = nil) async throws -> Checkpoint {
         try await ensureLoaded()
+        try await reconcileCheckpointsWithStore()
         let snapshot = try await captureSnapshot()
         return try await persistCheckpoint(
             snapshot: snapshot,
@@ -18,6 +19,7 @@ extension Workspace {
     /// Restores the workspace to a prior checkpoint and records the rollback as a new checkpoint.
     public func rollback(to checkpointId: UUID, label: String? = nil) async throws -> Checkpoint {
         try await ensureLoaded()
+        try await reconcileCheckpointsWithStore()
         let checkpoint = try checkpointOrThrow(id: checkpointId)
         let targetSnapshot = try await loadSnapshotOrThrow(id: checkpoint.snapshotId)
         try await untrackedRestore(targetSnapshot)

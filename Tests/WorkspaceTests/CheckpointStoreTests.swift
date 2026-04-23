@@ -79,7 +79,7 @@ struct CheckpointStoreTests {
         try await store.appendMutation(m1)
 
         let mutations = try await store.listMutationRecords(workspaceId: workspaceA)
-        #expect(mutations.map(\.sequence) == [1, 3])
+        #expect(mutations.map(\.sequence) == [1, 2])
 
         let reloadedSnapshot = try await store.loadSnapshot(id: snapshotId, workspaceId: workspaceA)
         #expect(reloadedSnapshot == snapshot)
@@ -232,7 +232,7 @@ struct CheckpointStoreTests {
         let storeB = FileCheckpointStore(rootDirectory: root)
         let merged = try await storeB.listMutationRecords(workspaceId: workspaceId)
         #expect(merged.map(\.sequence) == [1, 2])
-        #expect(merged.map(\.touchedPaths) == [["/a"], ["/b"]])
+        #expect(merged.map(\.touchedPaths) == [["/b"], ["/a"]])
 
         let m3 = MutationRecord(
             sequence: 3,
@@ -296,8 +296,39 @@ struct CheckpointStoreTests {
         #expect(mutations.isEmpty)
 
         let workspaceRoot = root.appendingPathComponent(workspaceId.uuidString, isDirectory: true)
-        let mutationsFile = workspaceRoot.appendingPathComponent("mutations.json")
+        let mutationsFile = workspaceRoot.appendingPathComponent("mutations.jsonl")
         #expect(!FileManager.default.fileExists(atPath: mutationsFile.path))
+    }
+
+    @Test
+    func `FileCheckpointStore migrates legacy mutations json array to jsonl`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let workspaceRoot = root.appendingPathComponent(workspaceId.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceRoot, withIntermediateDirectories: true)
+        let legacyURL = workspaceRoot.appendingPathComponent("mutations.json", isDirectory: false)
+        let jsonlURL = workspaceRoot.appendingPathComponent("mutations.jsonl", isDirectory: false)
+
+        let stored = MutationRecord(
+            sequence: 99,
+            workspaceId: workspaceId,
+            kind: .writeFile,
+            touchedPaths: ["/legacy.txt"],
+            fileChanges: []
+        )
+        let data = try JSONEncoder().encode([stored])
+        try data.write(to: legacyURL)
+
+        let store = FileCheckpointStore(rootDirectory: root)
+        let loaded = try await store.listMutationRecords(workspaceId: workspaceId)
+        #expect(loaded.count == 1)
+        #expect(loaded[0].touchedPaths == ["/legacy.txt"])
+        #expect(loaded[0].sequence == 99)
+
+        #expect(!FileManager.default.fileExists(atPath: legacyURL.path))
+        #expect(FileManager.default.fileExists(atPath: jsonlURL.path))
     }
 
     @Test
@@ -308,7 +339,7 @@ struct CheckpointStoreTests {
         let workspaceId = UUID()
         let workspaceRoot = root.appendingPathComponent(workspaceId.uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceRoot, withIntermediateDirectories: true)
-        let mutationsFile = workspaceRoot.appendingPathComponent("mutations.json")
+        let mutationsFile = workspaceRoot.appendingPathComponent("mutations.jsonl")
         try Data().write(to: mutationsFile)
 
         let store = FileCheckpointStore(rootDirectory: root)
@@ -317,16 +348,17 @@ struct CheckpointStoreTests {
         #expect(mutations.isEmpty)
 
         let appended = MutationRecord(
-            sequence: 1,
+            sequence: 0,
             workspaceId: workspaceId,
             kind: .writeFile,
             touchedPaths: ["/x"],
             fileChanges: []
         )
-        try await store.appendMutation(appended)
+        let written = try await store.appendMutation(appended)
 
         let after = try await store.listMutationRecords(workspaceId: workspaceId)
-        #expect(after == [appended])
+        #expect(after == [written])
+        #expect(written.sequence == 1)
     }
 
     @Test
@@ -344,10 +376,9 @@ struct CheckpointStoreTests {
                 let store = stores[writerIndex]
                 group.addTask {
                     for stepIndex in 0..<perWriter {
-                        let sequence = writerIndex * perWriter + stepIndex + 1
                         let path = WorkspacePath(normalizing: "/w\(writerIndex)/s\(stepIndex)")
                         let mutation = MutationRecord(
-                            sequence: sequence,
+                            sequence: 0,
                             workspaceId: workspaceId,
                             kind: .writeFile,
                             touchedPaths: [path],
@@ -364,8 +395,8 @@ struct CheckpointStoreTests {
         let mutations = try await reader.listMutationRecords(workspaceId: workspaceId)
 
         #expect(mutations.count == writerCount * perWriter)
-        let expectedSequences = Array(1...(writerCount * perWriter))
-        #expect(mutations.map(\.sequence) == expectedSequences)
+        let expectedSequences = Set(1...(writerCount * perWriter))
+        #expect(Set(mutations.map(\.sequence)) == expectedSequences)
     }
 
     private func makeTempDirectory() throws -> URL {

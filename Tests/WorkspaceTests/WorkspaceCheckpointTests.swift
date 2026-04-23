@@ -75,7 +75,7 @@ private actor FlakySnapshotCheckpointStore: CheckpointStore {
         return try await base.loadSnapshot(id: id, workspaceId: workspaceId)
     }
 
-    func appendMutation(_ mutation: MutationRecord) async throws {
+    func appendMutation(_ mutation: MutationRecord) async throws -> MutationRecord {
         try await base.appendMutation(mutation)
     }
 

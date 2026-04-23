@@ -87,7 +87,7 @@ let workspace = Workspace(
 )
 ```
 
-`Storage.directory(at:)` writes checkpoint, snapshot, and mutation JSON under the supplied URL. Mutation log appends are serialized through a `mutations.lock` sidecar using `flock` where the OS supports it; coordinating multiple hosts or network disks that do not honor `flock` may still require application-level synchronization.
+`Storage.directory(at:)` writes checkpoint and snapshot JSON plus a `mutations.jsonl` append log (one JSON record per line) under `<url>/<workspaceId>/`. A legacy `mutations.json` array is migrated to JSONL on first access. The store assigns monotonic `sequence` numbers while holding `mutations.lock` (advisory `flock` where the OS supports it), so multiple `Workspace` instances that share a `workspaceId` and store do not collide on mutation sequence. The current checkpoint head is derived from the parent-id graph (unparented tips), not only from `createdAt` ordering, which reduces surprises when wall clocks differ between processes. Listing or loading mutations still reads the full log; very long histories may need application-level rotation. Coordinating multiple hosts or network disks that do not honor `flock` may still require extra synchronization.
 
 ### Reads
 
@@ -201,7 +201,7 @@ Public `restoreSnapshot(_:)` is also tracked as a workspace mutation. Checkpoint
 
 ### Branch And Merge
 
-Branches are isolated `Workspace` actors cloned from the parent's current snapshot. They share the checkpoint store but not the filesystem, watchers, or mutation sequence.
+Branches are isolated `Workspace` actors cloned from the parent's current snapshot. They share the checkpoint store but not the filesystem, watchers, or mutation sequence. By default `branch()` materializes the snapshot into a new `InMemoryFilesystem`; pass `filesystem:` to use another implementation (for example a `ReadWriteFilesystem` if the branch should live on disk).
 
 ```swift
 try await workspace.writeFile("/readme.txt", content: "base")
