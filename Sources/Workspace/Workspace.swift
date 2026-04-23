@@ -2,7 +2,46 @@ import Foundation
 
 /// A high-level API for reading, editing, and summarizing a workspace.
 public actor Workspace {
-    private let filesystem: any FileSystem
+    /// Where to persist checkpoint and snapshot data.
+    public enum Storage: Sendable {
+        /// In-memory storage that does not survive process exit.
+        case inMemory
+        /// File-backed JSON storage rooted at `url`.
+        ///
+        /// Checkpoints and snapshots are individual JSON files; mutations are recorded in
+        /// `mutations.jsonl` (append-friendly, one record per line). A legacy `mutations.json` array is
+        /// migrated automatically. The store assigns monotonic `MutationRecord.sequence` values under
+        /// `mutations.lock` using an advisory lock where the OS supports it, so writers sharing a
+        /// `workspaceId` do not reuse sequence numbers. Multiple processes should still treat the
+        /// directory as a single-writer domain when the underlying filesystem does not honor advisory locks.
+        case directory(at: URL)
+    }
+
+    struct CheckpointWatcher {
+        var deliveredCheckpointIds: Set<UUID>
+        var continuation: AsyncStream<CheckpointEvent>.Continuation
+    }
+
+    public nonisolated let workspaceId: UUID
+
+    let filesystem: any FileSystem
+    let store: any CheckpointStore
+    let baseCheckpointId: UUID?
+
+    var loadTask: Task<Void, Error>?
+    var didLoadStoreState = false
+    var checkpoints: [Checkpoint] = []
+    var mutations: [MutationRecord] = []
+    var headCheckpointId: UUID?
+    var nextMutationSequence = 1
+    var checkpointWatchers: [UUID: CheckpointWatcher] = [:]
+    var checkpointPollingTask: Task<Void, Never>?
+
+    /// Sleep interval between polling the shared store for new checkpoints when
+    /// ``watchCheckpointEvents()`` has active subscribers. Tests may set a short value to reduce
+    /// wall-clock wait time.
+    public var checkpointEventPollInterval: Duration = .milliseconds(500)
+
     private var watchers: [UUID: WatchedChangeStream] = [:]
 
     private struct WatchedChangeStream {
@@ -11,9 +50,44 @@ public actor Workspace {
         var continuation: AsyncStream<ChangeEvent>.Continuation
     }
 
+    /// Creates an in-memory workspace suitable for tests and ephemeral work.
+    public init() {
+        self.init(filesystem: InMemoryFilesystem())
+    }
+
     /// Creates a workspace backed by `filesystem`.
-    public init(filesystem: any FileSystem) {
+    public init(
+        workspaceId: UUID = UUID(),
+        filesystem: any FileSystem,
+        storage: Storage = .inMemory
+    ) {
+        self.init(
+            workspaceId: workspaceId,
+            filesystem: filesystem,
+            store: Self.makeStore(for: storage),
+            baseCheckpointId: nil
+        )
+    }
+
+    init(
+        workspaceId: UUID = UUID(),
+        filesystem: any FileSystem,
+        store: any CheckpointStore,
+        baseCheckpointId: UUID? = nil
+    ) {
+        self.workspaceId = workspaceId
         self.filesystem = filesystem
+        self.store = store
+        self.baseCheckpointId = baseCheckpointId
+    }
+
+    static func makeStore(for storage: Storage) -> any CheckpointStore {
+        switch storage {
+        case .inMemory:
+            InMemoryCheckpointStore()
+        case .directory(at: let url):
+            FileCheckpointStore(rootDirectory: url)
+        }
     }
 
     /// Reads raw file contents from the workspace.
@@ -23,8 +97,13 @@ public actor Workspace {
 
     /// Writes raw file data to the workspace, replacing any existing contents.
     public func writeData(_ data: Data, to path: WorkspacePath) async throws {
-        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
-        try await filesystem.writeFile(path: path, data: data, append: false)
+        try await ensureLoaded()
+        try await performBinaryWrite(data: data, path: path)
+    }
+
+    func untrackedWriteData(_ data: Data, to path: WorkspacePath, append: Bool = false) async throws {
+        let events = try await plannedWriteEvents(path: path, data: data, append: append, on: filesystem)
+        try await filesystem.writeFile(path: path, data: data, append: append)
         emit(events)
     }
 
@@ -39,14 +118,29 @@ public actor Workspace {
 
     /// Writes UTF-8 text to a file, replacing any existing contents.
     public func writeFile(_ path: WorkspacePath, content: String) async throws {
-        let data = Data(content.utf8)
-        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
-        try await filesystem.writeFile(path: path, data: data, append: false)
-        emit(events)
+        try await performDirectEdit(
+            kind: .writeFile,
+            edit: .writeFile(path: path, content: content)
+        ) {
+            try await self.untrackedWriteFile(path, content: content)
+        }
+    }
+
+    func untrackedWriteFile(_ path: WorkspacePath, content: String) async throws {
+        try await untrackedWriteData(Data(content.utf8), to: path, append: false)
     }
 
     /// Appends UTF-8 text to a file.
     public func appendFile(_ path: WorkspacePath, content: String) async throws {
+        try await performDirectEdit(
+            kind: .appendFile,
+            edit: .appendFile(path: path, content: content)
+        ) {
+            try await self.untrackedAppendFile(path, content: content)
+        }
+    }
+
+    func untrackedAppendFile(_ path: WorkspacePath, content: String) async throws {
         let data = Data(content.utf8)
         let events = try await plannedWriteEvents(path: path, data: data, append: true, on: filesystem)
         try await filesystem.writeFile(path: path, data: data, append: true)
@@ -63,17 +157,16 @@ public actor Workspace {
         }
     }
 
-    /// Encodes a value as JSON and writes it to a file.
+    /// Encodes a value as JSON and writes it to a file. The on-disk file includes a single trailing
+    /// newline after the JSON for line-oriented tools; ``readJSON`` still decodes the value correctly.
     public func writeJSON<T: Encodable>(_ value: T, to path: WorkspacePath, prettyPrinted: Bool = true) async throws {
-        let encoder = JSONEncoder()
-        if prettyPrinted {
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let content = try encodedJSONString(for: value, prettyPrinted: prettyPrinted)
+        try await performDirectEdit(
+            kind: .writeJSON,
+            edit: .writeFile(path: path, content: content)
+        ) {
+            try await self.untrackedWriteFile(path, content: content)
         }
-        var data = try encoder.encode(value)
-        data.append(Data("\n".utf8))
-        let events = try await plannedWriteEvents(path: path, data: data, append: false, on: filesystem)
-        try await filesystem.writeFile(path: path, data: data, append: false)
-        emit(events)
     }
 
     /// Watches for future changes affecting `path`.
@@ -126,6 +219,15 @@ public actor Workspace {
 
     /// Creates a directory at `path`.
     public func createDirectory(at path: WorkspacePath, recursive: Bool = true) async throws {
+        try await performDirectEdit(
+            kind: .createDirectory,
+            edit: .createDirectory(path: path, recursive: recursive)
+        ) {
+            try await self.untrackedCreateDirectory(at: path, recursive: recursive)
+        }
+    }
+
+    func untrackedCreateDirectory(at path: WorkspacePath, recursive: Bool = true) async throws {
         let events = try await plannedDirectoryCreationEvents(path: path, recursive: recursive, on: filesystem)
         try await filesystem.createDirectory(path: path, recursive: recursive)
         emit(events)
@@ -133,6 +235,15 @@ public actor Workspace {
 
     /// Removes the entry at `path`.
     public func removeItem(at path: WorkspacePath, recursive: Bool = true) async throws {
+        try await performDirectEdit(
+            kind: .removeItem,
+            edit: .delete(path: path, recursive: recursive)
+        ) {
+            try await self.untrackedRemoveItem(at: path, recursive: recursive)
+        }
+    }
+
+    func untrackedRemoveItem(at path: WorkspacePath, recursive: Bool = true) async throws {
         let events = try await plannedDeletionEvents(at: path, on: filesystem)
         try await filesystem.remove(path: path, recursive: recursive)
         emit(events)
@@ -140,6 +251,17 @@ public actor Workspace {
 
     /// Copies an entry from `source` to `destination`.
     public func copyItem(from source: WorkspacePath, to destination: WorkspacePath, recursive: Bool = true)
+        async throws
+    {
+        try await performDirectEdit(
+            kind: .copyItem,
+            edit: .copy(from: source, to: destination, recursive: recursive)
+        ) {
+            try await self.untrackedCopyItem(from: source, to: destination, recursive: recursive)
+        }
+    }
+
+    func untrackedCopyItem(from source: WorkspacePath, to destination: WorkspacePath, recursive: Bool = true)
         async throws
     {
         let events = try await plannedTransferEvents(
@@ -158,6 +280,15 @@ public actor Workspace {
 
     /// Moves or renames an entry from `source` to `destination`.
     public func moveItem(from source: WorkspacePath, to destination: WorkspacePath) async throws {
+        try await performDirectEdit(
+            kind: .moveItem,
+            edit: .move(from: source, to: destination)
+        ) {
+            try await self.untrackedMoveItem(from: source, to: destination)
+        }
+    }
+
+    func untrackedMoveItem(from source: WorkspacePath, to destination: WorkspacePath) async throws {
         let events = try await plannedTransferEvents(
             from: source,
             to: destination,
@@ -181,6 +312,33 @@ public actor Workspace {
         try await buildSummary(path: path, depth: 0, maxDepth: maxDepth)
     }
 
+    /// Captures a durable snapshot of the subtree rooted at `path`.
+    ///
+    /// The returned ``Snapshot`` records file contents, symlinks, directory structure,
+    /// and POSIX permissions, and can later be replayed with ``restoreSnapshot(_:)``.
+    ///
+    /// - Parameter path: The subtree to capture. Defaults to the workspace root.
+    public func captureSnapshot(at path: WorkspacePath = .root) async throws -> Snapshot {
+        try await Snapshot.capture(from: filesystem, at: path)
+    }
+
+    /// Restores `snapshot` onto the workspace, removing any extra entries beneath the
+    /// snapshot's root so that the workspace exactly matches the captured tree.
+    public func restoreSnapshot(_ snapshot: Snapshot) async throws {
+        try await ensureLoaded()
+        let previousSnapshot = try await captureSnapshot()
+        try await untrackedRestore(snapshot)
+        let restoredSnapshot = try await captureSnapshot()
+        let delta = snapshotDelta(from: previousSnapshot.entry, to: restoredSnapshot.entry)
+        let topDiff: TextDiff? = delta.fileChanges.count == 1 ? delta.fileChanges[0].diff : nil
+        try await appendMutation(
+            kind: .restoreSnapshot,
+            touchedPaths: Array(delta.touchedPaths).sorted(),
+            fileChanges: delta.fileChanges,
+            diff: topDiff
+        )
+    }
+
     private struct PlannedReplacement {
         var change: ReplacementResult.Change
         var updatedContent: String
@@ -191,11 +349,6 @@ public actor Workspace {
         var edit: FileEdit
         var entry: FileEdit.Entry
         var changeEvents: [ChangeEvent]
-    }
-
-    private struct DiffToken: Hashable {
-        var text: String
-        var hasTrailingNewline: Bool
     }
 
     /// Returns a preview of a replacement request without mutating the workspace.
@@ -218,6 +371,31 @@ public actor Workspace {
         _ request: ReplacementRequest,
         failurePolicy: MutationFailurePolicy = .rollback
     ) async throws -> ReplacementResult {
+        try await ensureLoaded()
+        let result = try await untrackedApplyReplacement(request, failurePolicy: failurePolicy)
+        if !result.changes.isEmpty || !result.failures.isEmpty {
+            try await appendMutation(
+                kind: .applyReplacement,
+                touchedPaths: result.touchedPaths,
+                fileChanges: result.changes.map {
+                    FileEdit.FileChange(
+                        path: $0.path,
+                        kind: .file,
+                        effect: .modified,
+                        status: $0.status,
+                        diff: $0.diff
+                    )
+                },
+                diff: result.changes.count == 1 ? result.changes[0].diff : nil
+            )
+        }
+        return result
+    }
+
+    func untrackedApplyReplacement(
+        _ request: ReplacementRequest,
+        failurePolicy: MutationFailurePolicy = .rollback
+    ) async throws -> ReplacementResult {
         let plannedChanges = try await plannedReplacementChanges(for: request)
         var changes = plannedChanges.map(\.change)
         let touchedPaths = canonicalizedTouchedPaths(for: changes)
@@ -232,7 +410,7 @@ public actor Workspace {
             )
         }
 
-        let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
+        let captures = failurePolicy == .rollback ? try await rollbackCaptures(for: touchedPaths) : []
         var failures: [ReplacementResult.Failure] = []
         var appliedIndices: [Int] = []
 
@@ -246,7 +424,7 @@ public actor Workspace {
                 changes[index].status = .failed
                 let failure = ReplacementResult.Failure(path: plannedChange.change.path, message: describe(error))
                 if failurePolicy == .rollback {
-                    try await rollback(snapshots)
+                    try await rollback(captures)
                     for appliedIndex in appliedIndices {
                         changes[appliedIndex].status = .rolledBack
                     }
@@ -309,6 +487,29 @@ public actor Workspace {
         _ edits: [FileEdit],
         failurePolicy: MutationFailurePolicy = .rollback
     ) async throws -> FileEdit.BatchResult {
+        try await ensureLoaded()
+        let result = try await untrackedApplyEdits(edits, failurePolicy: failurePolicy)
+        if !edits.isEmpty {
+            let topDiff: TextDiff? =
+                if result.edits.count == 1, let single = result.edits.first, single.fileChanges.count == 1 {
+                    single.fileChanges[0].diff
+                } else {
+                    nil
+                }
+            try await appendMutation(
+                kind: .applyEdits,
+                touchedPaths: result.touchedPaths,
+                fileChanges: result.edits.flatMap(\.fileChanges),
+                diff: topDiff
+            )
+        }
+        return result
+    }
+
+    func untrackedApplyEdits(
+        _ edits: [FileEdit],
+        failurePolicy: MutationFailurePolicy = .rollback
+    ) async throws -> FileEdit.BatchResult {
         let touchedPaths = canonicalizedTouchedPaths(for: edits)
         let plannedEdits = try await planBatchEdits(edits)
         var executionEntries = plannedEdits.map(\.entry)
@@ -323,7 +524,7 @@ public actor Workspace {
             )
         }
 
-        let snapshots = failurePolicy == .rollback ? try await snapshotPaths(touchedPaths) : []
+        let captures = failurePolicy == .rollback ? try await rollbackCaptures(for: touchedPaths) : []
         var failures: [FileEdit.Failure] = []
         var appliedIndices: [Int] = []
 
@@ -341,7 +542,7 @@ public actor Workspace {
                     message: describe(error)
                 )
                 if failurePolicy == .rollback {
-                    try await rollback(snapshots)
+                    try await rollback(captures)
                     for appliedIndex in appliedIndices {
                         setStatus(.rolledBack, for: &executionEntries[appliedIndex])
                     }
@@ -678,13 +879,13 @@ public actor Workspace {
         let planningFilesystem = InMemoryFilesystem()
         let ancestors = Set(paths.flatMap(ancestorPaths(for:))).sorted()
         for ancestor in ancestors {
-            let snapshot = try await shallowSnapshot(path: ancestor, on: filesystem)
-            try await restore(snapshot, on: planningFilesystem)
+            let capture = try await shallowRollbackCapture(path: ancestor, on: filesystem)
+            try await restore(capture, on: planningFilesystem)
         }
 
-        let snapshots = try await snapshotPaths(paths)
-        for snapshot in snapshots {
-            try await restore(snapshot, on: planningFilesystem)
+        let captures = try await rollbackCaptures(for: paths)
+        for capture in captures {
+            try await restore(capture, on: planningFilesystem)
         }
         return planningFilesystem
     }
@@ -982,8 +1183,8 @@ public actor Workspace {
         at path: WorkspacePath,
         on target: any FileSystem
     ) async throws -> [ChangeEvent] {
-        let snapshot = try await snapshot(path: path, on: target)
-        return flattenDeletionEvents(from: snapshot)
+        let capture = try await rollbackCapture(path: path, on: target)
+        return flattenDeletionEvents(from: capture)
     }
 
     private func plannedTransferEvents(
@@ -992,9 +1193,9 @@ public actor Workspace {
         kind: ChangeEvent.Kind,
         on target: any FileSystem
     ) async throws -> [ChangeEvent] {
-        let snapshot = try await snapshot(path: sourcePath, on: target)
+        let capture = try await rollbackCapture(path: sourcePath, on: target)
         return flattenTransferEvents(
-            from: snapshot,
+            from: capture,
             sourceRoot: sourcePath,
             destinationRoot: destinationPath,
             kind: kind
@@ -1015,8 +1216,8 @@ public actor Workspace {
         ]
     }
 
-    private func flattenDeletionEvents(from snapshot: SnapshotEntry) -> [ChangeEvent] {
-        switch snapshot {
+    private func flattenDeletionEvents(from capture: RollbackCapture) -> [ChangeEvent] {
+        switch capture {
         case .missing:
             return []
         case let .file(path, _, _):
@@ -1040,12 +1241,12 @@ public actor Workspace {
     }
 
     private func flattenTransferEvents(
-        from snapshot: SnapshotEntry,
+        from capture: RollbackCapture,
         sourceRoot: WorkspacePath,
         destinationRoot: WorkspacePath,
         kind: ChangeEvent.Kind
     ) -> [ChangeEvent] {
-        switch snapshot {
+        switch capture {
         case .missing:
             return []
         case let .file(path, _, _):
@@ -1135,136 +1336,7 @@ public actor Workspace {
     }
 
     private func textDiff(from originalContent: String, to updatedContent: String) -> TextDiff {
-        let originalLines = diffTokens(in: originalContent)
-        let updatedLines = diffTokens(in: updatedContent)
-        let changes = Array(updatedLines.difference(from: originalLines))
-
-        let removals = Dictionary(grouping: changes.compactMap { change in
-            if case let .remove(offset, element, _) = change {
-                return (offset, element)
-            }
-            return nil
-        }, by: \.0)
-
-        let insertions = Dictionary(grouping: changes.compactMap { change in
-            if case let .insert(offset, element, _) = change {
-                return (offset, element)
-            }
-            return nil
-        }, by: \.0)
-
-        var lines: [TextDiff.Line] = []
-        var originalIndex = 0
-        var updatedIndex = 0
-        var originalLineNumber = 1
-        var updatedLineNumber = 1
-
-        while originalIndex < originalLines.count || updatedIndex < updatedLines.count {
-            if let removed = removals[originalIndex] {
-                for (_, token) in removed {
-                    lines.append(
-                        TextDiff.Line(
-                            kind: .removed,
-                            text: token.text,
-                            hasTrailingNewline: token.hasTrailingNewline,
-                            oldLineNumber: originalLineNumber
-                        )
-                    )
-                    originalIndex += 1
-                    originalLineNumber += 1
-                }
-                continue
-            }
-
-            if let inserted = insertions[updatedIndex] {
-                for (_, token) in inserted {
-                    lines.append(
-                        TextDiff.Line(
-                            kind: .added,
-                            text: token.text,
-                            hasTrailingNewline: token.hasTrailingNewline,
-                            newLineNumber: updatedLineNumber
-                        )
-                    )
-                    updatedIndex += 1
-                    updatedLineNumber += 1
-                }
-                continue
-            }
-
-            guard originalIndex < originalLines.count, updatedIndex < updatedLines.count else {
-                break
-            }
-
-            let updatedLine = updatedLines[updatedIndex]
-            lines.append(
-                TextDiff.Line(
-                    kind: .context,
-                    text: updatedLine.text,
-                    hasTrailingNewline: updatedLine.hasTrailingNewline,
-                    oldLineNumber: originalLineNumber,
-                    newLineNumber: updatedLineNumber
-                )
-            )
-            originalIndex += 1
-            updatedIndex += 1
-            originalLineNumber += 1
-            updatedLineNumber += 1
-        }
-
-        let changedIndices = lines.indices.filter { lines[$0].kind != .context }
-        guard !changedIndices.isEmpty else {
-            return TextDiff(hunks: [])
-        }
-
-        var ranges: [Range<Int>] = []
-        for index in changedIndices {
-            let lowerBound = max(0, index - 3)
-            let upperBound = min(lines.count, index + 4)
-            if let last = ranges.last, lowerBound <= last.upperBound {
-                ranges[ranges.count - 1] = last.lowerBound..<max(last.upperBound, upperBound)
-            } else {
-                ranges.append(lowerBound..<upperBound)
-            }
-        }
-
-        let hunks = ranges.map { range in
-            let hunkLines = Array(lines[range])
-            let originalLineNumbers = hunkLines.compactMap(\.oldLineNumber)
-            let updatedLineNumbers = hunkLines.compactMap(\.newLineNumber)
-            return TextDiff.Hunk(
-                oldStartLine: originalLineNumbers.first ?? 1,
-                oldLineCount: originalLineNumbers.count,
-                newStartLine: updatedLineNumbers.first ?? 1,
-                newLineCount: updatedLineNumbers.count,
-                lines: hunkLines
-            )
-        }
-
-        return TextDiff(hunks: hunks)
-    }
-
-    private func diffTokens(in text: String) -> [DiffToken] {
-        guard !text.isEmpty else {
-            return []
-        }
-
-        var tokens: [DiffToken] = []
-        var current = ""
-        for character in text {
-            if character == "\n" {
-                tokens.append(DiffToken(text: current, hasTrailingNewline: true))
-                current.removeAll(keepingCapacity: true)
-            } else {
-                current.append(character)
-            }
-        }
-
-        if !current.isEmpty || text.last != "\n" {
-            tokens.append(DiffToken(text: current, hasTrailingNewline: false))
-        }
-
-        return tokens
+        TextDiff.lineBased(from: originalContent, to: updatedContent)
     }
 
     private func describe(_ error: any Error) -> String {
@@ -1274,27 +1346,28 @@ public actor Workspace {
         return String(describing: error)
     }
 
-    private enum SnapshotEntry: Sendable {
+    /// A short-lived capture used only to restore failed batched mutations.
+    private enum RollbackCapture: Sendable {
         case missing(path: WorkspacePath)
         case file(path: WorkspacePath, data: Data, permissions: POSIXPermissions)
-        case directory(path: WorkspacePath, permissions: POSIXPermissions, children: [SnapshotEntry])
+        case directory(path: WorkspacePath, permissions: POSIXPermissions, children: [RollbackCapture])
         case symlink(path: WorkspacePath, target: String, permissions: POSIXPermissions)
     }
 
-    private func snapshotPaths(_ paths: [WorkspacePath]) async throws -> [SnapshotEntry] {
-        try await snapshotPaths(paths, on: filesystem)
+    private func rollbackCaptures(for paths: [WorkspacePath]) async throws -> [RollbackCapture] {
+        try await rollbackCaptures(paths, on: filesystem)
     }
 
-    private func snapshotPaths(
+    private func rollbackCaptures(
         _ paths: [WorkspacePath],
         on target: any FileSystem
-    ) async throws -> [SnapshotEntry] {
+    ) async throws -> [RollbackCapture] {
         try await paths.asyncMap { path in
-            try await self.snapshot(path: path, on: target)
+            try await self.rollbackCapture(path: path, on: target)
         }
     }
 
-    private func shallowSnapshot(path: WorkspacePath, on target: any FileSystem) async throws -> SnapshotEntry {
+    private func shallowRollbackCapture(path: WorkspacePath, on target: any FileSystem) async throws -> RollbackCapture {
         guard await target.exists(path: path) else {
             return .missing(path: path)
         }
@@ -1311,7 +1384,7 @@ public actor Workspace {
         }
     }
 
-    private func snapshot(path: WorkspacePath, on target: any FileSystem) async throws -> SnapshotEntry {
+    private func rollbackCapture(path: WorkspacePath, on target: any FileSystem) async throws -> RollbackCapture {
         guard await target.exists(path: path) else {
             return .missing(path: path)
         }
@@ -1322,7 +1395,7 @@ public actor Workspace {
             let children = try await entries
                 .sorted { $0.name < $1.name }
                 .asyncMap { [self] entry in
-                    try await self.snapshot(path: path.appending(entry.name), on: target)
+                    try await self.rollbackCapture(path: path.appending(entry.name), on: target)
                 }
             return .directory(path: path, permissions: info.permissions, children: children)
         }
@@ -1339,14 +1412,14 @@ public actor Workspace {
         )
     }
 
-    private func rollback(_ snapshots: [SnapshotEntry]) async throws {
-        for snapshot in snapshots.sorted(by: { path(of: $0).string.count < path(of: $1).string.count }) {
-            try await restore(snapshot, on: filesystem)
+    private func rollback(_ captures: [RollbackCapture]) async throws {
+        for capture in captures.sorted(by: { path(of: $0).string.count < path(of: $1).string.count }) {
+            try await restore(capture, on: filesystem)
         }
     }
 
-    private func restore(_ snapshot: SnapshotEntry, on target: any FileSystem) async throws {
-        switch snapshot {
+    private func restore(_ capture: RollbackCapture, on target: any FileSystem) async throws {
+        switch capture {
         case let .missing(path):
             if await target.exists(path: path) {
                 try await target.remove(path: path, recursive: true)
@@ -1370,6 +1443,20 @@ public actor Workspace {
             try await target.createSymlink(path: path, target: symlinkTarget)
             try await target.setPermissions(path: path, permissions: permissions)
         case let .directory(path, permissions, children):
+            if path.isRoot {
+                if await target.exists(path: path) {
+                    let entries = try await target.listDirectory(path: path)
+                    for entry in entries {
+                        try await target.remove(path: path.appending(entry.name), recursive: true)
+                    }
+                }
+                try await target.setPermissions(path: path, permissions: permissions)
+                for child in children {
+                    try await restore(child, on: target)
+                }
+                return
+            }
+
             if await target.exists(path: path) {
                 try await target.remove(path: path, recursive: true)
             }
@@ -1381,8 +1468,8 @@ public actor Workspace {
         }
     }
 
-    private func path(of snapshot: SnapshotEntry) -> WorkspacePath {
-        switch snapshot {
+    private func path(of capture: RollbackCapture) -> WorkspacePath {
+        switch capture {
         case let .missing(path),
              let .file(path, _, _),
              let .directory(path, _, _),

@@ -2,8 +2,8 @@ import Foundation
 import Testing
 @testable import Workspace
 
-private enum WorkspaceMountingTestSupport {
-    static func makeTempDirectory(prefix: String = "WorkspaceMountingTests") throws -> URL {
+private enum MountingTestSupport {
+    static func makeTempDirectory(prefix: String = "MountingTests") throws -> URL {
         let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         let url = base.appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -19,8 +19,8 @@ private enum WorkspaceMountingTestSupport {
     }
 }
 
-@Suite("Workspace Mounting")
-struct WorkspaceMountingTests {
+@Suite("Mounting")
+struct MountingTests {
     @Test
     func `multiple isolated mounts can share a memory workspace`() async throws {
         let workspaceA = InMemoryFilesystem()
@@ -122,11 +122,11 @@ struct WorkspaceMountingTests {
     func `mountable filesystem merges base entries with mounted directories`() async throws {
         let base = InMemoryFilesystem()
         try await base.createDirectory(path: "/docs", recursive: true)
-        try await base.writeFile(path: "/docs/local.txt", data: WorkspaceMountingTestSupport.data("local"), append: false)
-        try await base.writeFile(path: "/base.txt", data: WorkspaceMountingTestSupport.data("base"), append: false)
+        try await base.writeFile(path: "/docs/local.txt", data: MountingTestSupport.data("local"), append: false)
+        try await base.writeFile(path: "/base.txt", data: MountingTestSupport.data("base"), append: false)
 
         let mountedDocs = InMemoryFilesystem()
-        try await mountedDocs.writeFile(path: "/guide.txt", data: WorkspaceMountingTestSupport.data("guide"), append: false)
+        try await mountedDocs.writeFile(path: "/guide.txt", data: MountingTestSupport.data("guide"), append: false)
 
         let filesystem = MountableFilesystem(
             base: base,
@@ -136,7 +136,7 @@ struct WorkspaceMountingTests {
         let docsInfo = try await filesystem.stat(path: "/docs")
         #expect(docsInfo.kind == .directory)
         #expect(await filesystem.exists(path: "/docs"))
-        #expect(try await filesystem.readFile(path: "/base.txt") == WorkspaceMountingTestSupport.data("base"))
+        #expect(try await filesystem.readFile(path: "/base.txt") == MountingTestSupport.data("base"))
 
         let docsEntries = try await filesystem.listDirectory(path: "/docs")
         #expect(docsEntries.map(\.name) == ["external", "local.txt"])
@@ -144,7 +144,7 @@ struct WorkspaceMountingTests {
         let mountedEntries = try await filesystem.listDirectory(path: "/docs/external")
         #expect(mountedEntries.map(\.name) == ["guide.txt"])
 
-        try await filesystem.writeFile(path: "/docs/external/new.txt", data: WorkspaceMountingTestSupport.data("new"), append: false)
+        try await filesystem.writeFile(path: "/docs/external/new.txt", data: MountingTestSupport.data("new"), append: false)
         try await filesystem.createDirectory(path: "/docs/external/sub", recursive: true)
         try await filesystem.createSymlink(path: "/docs/external/link.txt", target: "guide.txt")
         try await filesystem.createHardLink(path: "/docs/external/hard.txt", target: "/docs/external/guide.txt")
@@ -152,8 +152,8 @@ struct WorkspaceMountingTests {
 
         #expect(try await filesystem.readSymlink(path: "/docs/external/link.txt") == "guide.txt")
         #expect(try await filesystem.resolveRealPath(path: "/docs/external/link.txt") == "/docs/external/guide.txt")
-        #expect(try await mountedDocs.readFile(path: "/new.txt") == WorkspaceMountingTestSupport.data("new"))
-        #expect(try await mountedDocs.readFile(path: "/hard.txt") == WorkspaceMountingTestSupport.data("guide"))
+        #expect(try await mountedDocs.readFile(path: "/new.txt") == MountingTestSupport.data("new"))
+        #expect(try await mountedDocs.readFile(path: "/hard.txt") == MountingTestSupport.data("guide"))
         #expect(try await mountedDocs.stat(path: "/guide.txt").permissions == POSIXPermissions(0o600))
 
         let globbed = try await filesystem.glob(pattern: "/docs/*.txt", currentDirectory: "/")
@@ -176,7 +176,7 @@ struct WorkspaceMountingTests {
     func `mountable filesystem supports directory copy and move across mounts`() async throws {
         let source = InMemoryFilesystem()
         try await source.createDirectory(path: "/tree/sub", recursive: true)
-        try await source.writeFile(path: "/tree/sub/file.txt", data: WorkspaceMountingTestSupport.data("nested"), append: false)
+        try await source.writeFile(path: "/tree/sub/file.txt", data: MountingTestSupport.data("nested"), append: false)
         try await source.createSymlink(path: "/tree/link.txt", target: "sub/file.txt")
 
         let destination = InMemoryFilesystem()
@@ -197,12 +197,12 @@ struct WorkspaceMountingTests {
         }
 
         try await filesystem.copy(from: "/src/tree", to: "/dst/tree", recursive: true)
-        #expect(try await destination.readFile(path: "/tree/sub/file.txt") == WorkspaceMountingTestSupport.data("nested"))
+        #expect(try await destination.readFile(path: "/tree/sub/file.txt") == MountingTestSupport.data("nested"))
         #expect(try await destination.readSymlink(path: "/tree/link.txt") == "sub/file.txt")
 
         try await filesystem.move(from: "/src/tree/sub/file.txt", to: "/dst/moved.txt")
         #expect(!(await source.exists(path: "/tree/sub/file.txt")))
-        #expect(try await destination.readFile(path: "/moved.txt") == WorkspaceMountingTestSupport.data("nested"))
+        #expect(try await destination.readFile(path: "/moved.txt") == MountingTestSupport.data("nested"))
 
         do {
             try await filesystem.createHardLink(path: "/dst/cross-hard.txt", target: "/src/tree/link.txt")
@@ -214,8 +214,8 @@ struct WorkspaceMountingTests {
 
     @Test
     func `mountable filesystem supports dynamic mounts and configurable base storage`() async throws {
-        let baseRoot = try WorkspaceMountingTestSupport.makeTempDirectory(prefix: "WorkspaceMountableBase")
-        defer { WorkspaceMountingTestSupport.removeDirectory(baseRoot) }
+        let baseRoot = try MountingTestSupport.makeTempDirectory(prefix: "MountableBase")
+        defer { MountingTestSupport.removeDirectory(baseRoot) }
 
         let base = ReadWriteFilesystem()
         let filesystem = MountableFilesystem(base: base)
@@ -224,10 +224,73 @@ struct WorkspaceMountingTests {
         let memory = InMemoryFilesystem()
         filesystem.mount("/memory", filesystem: memory)
 
-        try await filesystem.writeFile(path: "/root.txt", data: WorkspaceMountingTestSupport.data("root"), append: false)
-        try await filesystem.writeFile(path: "/memory/note.txt", data: WorkspaceMountingTestSupport.data("memo"), append: false)
+        try await filesystem.writeFile(path: "/root.txt", data: MountingTestSupport.data("root"), append: false)
+        try await filesystem.writeFile(path: "/memory/note.txt", data: MountingTestSupport.data("memo"), append: false)
 
-        #expect(try await filesystem.readFile(path: "/root.txt") == WorkspaceMountingTestSupport.data("root"))
-        #expect(try await memory.readFile(path: "/note.txt") == WorkspaceMountingTestSupport.data("memo"))
+        #expect(try await filesystem.readFile(path: "/root.txt") == MountingTestSupport.data("root"))
+        #expect(try await memory.readFile(path: "/note.txt") == MountingTestSupport.data("memo"))
+    }
+
+    @Test
+    func `mountable filesystem prefers the longest matching mount prefix`() async throws {
+        let outer = InMemoryFilesystem()
+        let inner = InMemoryFilesystem()
+        try await outer.writeFile(path: "/outer.txt", data: MountingTestSupport.data("outer"), append: false)
+        try await inner.writeFile(path: "/inner.txt", data: MountingTestSupport.data("inner"), append: false)
+
+        let filesystem = MountableFilesystem(
+            base: InMemoryFilesystem(),
+            mounts: [
+                .init(mountPoint: "/mnt", filesystem: outer),
+                .init(mountPoint: "/mnt/deep", filesystem: inner),
+            ]
+        )
+
+        #expect(try await filesystem.readFile(path: "/mnt/outer.txt") == MountingTestSupport.data("outer"))
+        #expect(try await filesystem.readFile(path: "/mnt/deep/inner.txt") == MountingTestSupport.data("inner"))
+    }
+
+    @Test
+    func `mountable filesystem exposes synthetic parents for nested mount points`() async throws {
+        let nested = InMemoryFilesystem()
+        try await nested.writeFile(path: "/leaf.txt", data: MountingTestSupport.data("leaf"), append: false)
+
+        let filesystem = MountableFilesystem(
+            base: InMemoryFilesystem(),
+            mounts: [.init(mountPoint: "/data/repo", filesystem: nested)]
+        )
+
+        #expect(await filesystem.exists(path: "/data"))
+        #expect(await filesystem.exists(path: "/data/repo"))
+
+        let dataInfo = try await filesystem.stat(path: "/data")
+        #expect(dataInfo.kind == .directory)
+        #expect(dataInfo.path == "/data")
+
+        let dataEntries = try await filesystem.listDirectory(path: "/data")
+        #expect(dataEntries.map(\.name) == ["repo"])
+
+        let repoEntries = try await filesystem.listDirectory(path: "/data/repo")
+        #expect(repoEntries.map(\.name) == ["leaf.txt"])
+
+        #expect(try await filesystem.readFile(path: "/data/repo/leaf.txt") == MountingTestSupport.data("leaf"))
+    }
+
+    @Test
+    func `mountable filesystem glob aggregates paths from base and mounts`() async throws {
+        let mounted = InMemoryFilesystem()
+        try await mounted.writeFile(path: "/b.txt", data: MountingTestSupport.data("mb"), append: false)
+
+        let base = InMemoryFilesystem()
+        try await base.writeFile(path: "/a.txt", data: MountingTestSupport.data("ba"), append: false)
+
+        let filesystem = MountableFilesystem(
+            base: base,
+            mounts: [.init(mountPoint: "/m", filesystem: mounted)]
+        )
+
+        let matches = try await filesystem.glob(pattern: "/*.txt", currentDirectory: "/")
+        #expect(matches.contains("/a.txt"))
+        #expect(matches.contains("/m/b.txt"))
     }
 }

@@ -16,6 +16,14 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
     case accessDenied(operation: String, message: String?)
     /// The requested operation is not supported or cannot be completed in the current environment.
     case unsupported(String)
+    /// The requested checkpoint does not exist for this workspace.
+    case checkpointNotFound(UUID)
+    /// The snapshot artifact for a checkpoint is missing.
+    case snapshotNotFound(UUID)
+    /// The parent workspace changed after a branch was created, so the branch cannot be merged.
+    case mergeConflict(parentWorkspaceId: UUID, expectedBase: UUID?, actualHead: UUID?)
+    /// A tracked workspace mutation could not be recorded.
+    case mutationFailed(String)
 
     /// A human-readable description of the error.
     public var description: String {
@@ -36,6 +44,16 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
         case let .accessDenied(operation, message):
             return message ?? "workspace access denied: \(operation)"
         case let .unsupported(message):
+            return message
+        case let .checkpointNotFound(checkpointId):
+            return "workspace checkpoint not found: \(checkpointId.uuidString)"
+        case let .snapshotNotFound(snapshotId):
+            return "workspace snapshot not found: \(snapshotId.uuidString)"
+        case let .mergeConflict(parentWorkspaceId, expectedBase, actualHead):
+            let expected = expectedBase?.uuidString ?? "nil"
+            let actual = actualHead?.uuidString ?? "nil"
+            return "cannot merge branch into workspace \(parentWorkspaceId.uuidString): expected base \(expected), current head is \(actual)"
+        case let .mutationFailed(message):
             return message
         }
     }

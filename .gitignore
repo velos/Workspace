@@ -1,4 +1,6 @@
 .build
 .swiftpm
+references
 Package.resolved
 .DS_Store
+.cursor

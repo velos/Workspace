@@ -2,8 +2,8 @@ import Foundation
 import Testing
 @testable import Workspace
 
-private enum WorkspaceTestSupport {
-    static func makeTempDirectory(prefix: String = "WorkspaceTests") throws -> URL {
+private enum CoreTestSupport {
+    static func makeTempDirectory(prefix: String = "CoreTests") throws -> URL {
         let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         let url = base.appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -123,7 +123,7 @@ private final class NSErrorFailOnceFilesystem: FileSystem, @unchecked Sendable {
     func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         if failingWritePaths.contains(path), !failedWritePaths.contains(path) {
             failedWritePaths.insert(path)
-            throw NSError(domain: "WorkspaceTests", code: 42, userInfo: [NSLocalizedDescriptionKey: "forced NSError write failure"])
+            throw NSError(domain: "CoreTests", code: 42, userInfo: [NSLocalizedDescriptionKey: "forced NSError write failure"])
         }
         try await base.writeFile(path: path, data: data, append: append)
     }
@@ -312,8 +312,8 @@ private func assertBasicWatchSemantics(
     )
 }
 
-@Suite("Workspace")
-struct WorkspaceTests {
+@Suite("Core")
+struct CoreTests {
     @Test
     func `workspace module reexports core filesystem primitives`() async throws {
         let workspaceFilesystem: any FileSystem = InMemoryFilesystem()
@@ -615,8 +615,8 @@ struct WorkspaceTests {
             watchedPath: "/note.txt"
         )
 
-        let overlayRoot = try WorkspaceTestSupport.makeTempDirectory(prefix: "WorkspaceOverlayWatch")
-        defer { WorkspaceTestSupport.removeDirectory(overlayRoot) }
+        let overlayRoot = try CoreTestSupport.makeTempDirectory(prefix: "OverlayWatch")
+        defer { CoreTestSupport.removeDirectory(overlayRoot) }
         let overlayWorkspace = Workspace(filesystem: try await OverlayFilesystem(rootDirectory: overlayRoot))
         try await assertBasicWatchSemantics(
             workspace: overlayWorkspace,
@@ -912,7 +912,7 @@ struct WorkspaceTests {
         #expect(!result.rolledBack)
         #expect(result.failures.count == 1)
         #expect(result.failures.first?.path == "/src/b.txt")
-        #expect(result.failures.first?.message.contains("WorkspaceTests") == true)
+        #expect(result.failures.first?.message.contains("CoreTests") == true)
         #expect(result.changes.map(\.status) == [.applied, .failed, .skipped])
         #expect(try await base.readFile(path: "/src/a.txt") == Data("bar".utf8))
         #expect(try await base.readFile(path: "/src/b.txt") == Data("foo".utf8))
@@ -1098,7 +1098,7 @@ struct WorkspaceTests {
         #expect(!result.rolledBack)
         #expect(result.failures.count == 1)
         #expect(result.failures.first?.index == 1)
-        #expect(result.failures.first?.message.contains("WorkspaceTests") == true)
+        #expect(result.failures.first?.message.contains("CoreTests") == true)
         #expect(result.edits.map(\.status) == [.applied, .failed, .skipped])
         #expect(!(await base.exists(path: "/old.txt")))
         #expect(!(await base.exists(path: "/blocked.txt")))
@@ -1196,11 +1196,11 @@ struct WorkspaceTests {
 
     @Test(.tags(.edits))
     func `applyEdits works with overlay and mountable filesystems`() async throws {
-        let workspaceRoot = try WorkspaceTestSupport.makeTempDirectory(prefix: "WorkspaceMountRoot")
-        defer { WorkspaceTestSupport.removeDirectory(workspaceRoot) }
+        let workspaceRoot = try CoreTestSupport.makeTempDirectory(prefix: "MountRoot")
+        defer { CoreTestSupport.removeDirectory(workspaceRoot) }
 
-        let docsRoot = try WorkspaceTestSupport.makeTempDirectory(prefix: "WorkspaceDocsRoot")
-        defer { WorkspaceTestSupport.removeDirectory(docsRoot) }
+        let docsRoot = try CoreTestSupport.makeTempDirectory(prefix: "DocsRoot")
+        defer { CoreTestSupport.removeDirectory(docsRoot) }
         try Data("guide".utf8).write(to: docsRoot.appendingPathComponent("guide.txt"))
 
         let mountable = MountableFilesystem(
