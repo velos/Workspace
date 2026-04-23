@@ -37,6 +37,11 @@ public actor Workspace {
     var checkpointWatchers: [UUID: CheckpointWatcher] = [:]
     var checkpointPollingTask: Task<Void, Never>?
 
+    /// Sleep interval between polling the shared store for new checkpoints when
+    /// ``watchCheckpointEvents()`` has active subscribers. Tests may set a short value to reduce
+    /// wall-clock wait time.
+    public var checkpointEventPollInterval: Duration = .milliseconds(500)
+
     private var watchers: [UUID: WatchedChangeStream] = [:]
 
     private struct WatchedChangeStream {
@@ -152,7 +157,8 @@ public actor Workspace {
         }
     }
 
-    /// Encodes a value as JSON and writes it to a file.
+    /// Encodes a value as JSON and writes it to a file. The on-disk file includes a single trailing
+    /// newline after the JSON for line-oriented tools; ``readJSON`` still decodes the value correctly.
     public func writeJSON<T: Encodable>(_ value: T, to path: WorkspacePath, prettyPrinted: Bool = true) async throws {
         let content = try encodedJSONString(for: value, prettyPrinted: prettyPrinted)
         try await performDirectEdit(

@@ -21,7 +21,10 @@ extension Workspace {
         try await ensureLoaded()
         try await reconcileCheckpointsWithStore()
         let checkpoint = try checkpointOrThrow(id: checkpointId)
-        let targetSnapshot = try await loadSnapshotOrThrow(id: checkpoint.snapshotId)
+        let targetSnapshot = try await loadSnapshotOrThrow(
+            id: checkpoint.snapshotId,
+            workspaceId: checkpoint.workspaceId
+        )
         try await untrackedRestore(targetSnapshot)
         let restoredSnapshot = try await captureSnapshot()
         return try await persistCheckpoint(
@@ -53,7 +56,8 @@ extension Workspace {
     }
 
     /// Watches for checkpoint events, including checkpoints created by other workspace instances
-    /// with the same `workspaceId` and shared store.
+    /// with the same `workspaceId` and shared store. Polling uses ``Workspace/checkpointEventPollInterval``
+    /// (500 ms by default) while the stream is active; lower it in tests to reduce wait time.
     public func watchCheckpointEvents() async throws -> AsyncStream<CheckpointEvent> {
         try await ensureLoaded()
 

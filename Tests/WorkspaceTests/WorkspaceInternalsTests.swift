@@ -221,6 +221,21 @@ struct WorkspaceInternalsTests {
     }
 
     @Test
+    func `writeData to a directory path throws with unsupported`() async throws {
+        let workspace = Workspace()
+        try await workspace.createDirectory(at: "/out", recursive: true)
+        do {
+            try await workspace.writeData(Data([1]), to: "/out")
+            Issue.record("expected error when writing to directory")
+        } catch let error as WorkspaceError {
+            guard case .unsupported = error else {
+                Issue.record("unexpected workspace error: \(error)")
+                return
+            }
+        }
+    }
+
+    @Test
     func `performBinaryWrite through an existing symlink records symlink metadata and updates target`() async throws {
         let filesystem = InMemoryFilesystem()
         try await filesystem.writeFile(path: "/target.bin", data: Data([1, 2, 3]), append: false)

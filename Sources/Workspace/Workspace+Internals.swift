@@ -108,19 +108,16 @@ extension Workspace {
     }
 
     func performBinaryWrite(data: Data, path: WorkspacePath) async throws {
-        try await ensureLoaded()
-
         let effect: FileEdit.Effect
         let kind: FileTree.Kind
 
         if await exists(path) {
             let info = try await fileInfo(at: path)
-            kind = info.kind
             if info.kind == .directory {
-                effect = .unchanged
-            } else {
-                effect = try await readData(from: path) == data ? .unchanged : .modified
+                throw WorkspaceError.unsupported("cannot write data to a directory: \(path)")
             }
+            kind = info.kind
+            effect = try await readData(from: path) == data ? .unchanged : .modified
         } else {
             kind = .file
             effect = .created
@@ -226,6 +223,10 @@ extension Workspace {
         return mutations
     }
 
+    /// Encodes `value` to bytes and a UTF-8 `String` with a **single trailing newline** for
+    /// line-oriented / POSIX-friendly file endings. Decoding via ``Workspace/readJSON(from:)``
+    /// still works because the JSON comes first; keep this in mind if you read raw bytes with a
+    /// different decoder.
     func encodedJSONString<T: Encodable>(for value: T, prettyPrinted: Bool) throws -> String {
         let encoder = JSONEncoder()
         if prettyPrinted {
@@ -265,9 +266,10 @@ extension Workspace {
             return
         }
         checkpointPollingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(500))
-                await self?.pollCheckpointEvents()
+            while !Task.isCancelled, let workspace = self {
+                let interval = await workspace.checkpointEventPollInterval
+                try? await Task.sleep(for: interval)
+                await workspace.pollCheckpointEvents()
             }
         }
     }
@@ -309,10 +311,11 @@ extension Workspace {
             guard var watcher = checkpointWatchers[id] else {
                 continue
             }
-            if watcher.deliveredCheckpointIds.insert(event.checkpoint.id).inserted {
-                watcher.continuation.yield(event)
-                checkpointWatchers[id] = watcher
+            guard watcher.deliveredCheckpointIds.insert(event.checkpoint.id).inserted else {
+                continue
             }
+            watcher.continuation.yield(event)
+            checkpointWatchers[id] = watcher
         }
     }
 

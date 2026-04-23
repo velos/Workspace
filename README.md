@@ -283,6 +283,7 @@ let workspace = Workspace(filesystem: filesystem)
 
 - Reads do not load checkpoint state. Writes, checkpoint calls, rollback, branch, and merge do.
 - All checkpoint reads share the workspace actor barrier with file I/O, so they serialize behind in-flight writes.
+- `writeJSON` ends the file with a single trailing newline; `readJSON` decodes the value as usual. Checkpoint event polling (when using `watchCheckpointEvents`) uses `Workspace.checkpointEventPollInterval` (500 ms by default; shorten in tests to reduce wait time).
 - `.inMemory` storage still records one mutation per write in memory, including old-content capture for text diffs.
 - Branches created with `.directory(at:)` share the same storage directory as the parent but are partitioned by `workspaceId`.
 - `walkTree` and `summarizeTree` return stable path ordering, which is useful for deterministic tool output.

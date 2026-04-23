@@ -192,7 +192,6 @@ actor FileCheckpointStore: CheckpointStore {
         guard fileManager.fileExists(atPath: jsonl.path) || fileManager.fileExists(atPath: legacy.path) else {
             return []
         }
-        try ensureWorkspaceDirectories(for: workspaceId)
         let lockURL = mutationsLockURL(workspaceId: workspaceId)
         return try Self.withMutationsExclusiveLock(at: lockURL) {
             try loadAllMutations(jsonl: jsonl, legacy: legacy)
