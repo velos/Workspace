@@ -328,6 +328,19 @@ struct CoreTests {
     }
 
     @Test
+    func `workspace exposes immutable filesystem property`() async throws {
+        let workspace = Workspace(filesystem: InMemoryFilesystem())
+
+        try await workspace.writeFile("/note.txt", content: "hello")
+
+        let filesystem: any FileSystem = workspace.filesystem
+        #expect(try await filesystem.readFile(path: "/note.txt") == Data("hello".utf8))
+
+        try await filesystem.writeFile(path: "/direct.txt", data: Data("normal".utf8), append: false)
+        #expect(try await workspace.readFile("/direct.txt") == "normal")
+    }
+
+    @Test
     func `readJSON and writeJSON roundtrip`() async throws {
         let fs = InMemoryFilesystem()
         let state = Workspace(filesystem: fs)

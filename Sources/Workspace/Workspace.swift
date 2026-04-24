@@ -24,7 +24,11 @@ public actor Workspace {
 
     public nonisolated let workspaceId: UUID
 
-    let filesystem: any FileSystem
+    /// The workspace's backing filesystem.
+    ///
+    /// The property is immutable after initialization, but the returned filesystem retains its normal
+    /// ``FileSystem`` capabilities.
+    public nonisolated let filesystem: any FileSystem
     let store: any CheckpointStore
     let baseCheckpointId: UUID?
 
