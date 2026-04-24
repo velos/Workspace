@@ -77,6 +77,15 @@ let filesystem = InMemoryFilesystem()
 let workspace = Workspace(filesystem: filesystem)
 ```
 
+After a workspace is created, `workspace.filesystem` exposes the backing filesystem as a normal
+`FileSystem`. The property itself is immutable, but the returned filesystem keeps its read/write
+capabilities:
+
+```swift
+let filesystem: any FileSystem = workspace.filesystem
+let data = try await filesystem.readFile(path: "/notes/todo.txt")
+```
+
 Persist checkpoint artifacts with file-backed storage:
 
 ```swift
