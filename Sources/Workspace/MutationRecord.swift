@@ -1,9 +1,13 @@
 import Foundation
 
 /// A recorded filesystem mutation emitted by ``Workspace``.
-struct MutationRecord: Sendable, Codable, Equatable {
+///
+/// Every tracked write appends one record (unless the workspace's ``Workspace/TrackingPolicy``
+/// disables history). Records are ordered by `sequence`, which the checkpoint store assigns
+/// monotonically per workspace.
+public struct MutationRecord: Sendable, Codable, Equatable {
     /// The coarse operation kind for filtering and tooling.
-    enum Kind: String, Sendable, Codable {
+    public enum Kind: String, Sendable, Codable {
         case writeFile
         case appendFile
         case writeData
@@ -19,13 +23,20 @@ struct MutationRecord: Sendable, Codable, Equatable {
         case mergeWorkspace
     }
 
-    var sequence: Int
-    var workspaceId: UUID
-    var timestamp: Date
-    var kind: Kind
-    var touchedPaths: [WorkspacePath]
-    var fileChanges: [FileEdit.FileChange]
-    var diff: TextDiff?
+    /// The store-assigned, per-workspace monotonic sequence number.
+    public internal(set) var sequence: Int
+    /// The workspace that performed the mutation.
+    public var workspaceId: UUID
+    /// When the mutation was recorded.
+    public var timestamp: Date
+    /// The coarse operation kind.
+    public var kind: Kind
+    /// The canonicalized paths the mutation touched.
+    public var touchedPaths: [WorkspacePath]
+    /// Per-file effects, including text diffs when the tracking policy records them.
+    public var fileChanges: [FileEdit.FileChange]
+    /// A convenience diff populated when the mutation changed exactly one text file.
+    public var diff: TextDiff?
 
     init(
         sequence: Int,

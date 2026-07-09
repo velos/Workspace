@@ -94,6 +94,11 @@ extension Workspace {
         edit: FileEdit,
         apply: () async throws -> Void
     ) async throws {
+        if case .disabled = tracking {
+            try await apply()
+            return
+        }
+
         try await ensureLoaded()
         let preview = try await previewEdits([edit])
         try await apply()
@@ -108,6 +113,11 @@ extension Workspace {
     }
 
     func performBinaryWrite(data: Data, path: WorkspacePath) async throws {
+        if case .disabled = tracking {
+            try await untrackedWriteData(data, to: path)
+            return
+        }
+
         let effect: FileEdit.Effect
         let kind: FileTree.Kind
 
@@ -117,7 +127,11 @@ extension Workspace {
                 throw WorkspaceError.unsupported("cannot write data to a directory: \(path)")
             }
             kind = info.kind
-            effect = try await readData(from: path) == data ? .unchanged : .modified
+            if computesDiffs {
+                effect = try await readData(from: path) == data ? .unchanged : .modified
+            } else {
+                effect = .modified
+            }
         } else {
             kind = .file
             effect = .created
@@ -200,6 +214,9 @@ extension Workspace {
         fileChanges: [FileEdit.FileChange],
         diff: TextDiff?
     ) async throws {
+        if case .disabled = tracking {
+            return
+        }
         let provisional = MutationRecord(
             sequence: 0,
             workspaceId: workspaceId,
@@ -218,7 +235,11 @@ extension Workspace {
         mutations.map(\.sequence).max() ?? 0
     }
 
-    func mutationRecords() async throws -> [MutationRecord] {
+    /// Returns the tracked mutation history for this workspace, oldest first.
+    ///
+    /// The amount of detail per record is governed by the workspace's ``Workspace/TrackingPolicy``;
+    /// with ``Workspace/TrackingPolicy/disabled`` the history is empty.
+    public func mutationRecords() async throws -> [MutationRecord] {
         try await ensureLoaded()
         return mutations
     }
@@ -461,6 +482,12 @@ extension Workspace {
     }
 
     func utf8TextFileDiff(oldData: Data, newData: Data) -> TextDiff? {
+        guard case let .fullDiffs(maxDiffBytes) = tracking else {
+            return nil
+        }
+        if let maxDiffBytes, oldData.count > maxDiffBytes || newData.count > maxDiffBytes {
+            return nil
+        }
         guard let oldString = String(data: oldData, encoding: .utf8),
               let newString = String(data: newData, encoding: .utf8)
         else {

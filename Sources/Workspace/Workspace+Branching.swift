@@ -26,7 +26,8 @@ extension Workspace {
             filesystem: branchFilesystem,
             store: store,
             baseCheckpointId: baseCheckpointId,
-            baseMutationCursor: latestMutationSequence()
+            baseMutationCursor: latestMutationSequence(),
+            tracking: tracking
         )
         _ = try await branch.seedBranchCheckpoint(
             snapshot: snapshot,

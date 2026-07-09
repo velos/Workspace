@@ -136,7 +136,20 @@ print(config.enabled) // true
 
 ### Tracked Writes
 
-Every public write records an internal mutation:
+Every public write records a mutation. The history is public — `mutationRecords()` returns the ordered records including per-file effects and text diffs — and the amount of detail is configurable per workspace:
+
+```swift
+let workspace = Workspace(
+    filesystem: InMemoryFilesystem(),
+    tracking: .fullDiffs(maxDiffBytes: 1_000_000) // cap diff computation to 1 MB files
+)
+// .full        — full diffs, no size cap (default)
+// .pathsOnly   — touched paths and effects, no text diffs
+// .disabled    — no history at all; change events still fire, but merge cannot
+//                detect uncheckpointed edits made in this mode
+```
+
+Tracked writes:
 
 ```swift
 try await workspace.writeFile("/notes/todo.txt", content: "one")
