@@ -35,11 +35,13 @@ private enum FilesystemTestSupport {
     }
 }
 
+#if canImport(Darwin)
 private final class NilAppGroupFileManager: FileManager {
     override func containerURL(forSecurityApplicationGroupIdentifier groupIdentifier: String) -> URL? {
         nil
     }
 }
+#endif
 
 extension Tag {
     @Tag static var permissions: Self
@@ -183,6 +185,192 @@ struct FilesystemTests {
         }
 
         #expect(try Data(contentsOf: outsideFile) == Data("original".utf8))
+    }
+
+    @Test(.tags(.readWrite))
+    func `read-write filesystem manages external symlinks without following them`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let outside = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemOutside")
+        defer { FilesystemTestSupport.removeDirectory(outside) }
+
+        let outsideFile = outside.appendingPathComponent("target.txt")
+        try Data("secret".utf8).write(to: outsideFile)
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.createSymlink(path: "/leak", target: outsideFile.path)
+
+        // lstat semantics: the link itself is visible and manageable...
+        #expect(await filesystem.exists(path: "/leak"))
+        #expect((try await filesystem.stat(path: "/leak")).kind == .symlink)
+        #expect(try await filesystem.readSymlink(path: "/leak") == outsideFile.path)
+
+        // ...but its contents stay unreachable.
+        do {
+            _ = try await filesystem.readFile(path: "/leak")
+            Issue.record("expected invalid path error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("invalid path"))
+        }
+
+        // The link can be renamed and deleted without touching its target.
+        try await filesystem.move(from: "/leak", to: "/renamed-leak")
+        #expect(await filesystem.exists(path: "/renamed-leak"))
+        try await filesystem.remove(path: "/renamed-leak", recursive: false)
+        #expect(!(await filesystem.exists(path: "/renamed-leak")))
+        #expect(FileManager.default.fileExists(atPath: outsideFile.path))
+    }
+
+    @Test(.tags(.readWrite))
+    func `read-write filesystem exists does not probe outside the root`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let outside = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemOutside")
+        defer { FilesystemTestSupport.removeDirectory(outside) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let missingTarget = outside.appendingPathComponent("missing.txt").path
+        try await filesystem.createSymlink(path: "/dangling", target: missingTarget)
+
+        // The link exists regardless of whether its external target does: existence checks never
+        // dereference the final component, so they reveal nothing about paths outside the root.
+        #expect(await filesystem.exists(path: "/dangling"))
+        #expect((try await filesystem.stat(path: "/dangling")).kind == .symlink)
+
+        try Data("now present".utf8).write(to: URL(fileURLWithPath: missingTarget))
+        #expect(await filesystem.exists(path: "/dangling"))
+    }
+
+    @Test(.tags(.readWrite))
+    func `read-write filesystem removes a directory symlink without touching its target`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.createDirectory(path: "/real", recursive: true)
+        try await filesystem.writeFile(path: "/real/keep.txt", data: Data("keep".utf8), append: false)
+        try await filesystem.createSymlink(path: "/alias", target: "real")
+
+        try await filesystem.remove(path: "/alias", recursive: false)
+
+        #expect(!(await filesystem.exists(path: "/alias")))
+        #expect(await filesystem.exists(path: "/real/keep.txt"))
+    }
+
+    @Test(.tags(.inMemory))
+    func `glob wildcards stay within a single path component`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.createDirectory(path: "/docs/sub", recursive: true)
+        try await filesystem.writeFile(path: "/docs/top.txt", data: FilesystemTestSupport.data("a"), append: false)
+        try await filesystem.writeFile(path: "/docs/sub/deep.txt", data: FilesystemTestSupport.data("b"), append: false)
+        try await filesystem.writeFile(path: "/docs/note.md", data: FilesystemTestSupport.data("c"), append: false)
+
+        #expect(try await filesystem.glob(pattern: "/docs/*.txt", currentDirectory: "/") == ["/docs/top.txt"])
+        #expect(try await filesystem.glob(pattern: "/docs/**", currentDirectory: "/").contains("/docs/sub/deep.txt"))
+        #expect(try await filesystem.glob(pattern: "/docs/?op.txt", currentDirectory: "/") == ["/docs/top.txt"])
+        #expect(try await filesystem.glob(pattern: "/docs/**/*.txt", currentDirectory: "/").contains("/docs/sub/deep.txt"))
+    }
+
+    @Test(.tags(.readWrite))
+    func `ranged and chunked reads return consistent slices`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRanged")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let payload = Data("0123456789".utf8)
+        try await filesystem.writeFile(path: "/data.bin", data: payload, append: false)
+
+        #expect(try await filesystem.readFile(path: "/data.bin", offset: 0, length: nil) == payload)
+        #expect(try await filesystem.readFile(path: "/data.bin", offset: 3, length: 4) == Data("3456".utf8))
+        #expect(try await filesystem.readFile(path: "/data.bin", offset: 8, length: 10) == Data("89".utf8))
+        #expect(try await filesystem.readFile(path: "/data.bin", offset: 42, length: nil) == Data())
+
+        var chunks: [Data] = []
+        for try await chunk in try await filesystem.readFileChunks(path: "/data.bin", chunkSize: 3) {
+            chunks.append(chunk)
+        }
+        #expect(chunks.map(\.count) == [3, 3, 3, 1])
+        #expect(chunks.reduce(Data(), +) == payload)
+
+        // The protocol's default implementation used by the in-memory backend agrees.
+        let memory = InMemoryFilesystem()
+        try await memory.writeFile(path: "/data.bin", data: payload, append: false)
+        #expect(try await memory.readFile(path: "/data.bin", offset: 3, length: 4) == Data("3456".utf8))
+        #expect(try await memory.readFile(path: "/data.bin", offset: 42, length: 1) == Data())
+
+        var memoryChunks: [Data] = []
+        for try await chunk in try await memory.readFileChunks(path: "/data.bin", chunkSize: 4) {
+            memoryChunks.append(chunk)
+        }
+        #expect(memoryChunks.reduce(Data(), +) == payload)
+    }
+
+    @Test(.tags(.readWrite))
+    func `createFile is exclusive on disk and in memory`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemCreate")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.createFile(path: "/fresh/new.txt", data: Data("one".utf8))
+        #expect(try await filesystem.readFile(path: "/fresh/new.txt") == Data("one".utf8))
+
+        do {
+            try await filesystem.createFile(path: "/fresh/new.txt", data: Data("two".utf8))
+            Issue.record("expected EEXIST for existing file")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EEXIST))
+        }
+        #expect(try await filesystem.readFile(path: "/fresh/new.txt") == Data("one".utf8))
+
+        let memory = InMemoryFilesystem()
+        try await memory.createFile(path: "/new.txt", data: Data("one".utf8))
+        do {
+            try await memory.createFile(path: "/new.txt", data: Data("two".utf8))
+            Issue.record("expected EEXIST for existing file")
+        } catch let error as NSError {
+            #expect(error.code == Int(EEXIST))
+        }
+        #expect(try await memory.readFile(path: "/new.txt") == Data("one".utf8))
+    }
+
+    @Test(.tags(.permissions))
+    func `capabilities are advertised and forwarded through wrappers`() async throws {
+        let memory = InMemoryFilesystem()
+        let memoryCapabilities = await memory.capabilities()
+        #expect(memoryCapabilities.contains(.symlinks))
+        #expect(memoryCapabilities.contains(.permissions))
+
+        let permissioned = PermissionedFileSystem(
+            base: memory,
+            authorizer: PermissionAuthorizer { _ in .allow }
+        )
+        #expect(await permissioned.capabilities() == memoryCapabilities)
+
+        let denied = PermissionedFileSystem(
+            base: memory,
+            authorizer: PermissionAuthorizer { request in
+                request.operation == .writeFile ? .deny(message: "no writes") : .allow
+            }
+        )
+        do {
+            try await denied.createFile(path: "/x.txt", data: Data())
+            Issue.record("expected createFile denial through writeFile permission")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("no writes"))
+        }
+    }
+
+    @Test(.tags(.inMemory))
+    func `glob character classes support shell negation`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.writeFile(path: "/a.txt", data: FilesystemTestSupport.data("a"), append: false)
+        try await filesystem.writeFile(path: "/b.txt", data: FilesystemTestSupport.data("b"), append: false)
+
+        #expect(try await filesystem.glob(pattern: "/[!a].txt", currentDirectory: "/") == ["/b.txt"])
+        #expect(try await filesystem.glob(pattern: "/[ab].txt", currentDirectory: "/") == ["/a.txt", "/b.txt"])
     }
 
     @Test(.tags(.readWrite))
@@ -575,6 +763,101 @@ struct FilesystemTests {
     }
 
     @Test(.tags(.overlay))
+    func `overlay reads pass through lazily and writes stay in memory`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayLazy")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let noteURL = root.appendingPathComponent("note.txt")
+        try Data("disk".utf8).write(to: noteURL)
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk".utf8))
+
+        // A file added on disk after configuration is visible without reload: reads are lazy.
+        try Data("late".utf8).write(to: root.appendingPathComponent("late.txt"))
+        #expect(try await filesystem.readFile(path: "/late.txt") == Data("late".utf8))
+
+        // Overlay writes shadow the source without touching it.
+        try await filesystem.writeFile(path: "/note.txt", data: Data("overlay".utf8), append: false)
+        #expect(try await filesystem.readFile(path: "/note.txt") == Data("overlay".utf8))
+        #expect(try Data(contentsOf: noteURL) == Data("disk".utf8))
+    }
+
+    @Test(.tags(.overlay))
+    func `overlay deletions hide lower entries and re-creation yields a fresh directory`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayWhiteout")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let dirURL = root.appendingPathComponent("dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        try Data("a".utf8).write(to: dirURL.appendingPathComponent("a.txt"))
+        try Data("b".utf8).write(to: dirURL.appendingPathComponent("b.txt"))
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+
+        try await filesystem.remove(path: "/dir/a.txt", recursive: false)
+        #expect(!(await filesystem.exists(path: "/dir/a.txt")))
+        #expect((try await filesystem.listDirectory(path: "/dir")).map(\.name) == ["b.txt"])
+        #expect(FileManager.default.fileExists(atPath: dirURL.appendingPathComponent("a.txt").path))
+
+        // Removing the whole directory and re-creating it must not resurrect lower children.
+        try await filesystem.remove(path: "/dir", recursive: true)
+        #expect(!(await filesystem.exists(path: "/dir")))
+        try await filesystem.createDirectory(path: "/dir", recursive: false)
+        #expect((try await filesystem.listDirectory(path: "/dir")).isEmpty)
+
+        // reload drops all overlay state.
+        try await filesystem.reload()
+        #expect(try await filesystem.readFile(path: "/dir/a.txt") == Data("a".utf8))
+    }
+
+    @Test(.tags(.overlay))
+    func `overlay copies up on append and merges listings across layers`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayCopyUp")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        try Data("one".utf8).write(to: root.appendingPathComponent("log.txt"))
+        let subURL = root.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: subURL, withIntermediateDirectories: true)
+        try Data("k".utf8).write(to: subURL.appendingPathComponent("keep.txt"))
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+
+        try await filesystem.writeFile(path: "/log.txt", data: Data(" two".utf8), append: true)
+        #expect(try await filesystem.readFile(path: "/log.txt") == Data("one two".utf8))
+        #expect(try Data(contentsOf: root.appendingPathComponent("log.txt")) == Data("one".utf8))
+
+        try await filesystem.writeFile(path: "/sub/new.txt", data: Data("n".utf8), append: false)
+        #expect((try await filesystem.listDirectory(path: "/sub")).map(\.name) == ["keep.txt", "new.txt"])
+
+        try await filesystem.move(from: "/sub/keep.txt", to: "/sub/moved.txt")
+        #expect(!(await filesystem.exists(path: "/sub/keep.txt")))
+        #expect(try await filesystem.readFile(path: "/sub/moved.txt") == Data("k".utf8))
+        #expect(FileManager.default.fileExists(atPath: subURL.appendingPathComponent("keep.txt").path))
+    }
+
+    @Test(.tags(.overlay))
+    func `overlay stat passes through source metadata for untouched files`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayMetadata")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let fileURL = root.appendingPathComponent("old.txt")
+        try Data("old".utf8).write(to: fileURL)
+        let past = Date(timeIntervalSince1970: 946_684_800)
+        try FileManager.default.setAttributes(
+            [.modificationDate: past, .posixPermissions: 0o640],
+            ofItemAtPath: fileURL.path
+        )
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        let info = try await filesystem.stat(path: "/old.txt")
+
+        #expect(info.permissions == POSIXPermissions(0o640))
+        let mtime = try #require(info.modificationDate)
+        #expect(abs(mtime.timeIntervalSince(past)) < 1.5)
+    }
+
+    @Test(.tags(.overlay))
     func `overlay filesystem reload requires a configured root and treats missing roots as empty`() async throws {
         let unconfigured = OverlayFilesystem()
 
@@ -731,6 +1014,7 @@ struct FilesystemTests {
             #expect(error.description.contains("invalid app group identifier"))
         }
 
+        #if canImport(Darwin)
         do {
             _ = try SandboxFilesystem(
                 root: .appGroup("group.workspace.tests.missing"),
@@ -740,6 +1024,14 @@ struct FilesystemTests {
         } catch let error as WorkspaceError {
             #expect(error.description.contains("app group container unavailable"))
         }
+        #else
+        do {
+            _ = try SandboxFilesystem(root: .appGroup("group.workspace.tests.missing"))
+            Issue.record("expected unavailable app group rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("app group container unavailable"))
+        }
+        #endif
 
         let firstRoot = try FilesystemTestSupport.makeTempDirectory(prefix: "SandboxFirst")
         defer { FilesystemTestSupport.removeDirectory(firstRoot) }

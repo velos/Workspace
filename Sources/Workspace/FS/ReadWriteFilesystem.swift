@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// A disk-backed filesystem rooted at a concrete directory on the host filesystem.
 ///
 /// Paths are resolved relative to the configured root and constrained so callers cannot escape that root
@@ -43,9 +49,12 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// See ``FileSystem/stat(path:)``.
+    ///
+    /// Uses `lstat` semantics: a symlink is reported as a symlink without resolving its target,
+    /// so links pointing outside the root can still be inspected.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
         let configuration = try requireConfiguration()
-        let url = try existingURL(for: path, configuration: configuration)
+        let url = try noFollowURL(for: path, configuration: configuration)
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
 
         let fileType = attributes[.type] as? FileAttributeType
@@ -100,6 +109,87 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         return try Data(contentsOf: url)
     }
 
+    /// See ``FileSystem/capabilities()``.
+    public func capabilities() async -> FileSystemCapabilities {
+        [.symlinks, .hardLinks, .permissions, .realPathResolution]
+    }
+
+    /// See ``FileSystem/readFile(path:offset:length:)``. Reads only the requested range using a
+    /// seeking file handle instead of loading the whole file.
+    public func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data {
+        if let length, length < 0 {
+            throw WorkspaceError.unsupported("read length must not be negative")
+        }
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        guard offset < size else {
+            return Data()
+        }
+        try handle.seek(toOffset: offset)
+        if let length {
+            return try handle.read(upToCount: length) ?? Data()
+        }
+        return try handle.readToEnd() ?? Data()
+    }
+
+    /// See ``FileSystem/readFileChunks(path:chunkSize:)``. Streams the file incrementally so
+    /// large files never need to be fully resident.
+    public func readFileChunks(
+        path: WorkspacePath,
+        chunkSize: Int
+    ) async throws -> AsyncThrowingStream<Data, Error> {
+        guard chunkSize > 0 else {
+            throw WorkspaceError.unsupported("chunk size must be positive")
+        }
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
+        // Validate readability up front so the caller sees open errors directly.
+        let probe = try FileHandle(forReadingFrom: url)
+        try probe.close()
+
+        return AsyncThrowingStream { continuation in
+            let reader = Task.detached {
+                do {
+                    let handle = try FileHandle(forReadingFrom: url)
+                    defer { try? handle.close() }
+                    while !Task.isCancelled {
+                        guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
+                            break
+                        }
+                        continuation.yield(chunk)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                reader.cancel()
+            }
+        }
+    }
+
+    /// See ``FileSystem/createFile(path:data:)``. Uses an exclusive write so concurrent creators
+    /// cannot overwrite each other.
+    public func createFile(path: WorkspacePath, data: Data) async throws {
+        let configuration = try requireConfiguration()
+        let url = try creationURL(for: path, configuration: configuration)
+        let parent = url.deletingLastPathComponent()
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        do {
+            try data.write(to: url, options: [.withoutOverwriting])
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain, nsError.code == CocoaError.fileWriteFileExists.rawValue {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EEXIST))
+            }
+            throw error
+        }
+    }
+
     /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         let configuration = try requireConfiguration()
@@ -126,15 +216,18 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// See ``FileSystem/remove(path:recursive:)``.
+    ///
+    /// Uses `lstat` semantics: removing a symlink unlinks the link itself — never its target —
+    /// so dangling links and links pointing outside the root can be cleaned up.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
         let configuration = try requireConfiguration()
-        let url = try existingURL(for: path, configuration: configuration)
+        let url = try noFollowURL(for: path, configuration: configuration)
 
-        var isDirectory: ObjCBool = false
-        let exists = fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory)
-        guard exists else { return }
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else {
+            return
+        }
 
-        if isDirectory.boolValue, !recursive {
+        if attributes[.type] as? FileAttributeType == .typeDirectory, !recursive {
             let contents = try fileManager.contentsOfDirectory(atPath: url.path)
             if !contents.isEmpty {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTEMPTY))
@@ -147,7 +240,7 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         let configuration = try requireConfiguration()
-        let source = try existingURL(for: sourcePath, configuration: configuration)
+        let source = try noFollowURL(for: sourcePath, configuration: configuration)
         let destination = try creationURL(for: destinationPath, configuration: configuration)
         let parent = destination.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -159,7 +252,7 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         async throws
     {
         let configuration = try requireConfiguration()
-        let source = try existingURL(for: sourcePath, configuration: configuration)
+        let source = try noFollowURL(for: sourcePath, configuration: configuration)
         let destination = try creationURL(for: destinationPath, configuration: configuration)
 
         let sourceInfo = try stat(path: sourcePath, configuration: configuration)
@@ -202,9 +295,12 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// See ``FileSystem/readSymlink(path:)``.
+    ///
+    /// Uses `lstat` semantics so the target string of a link pointing outside the root can still
+    /// be read without dereferencing it.
     public func readSymlink(path: WorkspacePath) async throws -> String {
         let configuration = try requireConfiguration()
-        let url = try existingURL(for: path, configuration: configuration)
+        let url = try noFollowURL(for: path, configuration: configuration)
         return try fileManager.destinationOfSymbolicLink(atPath: url.path)
     }
 
@@ -225,14 +321,18 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// See ``FileSystem/exists(path:)``.
+    ///
+    /// Uses `lstat` semantics behind the same containment check as other entry operations: a
+    /// symlink exists even when dangling, and its target is never resolved, so this cannot be
+    /// used to probe paths outside the root.
     public func exists(path: WorkspacePath) async -> Bool {
         if path.string.contains("\u{0}") {
             return false
         }
         do {
             let configuration = try requireConfiguration()
-            let url = try existingOrPotentialURL(for: path, configuration: configuration)
-            return fileManager.fileExists(atPath: url.path)
+            let url = try noFollowURL(for: path, configuration: configuration)
+            return (try? fileManager.attributesOfItem(atPath: url.path)) != nil
         } catch {
             return false
         }
@@ -305,6 +405,23 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         return url
     }
 
+    /// Returns a jailed URL for operations on the entry itself (`lstat` semantics): the parent
+    /// chain is resolved and containment-checked, but a symlink at the final component is not
+    /// followed. This lets callers stat, remove, or move a symlink whose target lies outside the
+    /// root without ever dereferencing it.
+    private func noFollowURL(
+        for virtualPath: WorkspacePath,
+        configuration: ConfigurationSnapshot
+    ) throws -> URL {
+        let url = try existingOrPotentialURL(for: virtualPath, configuration: configuration)
+        if virtualPath.isRoot {
+            try ensureInsideRoot(url, configuration: configuration)
+            return url
+        }
+        try ensureInsideRoot(url.deletingLastPathComponent(), configuration: configuration)
+        return url
+    }
+
     /// The parent containment check never resolves the destination's final component, so a
     /// pre-existing symlink at the destination could redirect follow-on opens (for example an
     /// append) outside the configured root. Reject destinations whose final component is a
@@ -358,7 +475,7 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     private func stat(path: WorkspacePath, configuration: ConfigurationSnapshot) throws -> FileInfo {
-        let url = try existingURL(for: path, configuration: configuration)
+        let url = try noFollowURL(for: path, configuration: configuration)
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
 
         let fileType = attributes[.type] as? FileAttributeType

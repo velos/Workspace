@@ -33,7 +33,7 @@ Many agent and tooling flows need more than plain disk I/O:
 - `FileSystem`: low-level protocol for custom filesystem backends
 - `ReadWriteFilesystem`: real disk access rooted to a configured directory
 - `InMemoryFilesystem`: fully in-memory filesystem for isolated workspaces and tests
-- `OverlayFilesystem`: snapshot a disk root and keep writes in memory
+- `OverlayFilesystem`: lazy copy-on-write view of a disk root — reads pass through, writes stay in memory
 - `MountableFilesystem`: compose multiple filesystems under one virtual tree
 - `PermissionedFileSystem`: wrap any filesystem with operation-level approvals
 - `SandboxFilesystem`: convenience wrapper for app sandbox roots
@@ -96,7 +96,7 @@ let workspace = Workspace(
 )
 ```
 
-`Storage.directory(at:)` writes checkpoint and snapshot JSON plus a `mutations.jsonl` append log (one JSON record per line) under `<url>/<workspaceId>/`. A legacy `mutations.json` array is migrated to JSONL on first access. The store assigns monotonic `sequence` numbers while holding `mutations.lock` (advisory `flock` where the OS supports it), so multiple `Workspace` instances that share a `workspaceId` and store do not collide on mutation sequence. Appends read only the log's final record to derive the next sequence, and a partial trailing line left by a crashed append is skipped on read and truncated before the next append. The current checkpoint head is derived from the parent-id graph (unparented tips), not only from `createdAt` ordering, which reduces surprises when wall clocks differ between processes. Listing mutations still reads the full log; very long histories may need application-level rotation. Coordinating multiple hosts or network disks that do not honor `flock` may still require extra synchronization.
+`Storage.directory(at:)` writes checkpoint metadata, snapshot manifests, and a `mutations.jsonl` append log (one JSON record per line) under `<url>/<workspaceId>/`. Snapshots are content-addressed: file bytes are stored once per unique content in `blobs/<sha256>`, and each snapshot manifest references them by hash — so consecutive checkpoints share unchanged file content instead of re-serializing the whole tree, and contents are stored raw rather than base64-inflated. Legacy inline-snapshot JSON files and a legacy `mutations.json` array are still read (the latter is migrated to JSONL on first access). Blobs are retained until pruned by future GC tooling. The store assigns monotonic `sequence` numbers while holding `mutations.lock` (advisory `flock` where the OS supports it), so multiple `Workspace` instances that share a `workspaceId` and store do not collide on mutation sequence. Appends read only the log's final record to derive the next sequence, and a partial trailing line left by a crashed append is skipped on read and truncated before the next append. The current checkpoint head is derived from the parent-id graph (unparented tips), not only from `createdAt` ordering, which reduces surprises when wall clocks differ between processes. Listing mutations still reads the full log; very long histories may need application-level rotation. Coordinating multiple hosts or network disks that do not honor `flock` may still require extra synchronization.
 
 ### Reads
 
@@ -110,6 +110,16 @@ let matches = try await workspace.glob("/notes/*.txt", currentDirectory: "/")
 let tree = try await workspace.walkTree("/")
 let summary = try await workspace.summarizeTree("/")
 ```
+
+Glob wildcards use shell semantics: `*` and `?` match within a single path component, `**` matches recursively across components, and character classes support negation (`[!abc]`).
+
+Ranged reads avoid loading whole files when the backing filesystem supports seeking:
+
+```swift
+let slice = try await workspace.readData(from: "/blob.bin", offset: 1024, length: 4096)
+```
+
+At the `FileSystem` level, implementations also provide `readFileChunks(path:chunkSize:)` for streaming reads, `createFile(path:data:)` for exclusive creation (fails with `EEXIST`), and `capabilities()` to query optional features (symlinks, hard links, permissions, real-path resolution) without probe-and-catch.
 
 JSON helpers encode and decode through `Codable`:
 
@@ -126,7 +136,20 @@ print(config.enabled) // true
 
 ### Tracked Writes
 
-Every public write records an internal mutation:
+Every public write records a mutation. The history is public — `mutationRecords()` returns the ordered records including per-file effects and text diffs — and the amount of detail is configurable per workspace:
+
+```swift
+let workspace = Workspace(
+    filesystem: InMemoryFilesystem(),
+    tracking: .fullDiffs(maxDiffBytes: 1_000_000) // cap diff computation to 1 MB files
+)
+// .full        — full diffs, no size cap (default)
+// .pathsOnly   — touched paths and effects, no text diffs
+// .disabled    — no history at all; change events still fire, but merge cannot
+//                detect uncheckpointed edits made in this mode
+```
+
+Tracked writes:
 
 ```swift
 try await workspace.writeFile("/notes/todo.txt", content: "one")
@@ -206,7 +229,7 @@ print(all.count)
 print(snapshot.rootPath)
 ```
 
-Public `restoreSnapshot(_:)` is also tracked as a workspace mutation. Checkpoint rollback uses an internal untracked restore so the rollback is represented by the rollback checkpoint, not by a second restore mutation.
+Public `restoreSnapshot(_:)` is also tracked as a workspace mutation. Checkpoint rollback records the tree changes it performs as a `rollback` mutation in addition to the rollback checkpoint, so the mutation log remains a complete account of filesystem changes. Long-running workspaces can bound the log with `pruneMutationHistory(throughSequence:)`, which always retains the newest record so sequence numbers stay monotonic.
 
 ### Branch And Merge
 
@@ -228,6 +251,20 @@ print(merged.mergedFromCheckpointId == branchHead.id)       // true
 ```
 
 `merge(_:)` is optimistic. If the parent workspace head changed after `branch()` was created, merge throws `WorkspaceError.mergeConflict(parentWorkspaceId:expectedBase:actualHead:)`. If the parent made tracked writes after `branch()` without creating a checkpoint, merge throws `WorkspaceError.mergeUncheckpointedChanges(parentWorkspaceId:baseMutationCursor:currentMutationCursor:)` instead of silently overwriting those edits; create a checkpoint or roll the parent back first.
+
+`mergeThreeWay(_:label:)` merges even when both sides advanced. Each path is resolved against the branch's base checkpoint: the side that changed wins, identical changes merge cleanly, and when both sides changed the same path differently the merge applies nothing and returns structured conflicts instead of throwing:
+
+```swift
+let result = try await workspace.mergeThreeWay(branch, label: "merge draft")
+if result.applied {
+    print("merged as checkpoint \(result.checkpoint!.id)")
+} else {
+    for conflict in result.conflicts {
+        print("conflict at \(conflict.path): \(conflict.kind)")
+        // conflict.oursDiff / conflict.theirsDiff carry base→side diffs for text files
+    }
+}
+```
 
 ## Common Filesystem Patterns
 
@@ -252,6 +289,8 @@ let workspace = Workspace(filesystem: filesystem)
 let preview = try await workspace.summarizeTree("/Sources", maxDepth: 2)
 try await workspace.writeFile("/SCRATCH.md", content: "overlay-only change\n")
 ```
+
+The overlay is lazy: nothing is copied at configuration time, reads pass through to the source directory (so files that change on disk are visible immediately), and only mutated entries are copied up into memory. Deletions are recorded as whiteouts that hide the source entry without touching the disk. `reload()` discards all overlay writes and whiteouts.
 
 ### Mounted Workspaces
 
@@ -308,6 +347,7 @@ let workspace = Workspace(filesystem: filesystem)
 ## Security Notes
 
 - Jail and root enforcement belong to the underlying filesystem implementation.
+- `ReadWriteFilesystem` uses `lstat` semantics for entry-level operations (`stat`, `exists`, `remove`, `move` source, `readSymlink`): a symlink is handled as the link itself, never its target, so links pointing outside the root can be inspected and deleted but not read or written through.
 - Permission checks are additive. They do not replace path normalization or jail enforcement.
 - If you expose `Workspace` to model-driven or remote callers, the host still needs to define what roots, mounts, and permissions are acceptable.
 

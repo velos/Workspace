@@ -184,6 +184,9 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     }
 
     /// Converts a shell-style glob pattern into an anchored regular expression pattern.
+    ///
+    /// `*` and `?` match within a single path component (they never cross `/`), `**` matches any
+    /// characters including `/`, and character classes support shell-style negation (`[!abc]`).
     public static func globToRegex(_ pattern: some StringProtocol) -> String {
         let pattern = String(pattern)
         var regex = "^"
@@ -192,13 +195,25 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
         while index < pattern.endIndex {
             let char = pattern[index]
             if char == "*" {
-                regex += ".*"
+                let nextIndex = pattern.index(after: index)
+                if nextIndex < pattern.endIndex, pattern[nextIndex] == "*" {
+                    regex += ".*"
+                    index = nextIndex
+                } else {
+                    regex += "[^/]*"
+                }
             } else if char == "?" {
-                regex += "."
+                regex += "[^/]"
             } else if char == "[" {
-                if let closeIndex = pattern[index...].firstIndex(of: "]") {
+                if let closeIndex = pattern[index...].firstIndex(of: "]"),
+                   closeIndex > pattern.index(after: index)
+                {
                     let range = pattern.index(after: index)..<closeIndex
-                    regex += "[" + String(pattern[range]) + "]"
+                    var body = String(pattern[range])
+                    if body.hasPrefix("!") {
+                        body = "^" + body.dropFirst()
+                    }
+                    regex += "[" + body + "]"
                     index = closeIndex
                 } else {
                     regex += "\\["

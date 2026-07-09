@@ -483,6 +483,129 @@ struct CheckpointStoreTests {
         }
     }
 
+    @Test
+    func `FileCheckpointStore deduplicates snapshot content into blobs`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let store = FileCheckpointStore(rootDirectory: root)
+        let workspaceId = UUID()
+
+        func fileEntry(_ path: WorkspacePath, _ text: String) -> Snapshot.Entry {
+            .file(Snapshot.File(path: path, data: Data(text.utf8), permissions: POSIXPermissions(0o644)))
+        }
+        func tree(_ children: [Snapshot.Entry]) -> Snapshot {
+            Snapshot(
+                rootPath: .root,
+                entry: .directory(
+                    Snapshot.Directory(path: .root, permissions: .defaultDirectory, children: children)
+                )
+            )
+        }
+
+        let first = tree([fileEntry("/a.txt", "alpha"), fileEntry("/b.txt", "beta")])
+        let second = tree([fileEntry("/a.txt", "alpha"), fileEntry("/b.txt", "changed")])
+        try await store.saveSnapshot(first, workspaceId: workspaceId)
+        try await store.saveSnapshot(second, workspaceId: workspaceId)
+
+        // "alpha" is shared between the snapshots and stored once: three blobs, not four.
+        let blobsDirectory = root
+            .appendingPathComponent(workspaceId.uuidString, isDirectory: true)
+            .appendingPathComponent("blobs", isDirectory: true)
+        let blobs = try FileManager.default.contentsOfDirectory(atPath: blobsDirectory.path)
+        #expect(blobs.count == 3)
+
+        // The manifest carries hashes, not base64-inflated contents.
+        let manifestURL = root
+            .appendingPathComponent(workspaceId.uuidString, isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent("\(first.id.uuidString).json", isDirectory: false)
+        let manifestText = try String(contentsOf: manifestURL, encoding: .utf8)
+        #expect(!manifestText.contains(Data("alpha".utf8).base64EncodedString()))
+        #expect(manifestText.contains("\"version\""))
+        #expect(manifestText.contains(SHA256.hexDigest(of: Data("alpha".utf8))))
+
+        // Loading reconstructs full snapshots, including contents and permissions.
+        #expect(try await store.loadSnapshot(id: first.id, workspaceId: workspaceId) == first)
+        #expect(try await store.loadSnapshot(id: second.id, workspaceId: workspaceId) == second)
+
+        // A fresh store instance reads the same artifacts.
+        let reader = FileCheckpointStore(rootDirectory: root)
+        #expect(try await reader.loadSnapshot(id: second.id, workspaceId: workspaceId) == second)
+    }
+
+    @Test
+    func `FileCheckpointStore loads legacy inline snapshots`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let snapshot = Snapshot(
+            rootPath: .root,
+            entry: .directory(
+                Snapshot.Directory(
+                    path: .root,
+                    permissions: .defaultDirectory,
+                    children: [
+                        .file(Snapshot.File(path: "/x.txt", data: Data("legacy".utf8), permissions: POSIXPermissions(0o600))),
+                    ]
+                )
+            )
+        )
+
+        // Write the legacy format (full snapshot with inline contents) directly.
+        let snapshotsDirectory = root
+            .appendingPathComponent(workspaceId.uuidString, isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+        try FileManager.default.createDirectory(at: snapshotsDirectory, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(snapshot).write(
+            to: snapshotsDirectory.appendingPathComponent("\(snapshot.id.uuidString).json", isDirectory: false)
+        )
+
+        let store = FileCheckpointStore(rootDirectory: root)
+        #expect(try await store.loadSnapshot(id: snapshot.id, workspaceId: workspaceId) == snapshot)
+    }
+
+    @Test
+    func `pruneMutationRecords bounds the log and keeps the newest record`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let store = FileCheckpointStore(rootDirectory: root)
+        let workspaceId = UUID()
+        for index in 0..<5 {
+            try await store.appendMutation(
+                MutationRecord(
+                    sequence: 0,
+                    workspaceId: workspaceId,
+                    kind: .writeFile,
+                    touchedPaths: [WorkspacePath(normalizing: "/file-\(index).txt")],
+                    fileChanges: []
+                )
+            )
+        }
+
+        try await store.pruneMutationRecords(workspaceId: workspaceId, throughSequence: 3)
+        #expect(try await store.listMutationRecords(workspaceId: workspaceId).map(\.sequence) == [4, 5])
+
+        // Pruning everything still retains the newest record so sequences stay monotonic.
+        try await store.pruneMutationRecords(workspaceId: workspaceId, throughSequence: 100)
+        #expect(try await store.listMutationRecords(workspaceId: workspaceId).map(\.sequence) == [5])
+
+        let appended = try await store.appendMutation(
+            MutationRecord(
+                sequence: 0,
+                workspaceId: workspaceId,
+                kind: .writeFile,
+                touchedPaths: ["/next.txt"],
+                fileChanges: []
+            )
+        )
+        #expect(appended.sequence == 6)
+    }
+
     private func mutationsJsonlURL(root: URL, workspaceId: UUID) -> URL {
         root
             .appendingPathComponent(workspaceId.uuidString, isDirectory: true)

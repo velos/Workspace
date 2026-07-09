@@ -151,6 +151,48 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
         return try await base.readFile(path: path)
     }
 
+    /// See ``FileSystem/readFile(path:offset:length:)``.
+    public func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data {
+        if let resolved = resolveMounted(path: path, mounts: mountsSnapshot()) {
+            return try await resolved.filesystem.readFile(
+                path: resolved.relativePath,
+                offset: offset,
+                length: length
+            )
+        }
+        return try await base.readFile(path: path, offset: offset, length: length)
+    }
+
+    /// See ``FileSystem/readFileChunks(path:chunkSize:)``.
+    public func readFileChunks(
+        path: WorkspacePath,
+        chunkSize: Int
+    ) async throws -> AsyncThrowingStream<Data, Error> {
+        if let resolved = resolveMounted(path: path, mounts: mountsSnapshot()) {
+            return try await resolved.filesystem.readFileChunks(
+                path: resolved.relativePath,
+                chunkSize: chunkSize
+            )
+        }
+        return try await base.readFileChunks(path: path, chunkSize: chunkSize)
+    }
+
+    /// See ``FileSystem/createFile(path:data:)``.
+    public func createFile(path: WorkspacePath, data: Data) async throws {
+        let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
+        try await resolved.filesystem.createFile(path: resolved.relativePath, data: data)
+    }
+
+    /// See ``FileSystem/capabilities()``. Reports the intersection of the base filesystem's and
+    /// every mount's capabilities, since a path may resolve to any of them.
+    public func capabilities() async -> FileSystemCapabilities {
+        var combined = await base.capabilities()
+        for mount in mountsSnapshot() {
+            combined.formIntersection(await mount.filesystem.capabilities())
+        }
+        return combined
+    }
+
     /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         let resolved = resolveWritable(path: path, mounts: mountsSnapshot())

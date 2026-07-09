@@ -17,6 +17,21 @@ public actor Workspace {
         case directory(at: URL)
     }
 
+    /// Controls how much detail tracked writes record in the mutation log.
+    public enum TrackingPolicy: Sendable, Equatable {
+        /// Record full mutation records including per-file line diffs. `maxDiffBytes` caps the
+        /// content size for which diffs are computed; larger files are recorded without a diff.
+        case fullDiffs(maxDiffBytes: Int?)
+        /// Record mutation records with touched paths and effects but no text diffs.
+        case pathsOnly
+        /// Record no mutation history at all. Change events still fire, but ``Workspace/merge(_:label:)``
+        /// cannot detect uncheckpointed edits made in this mode.
+        case disabled
+
+        /// Full diffs with no size cap. The default.
+        public static let full = TrackingPolicy.fullDiffs(maxDiffBytes: nil)
+    }
+
     struct CheckpointWatcher {
         var deliveredCheckpointIds: Set<UUID>
         var continuation: AsyncStream<CheckpointEvent>.Continuation
@@ -29,6 +44,8 @@ public actor Workspace {
     /// The property is immutable after initialization, but the returned filesystem retains its normal
     /// ``FileSystem`` capabilities.
     public nonisolated let filesystem: any FileSystem
+    /// How much detail tracked writes record. See ``TrackingPolicy``.
+    public nonisolated let tracking: TrackingPolicy
     let store: any CheckpointStore
     let baseCheckpointId: UUID?
     /// The parent's mutation sequence at the moment this workspace was branched. Merge uses it to
@@ -66,13 +83,15 @@ public actor Workspace {
     public init(
         workspaceId: UUID = UUID(),
         filesystem: any FileSystem,
-        storage: Storage = .inMemory
+        storage: Storage = .inMemory,
+        tracking: TrackingPolicy = .full
     ) {
         self.init(
             workspaceId: workspaceId,
             filesystem: filesystem,
             store: Self.makeStore(for: storage),
-            baseCheckpointId: nil
+            baseCheckpointId: nil,
+            tracking: tracking
         )
     }
 
@@ -81,13 +100,15 @@ public actor Workspace {
         filesystem: any FileSystem,
         store: any CheckpointStore,
         baseCheckpointId: UUID? = nil,
-        baseMutationCursor: Int? = nil
+        baseMutationCursor: Int? = nil,
+        tracking: TrackingPolicy = .full
     ) {
         self.workspaceId = workspaceId
         self.filesystem = filesystem
         self.store = store
         self.baseCheckpointId = baseCheckpointId
         self.baseMutationCursor = baseMutationCursor
+        self.tracking = tracking
     }
 
     static func makeStore(for storage: Storage) -> any CheckpointStore {
@@ -102,6 +123,12 @@ public actor Workspace {
     /// Reads raw file contents from the workspace.
     public func readData(from path: WorkspacePath) async throws -> Data {
         try await filesystem.readFile(path: path)
+    }
+
+    /// Reads up to `length` bytes starting at `offset` without loading the whole file when the
+    /// backing filesystem supports ranged reads.
+    public func readData(from path: WorkspacePath, offset: UInt64, length: Int? = nil) async throws -> Data {
+        try await filesystem.readFile(path: path, offset: offset, length: length)
     }
 
     /// Writes raw file data to the workspace, replacing any existing contents.
@@ -790,6 +817,7 @@ public actor Workspace {
                         path: path,
                         replacements: replacement.count,
                         diff: textDiff(from: originalContent, to: replacement.updatedContent)
+                            ?? TextDiff(hunks: [])
                     ),
                     updatedContent: replacement.updatedContent,
                     nodeKind: info.kind
@@ -915,9 +943,16 @@ public actor Workspace {
     ) async throws -> FileEdit.Entry {
         switch edit {
         case let .writeFile(path, content):
-            let original = try await readUTF8IfPresent(path, on: target)
             let info = try await statIfPresent(path, on: target)
-            let effect = effect(forOriginalContent: original, updatedContent: content)
+            let original = computesDiffs ? try await readUTF8IfPresent(path, on: target) : nil
+            let effect: FileEdit.Effect =
+                if info == nil {
+                    .created
+                } else if computesDiffs {
+                    effect(forOriginalContent: original, updatedContent: content)
+                } else {
+                    .modified
+                }
             return FileEdit.Entry(
                 edit: edit,
                 changeState: changeState(for: effect),
@@ -933,10 +968,17 @@ public actor Workspace {
                 ]
             )
         case let .appendFile(path, content):
-            let original = try await readUTF8IfPresent(path, on: target)
-            let updated = (original ?? "") + content
             let info = try await statIfPresent(path, on: target)
-            let effect = effect(forOriginalContent: original, updatedContent: updated)
+            let original = computesDiffs ? try await readUTF8IfPresent(path, on: target) : nil
+            let updated = (original ?? "") + content
+            let effect: FileEdit.Effect =
+                if info == nil {
+                    .created
+                } else if computesDiffs {
+                    effect(forOriginalContent: original, updatedContent: updated)
+                } else {
+                    .modified
+                }
             return FileEdit.Entry(
                 edit: edit,
                 changeState: changeState(for: effect),
@@ -1027,7 +1069,7 @@ public actor Workspace {
         }
 
         let diff: TextDiff?
-        if info.kind == .symlink {
+        if info.kind == .symlink || !computesDiffs {
             diff = nil
         } else if let originalContent = try await readUTF8IfPresent(
             path,
@@ -1188,11 +1230,43 @@ public actor Workspace {
         ]
     }
 
+    /// A content-free tree capture used only to plan change events. Unlike ``RollbackCapture``
+    /// it never reads file bytes, so planning deletion or transfer events for a large subtree
+    /// costs stats and listings, not file contents.
+    private indirect enum StructureCapture: Sendable {
+        case missing
+        case file(path: WorkspacePath)
+        case symlink(path: WorkspacePath)
+        case directory(path: WorkspacePath, children: [StructureCapture])
+    }
+
+    private func structureCapture(path: WorkspacePath, on target: any FileSystem) async throws -> StructureCapture {
+        guard await target.exists(path: path) else {
+            return .missing
+        }
+
+        let info = try await target.stat(path: path)
+        switch info.kind {
+        case .directory:
+            let entries = try await target.listDirectory(path: path)
+            let children = try await entries
+                .sorted { $0.name < $1.name }
+                .asyncMap { [self] entry in
+                    try await self.structureCapture(path: path.appending(entry.name), on: target)
+                }
+            return .directory(path: path, children: children)
+        case .symlink:
+            return .symlink(path: path)
+        case .file:
+            return .file(path: path)
+        }
+    }
+
     private func plannedDeletionEvents(
         at path: WorkspacePath,
         on target: any FileSystem
     ) async throws -> [ChangeEvent] {
-        let capture = try await rollbackCapture(path: path, on: target)
+        let capture = try await structureCapture(path: path, on: target)
         return flattenDeletionEvents(from: capture)
     }
 
@@ -1202,7 +1276,7 @@ public actor Workspace {
         kind: ChangeEvent.Kind,
         on target: any FileSystem
     ) async throws -> [ChangeEvent] {
-        let capture = try await rollbackCapture(path: sourcePath, on: target)
+        let capture = try await structureCapture(path: sourcePath, on: target)
         return flattenTransferEvents(
             from: capture,
             sourceRoot: sourcePath,
@@ -1212,7 +1286,7 @@ public actor Workspace {
     }
 
     private func changeEvents(for replacement: PlannedReplacement) -> [ChangeEvent] {
-        guard !replacement.change.diff.hunks.isEmpty else {
+        guard replacement.change.replacements > 0 else {
             return []
         }
 
@@ -1225,15 +1299,15 @@ public actor Workspace {
         ]
     }
 
-    private func flattenDeletionEvents(from capture: RollbackCapture) -> [ChangeEvent] {
+    private func flattenDeletionEvents(from capture: StructureCapture) -> [ChangeEvent] {
         switch capture {
         case .missing:
             return []
-        case let .file(path, _, _):
+        case let .file(path):
             return [ChangeEvent(kind: .deleted, path: path, nodeKind: .file)]
-        case let .symlink(path, _, _):
+        case let .symlink(path):
             return [ChangeEvent(kind: .deleted, path: path, nodeKind: .symlink)]
-        case let .directory(path, _, children):
+        case let .directory(path, children):
             var events: [ChangeEvent] = []
             for child in children {
                 events += flattenDeletionEvents(from: child)
@@ -1250,7 +1324,7 @@ public actor Workspace {
     }
 
     private func flattenTransferEvents(
-        from capture: RollbackCapture,
+        from capture: StructureCapture,
         sourceRoot: WorkspacePath,
         destinationRoot: WorkspacePath,
         kind: ChangeEvent.Kind
@@ -1258,7 +1332,7 @@ public actor Workspace {
         switch capture {
         case .missing:
             return []
-        case let .file(path, _, _):
+        case let .file(path):
             return [
                 ChangeEvent(
                     kind: kind,
@@ -1267,7 +1341,7 @@ public actor Workspace {
                     nodeKind: .file
                 ),
             ]
-        case let .symlink(path, _, _):
+        case let .symlink(path):
             return [
                 ChangeEvent(
                     kind: kind,
@@ -1276,7 +1350,7 @@ public actor Workspace {
                     nodeKind: .symlink
                 ),
             ]
-        case let .directory(path, _, children):
+        case let .directory(path, children):
             var events: [ChangeEvent] = [
                 ChangeEvent(
                     kind: kind,
@@ -1344,8 +1418,24 @@ public actor Workspace {
         }
     }
 
-    private func textDiff(from originalContent: String, to updatedContent: String) -> TextDiff {
-        TextDiff.lineBased(from: originalContent, to: updatedContent)
+    /// Whether the tracking policy calls for line diffs at all.
+    var computesDiffs: Bool {
+        if case .fullDiffs = tracking {
+            return true
+        }
+        return false
+    }
+
+    private func textDiff(from originalContent: String, to updatedContent: String) -> TextDiff? {
+        guard case let .fullDiffs(maxDiffBytes) = tracking else {
+            return nil
+        }
+        if let maxDiffBytes,
+           originalContent.utf8.count > maxDiffBytes || updatedContent.utf8.count > maxDiffBytes
+        {
+            return nil
+        }
+        return TextDiff.lineBased(from: originalContent, to: updatedContent)
     }
 
     private func describe(_ error: any Error) -> String {

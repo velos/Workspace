@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// A purely in-memory filesystem implementation.
 ///
 /// This implementation is useful for tests, previews, and transient workspaces where no host disk
@@ -117,6 +123,20 @@ public actor InMemoryFilesystem: FileSystem {
         }
 
         return data
+    }
+
+    /// See ``FileSystem/capabilities()``.
+    public func capabilities() async -> FileSystemCapabilities {
+        [.symlinks, .hardLinks, .permissions, .realPathResolution]
+    }
+
+    /// See ``FileSystem/createFile(path:data:)``. Actor isolation makes the existence check and
+    /// write a single atomic step.
+    public func createFile(path: WorkspacePath, data: Data) async throws {
+        if (try? node(at: path, followFinalSymlink: false)) != nil {
+            throw posixError(EEXIST)
+        }
+        try await writeFile(path: path, data: data, append: false)
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.

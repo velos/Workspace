@@ -1,3 +1,4 @@
+#if canImport(Darwin)
 import Foundation
 
 /// A disk-backed filesystem rooted at a security-scoped URL.
@@ -142,6 +143,30 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
         try await backing.readFile(path: path)
     }
 
+    /// See ``FileSystem/readFile(path:offset:length:)``.
+    public func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data {
+        try await backing.readFile(path: path, offset: offset, length: length)
+    }
+
+    /// See ``FileSystem/readFileChunks(path:chunkSize:)``.
+    public func readFileChunks(
+        path: WorkspacePath,
+        chunkSize: Int
+    ) async throws -> AsyncThrowingStream<Data, Error> {
+        try await backing.readFileChunks(path: path, chunkSize: chunkSize)
+    }
+
+    /// See ``FileSystem/createFile(path:data:)``.
+    public func createFile(path: WorkspacePath, data: Data) async throws {
+        try ensureWritable()
+        try await backing.createFile(path: path, data: data)
+    }
+
+    /// See ``FileSystem/capabilities()``.
+    public func capabilities() async -> FileSystemCapabilities {
+        await backing.capabilities()
+    }
+
     /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         try ensureWritable()
@@ -257,3 +282,4 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
     private static let bookmarkResolutionOptions: URL.BookmarkResolutionOptions = []
     #endif
 }
+#endif
