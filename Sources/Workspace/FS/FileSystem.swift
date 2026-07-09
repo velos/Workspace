@@ -22,6 +22,9 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
     case snapshotNotFound(UUID)
     /// The parent workspace changed after a branch was created, so the branch cannot be merged.
     case mergeConflict(parentWorkspaceId: UUID, expectedBase: UUID?, actualHead: UUID?)
+    /// The parent workspace has tracked mutations that no checkpoint captures, so merging would
+    /// silently discard them.
+    case mergeUncheckpointedChanges(parentWorkspaceId: UUID, baseMutationCursor: Int, currentMutationCursor: Int)
     /// A tracked workspace mutation could not be recorded.
     case mutationFailed(String)
 
@@ -53,6 +56,8 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
             let expected = expectedBase?.uuidString ?? "nil"
             let actual = actualHead?.uuidString ?? "nil"
             return "cannot merge branch into workspace \(parentWorkspaceId.uuidString): expected base \(expected), current head is \(actual)"
+        case let .mergeUncheckpointedChanges(parentWorkspaceId, baseMutationCursor, currentMutationCursor):
+            return "cannot merge branch into workspace \(parentWorkspaceId.uuidString): the workspace has uncheckpointed changes (mutation sequence \(currentMutationCursor), branch base \(baseMutationCursor)); create a checkpoint or roll back before merging"
         case let .mutationFailed(message):
             return message
         }
