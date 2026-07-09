@@ -273,6 +273,96 @@ struct FilesystemTests {
         #expect(try await filesystem.glob(pattern: "/docs/**/*.txt", currentDirectory: "/").contains("/docs/sub/deep.txt"))
     }
 
+    @Test(.tags(.readWrite))
+    func `ranged and chunked reads return consistent slices`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRanged")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let payload = Data("0123456789".utf8)
+        try await filesystem.writeFile(path: "/data.bin", data: payload, append: false)
+
+        #expect(try await filesystem.readFile(path: "/data.bin", offset: 0, length: nil) == payload)
+        #expect(try await filesystem.readFile(path: "/data.bin", offset: 3, length: 4) == Data("3456".utf8))
+        #expect(try await filesystem.readFile(path: "/data.bin", offset: 8, length: 10) == Data("89".utf8))
+        #expect(try await filesystem.readFile(path: "/data.bin", offset: 42, length: nil) == Data())
+
+        var chunks: [Data] = []
+        for try await chunk in try await filesystem.readFileChunks(path: "/data.bin", chunkSize: 3) {
+            chunks.append(chunk)
+        }
+        #expect(chunks.map(\.count) == [3, 3, 3, 1])
+        #expect(chunks.reduce(Data(), +) == payload)
+
+        // The protocol's default implementation used by the in-memory backend agrees.
+        let memory = InMemoryFilesystem()
+        try await memory.writeFile(path: "/data.bin", data: payload, append: false)
+        #expect(try await memory.readFile(path: "/data.bin", offset: 3, length: 4) == Data("3456".utf8))
+        #expect(try await memory.readFile(path: "/data.bin", offset: 42, length: 1) == Data())
+
+        var memoryChunks: [Data] = []
+        for try await chunk in try await memory.readFileChunks(path: "/data.bin", chunkSize: 4) {
+            memoryChunks.append(chunk)
+        }
+        #expect(memoryChunks.reduce(Data(), +) == payload)
+    }
+
+    @Test(.tags(.readWrite))
+    func `createFile is exclusive on disk and in memory`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemCreate")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.createFile(path: "/fresh/new.txt", data: Data("one".utf8))
+        #expect(try await filesystem.readFile(path: "/fresh/new.txt") == Data("one".utf8))
+
+        do {
+            try await filesystem.createFile(path: "/fresh/new.txt", data: Data("two".utf8))
+            Issue.record("expected EEXIST for existing file")
+        } catch let error as NSError {
+            #expect(error.domain == NSPOSIXErrorDomain)
+            #expect(error.code == Int(EEXIST))
+        }
+        #expect(try await filesystem.readFile(path: "/fresh/new.txt") == Data("one".utf8))
+
+        let memory = InMemoryFilesystem()
+        try await memory.createFile(path: "/new.txt", data: Data("one".utf8))
+        do {
+            try await memory.createFile(path: "/new.txt", data: Data("two".utf8))
+            Issue.record("expected EEXIST for existing file")
+        } catch let error as NSError {
+            #expect(error.code == Int(EEXIST))
+        }
+        #expect(try await memory.readFile(path: "/new.txt") == Data("one".utf8))
+    }
+
+    @Test(.tags(.permissions))
+    func `capabilities are advertised and forwarded through wrappers`() async throws {
+        let memory = InMemoryFilesystem()
+        let memoryCapabilities = await memory.capabilities()
+        #expect(memoryCapabilities.contains(.symlinks))
+        #expect(memoryCapabilities.contains(.permissions))
+
+        let permissioned = PermissionedFileSystem(
+            base: memory,
+            authorizer: PermissionAuthorizer { _ in .allow }
+        )
+        #expect(await permissioned.capabilities() == memoryCapabilities)
+
+        let denied = PermissionedFileSystem(
+            base: memory,
+            authorizer: PermissionAuthorizer { request in
+                request.operation == .writeFile ? .deny(message: "no writes") : .allow
+            }
+        )
+        do {
+            try await denied.createFile(path: "/x.txt", data: Data())
+            Issue.record("expected createFile denial through writeFile permission")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("no writes"))
+        }
+    }
+
     @Test(.tags(.inMemory))
     func `glob character classes support shell negation`() async throws {
         let filesystem = InMemoryFilesystem()

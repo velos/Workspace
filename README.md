@@ -113,6 +113,14 @@ let summary = try await workspace.summarizeTree("/")
 
 Glob wildcards use shell semantics: `*` and `?` match within a single path component, `**` matches recursively across components, and character classes support negation (`[!abc]`).
 
+Ranged reads avoid loading whole files when the backing filesystem supports seeking:
+
+```swift
+let slice = try await workspace.readData(from: "/blob.bin", offset: 1024, length: 4096)
+```
+
+At the `FileSystem` level, implementations also provide `readFileChunks(path:chunkSize:)` for streaming reads, `createFile(path:data:)` for exclusive creation (fails with `EEXIST`), and `capabilities()` to query optional features (symlinks, hard links, permissions, real-path resolution) without probe-and-catch.
+
 JSON helpers encode and decode through `Codable`:
 
 ```swift

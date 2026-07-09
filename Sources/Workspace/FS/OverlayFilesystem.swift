@@ -66,6 +66,29 @@ public actor OverlayFilesystem: FileSystem {
         try await overlay.readFile(path: path)
     }
 
+    /// See ``FileSystem/readFile(path:offset:length:)``.
+    public func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data {
+        try await overlay.readFile(path: path, offset: offset, length: length)
+    }
+
+    /// See ``FileSystem/readFileChunks(path:chunkSize:)``.
+    public func readFileChunks(
+        path: WorkspacePath,
+        chunkSize: Int
+    ) async throws -> AsyncThrowingStream<Data, Error> {
+        try await overlay.readFileChunks(path: path, chunkSize: chunkSize)
+    }
+
+    /// See ``FileSystem/createFile(path:data:)``.
+    public func createFile(path: WorkspacePath, data: Data) async throws {
+        try await overlay.createFile(path: path, data: data)
+    }
+
+    /// See ``FileSystem/capabilities()``.
+    public func capabilities() async -> FileSystemCapabilities {
+        await overlay.capabilities()
+    }
+
     /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         try await overlay.writeFile(path: path, data: data, append: append)

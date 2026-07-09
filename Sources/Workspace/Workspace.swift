@@ -104,6 +104,12 @@ public actor Workspace {
         try await filesystem.readFile(path: path)
     }
 
+    /// Reads up to `length` bytes starting at `offset` without loading the whole file when the
+    /// backing filesystem supports ranged reads.
+    public func readData(from path: WorkspacePath, offset: UInt64, length: Int? = nil) async throws -> Data {
+        try await filesystem.readFile(path: path, offset: offset, length: length)
+    }
+
     /// Writes raw file data to the workspace, replacing any existing contents.
     public func writeData(_ data: Data, to path: WorkspacePath) async throws {
         try await ensureLoaded()

@@ -49,6 +49,10 @@ jobs:
       - name: Show Swift version
         run: swift --version
 
+      - name: Mark workspace safe for git in container
+        if: runner.os == 'Linux'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Run test suite
         shell: bash
         run: |

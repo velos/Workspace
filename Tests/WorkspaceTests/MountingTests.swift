@@ -158,7 +158,10 @@ struct MountingTests {
 
         let globbed = try await filesystem.glob(pattern: "/docs/*.txt", currentDirectory: "/")
         #expect(globbed.contains("/docs/local.txt"))
-        #expect(globbed.contains("/docs/external/guide.txt"))
+        #expect(!globbed.contains("/docs/external/guide.txt"))
+
+        let nested = try await filesystem.glob(pattern: "/docs/**", currentDirectory: "/")
+        #expect(nested.contains("/docs/external/guide.txt"))
 
         try await filesystem.remove(path: "/docs/external/new.txt", recursive: false)
         #expect(!(await mountedDocs.exists(path: "/new.txt")))
@@ -291,6 +294,10 @@ struct MountingTests {
 
         let matches = try await filesystem.glob(pattern: "/*.txt", currentDirectory: "/")
         #expect(matches.contains("/a.txt"))
-        #expect(matches.contains("/m/b.txt"))
+        #expect(!matches.contains("/m/b.txt"))
+
+        let recursive = try await filesystem.glob(pattern: "/**.txt", currentDirectory: "/")
+        #expect(recursive.contains("/a.txt"))
+        #expect(recursive.contains("/m/b.txt"))
     }
 }

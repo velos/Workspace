@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Errors produced by workspace path and filesystem operations.
 public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
     /// The caller supplied a path that cannot be represented safely.
@@ -107,6 +113,27 @@ public struct DirectoryEntry: Sendable, Codable {
     }
 }
 
+/// Optional features a filesystem implementation can advertise.
+///
+/// Callers can branch on capabilities instead of probing operations and catching
+/// ``WorkspaceError/unsupported(_:)``.
+public struct FileSystemCapabilities: OptionSet, Sendable {
+    public let rawValue: Int
+
+    public init(rawValue: Int) {
+        self.rawValue = rawValue
+    }
+
+    /// Symbolic links can be created and read.
+    public static let symlinks = FileSystemCapabilities(rawValue: 1 << 0)
+    /// Hard links can be created.
+    public static let hardLinks = FileSystemCapabilities(rawValue: 1 << 1)
+    /// POSIX permissions can be read and mutated.
+    public static let permissions = FileSystemCapabilities(rawValue: 1 << 2)
+    /// ``FileSystem/resolveRealPath(path:)`` resolves symlink chains.
+    public static let realPathResolution = FileSystemCapabilities(rawValue: 1 << 3)
+}
+
 /// Read-only filesystem capabilities.
 public protocol ReadableFileSystem: AnyObject, Sendable {
     /// Returns metadata for the entry at `path`.
@@ -152,6 +179,15 @@ public protocol FileSystem: WritableFileSystem {
     func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws
     /// Resolves the real path of `path`, following symlinks.
     func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath
+    /// Returns the optional features this filesystem supports.
+    func capabilities() async -> FileSystemCapabilities
+    /// Reads up to `length` bytes starting at `offset`. Passing `nil` reads to the end of the
+    /// file; an offset at or past the end returns empty data.
+    func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data
+    /// Streams the file contents as chunks of at most `chunkSize` bytes.
+    func readFileChunks(path: WorkspacePath, chunkSize: Int) async throws -> AsyncThrowingStream<Data, Error>
+    /// Writes `data` to a new file, failing with `EEXIST` when an entry already exists at `path`.
+    func createFile(path: WorkspacePath, data: Data) async throws
 }
 
 extension FileSystem {
@@ -192,5 +228,55 @@ extension FileSystem {
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         _ = path
         throw WorkspaceError.unsupported("real path resolution is not supported by this filesystem")
+    }
+
+    /// The default implementation advertises no optional features.
+    public func capabilities() async -> FileSystemCapabilities {
+        []
+    }
+
+    /// The default implementation reads the whole file and slices the requested range.
+    /// Implementations backed by real files should override this with a seek-based read.
+    public func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data {
+        if let length, length < 0 {
+            throw WorkspaceError.unsupported("read length must not be negative")
+        }
+        let data = try await readFile(path: path)
+        guard offset < UInt64(data.count) else {
+            return Data()
+        }
+        let start = data.index(data.startIndex, offsetBy: Int(offset))
+        let end = length.map { data.index(start, offsetBy: $0, limitedBy: data.endIndex) ?? data.endIndex } ?? data.endIndex
+        return Data(data[start..<end])
+    }
+
+    /// The default implementation reads the whole file once and yields it in chunks.
+    /// Implementations backed by real files should override this with an incremental read.
+    public func readFileChunks(
+        path: WorkspacePath,
+        chunkSize: Int
+    ) async throws -> AsyncThrowingStream<Data, Error> {
+        guard chunkSize > 0 else {
+            throw WorkspaceError.unsupported("chunk size must be positive")
+        }
+        let data = try await readFile(path: path)
+        return AsyncThrowingStream { continuation in
+            var index = data.startIndex
+            while index < data.endIndex {
+                let end = data.index(index, offsetBy: chunkSize, limitedBy: data.endIndex) ?? data.endIndex
+                continuation.yield(Data(data[index..<end]))
+                index = end
+            }
+            continuation.finish()
+        }
+    }
+
+    /// The default implementation checks existence and then writes. Backends whose storage is
+    /// shared with other writers should override this with an atomic exclusive create.
+    public func createFile(path: WorkspacePath, data: Data) async throws {
+        if await exists(path: path) {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EEXIST))
+        }
+        try await writeFile(path: path, data: data, append: false)
     }
 }

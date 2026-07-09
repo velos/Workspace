@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// A disk-backed filesystem rooted at a concrete directory on the host filesystem.
 ///
 /// Paths are resolved relative to the configured root and constrained so callers cannot escape that root
@@ -101,6 +107,87 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         let configuration = try requireConfiguration()
         let url = try existingURL(for: path, configuration: configuration)
         return try Data(contentsOf: url)
+    }
+
+    /// See ``FileSystem/capabilities()``.
+    public func capabilities() async -> FileSystemCapabilities {
+        [.symlinks, .hardLinks, .permissions, .realPathResolution]
+    }
+
+    /// See ``FileSystem/readFile(path:offset:length:)``. Reads only the requested range using a
+    /// seeking file handle instead of loading the whole file.
+    public func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data {
+        if let length, length < 0 {
+            throw WorkspaceError.unsupported("read length must not be negative")
+        }
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        guard offset < size else {
+            return Data()
+        }
+        try handle.seek(toOffset: offset)
+        if let length {
+            return try handle.read(upToCount: length) ?? Data()
+        }
+        return try handle.readToEnd() ?? Data()
+    }
+
+    /// See ``FileSystem/readFileChunks(path:chunkSize:)``. Streams the file incrementally so
+    /// large files never need to be fully resident.
+    public func readFileChunks(
+        path: WorkspacePath,
+        chunkSize: Int
+    ) async throws -> AsyncThrowingStream<Data, Error> {
+        guard chunkSize > 0 else {
+            throw WorkspaceError.unsupported("chunk size must be positive")
+        }
+        let configuration = try requireConfiguration()
+        let url = try existingURL(for: path, configuration: configuration)
+        // Validate readability up front so the caller sees open errors directly.
+        let probe = try FileHandle(forReadingFrom: url)
+        try probe.close()
+
+        return AsyncThrowingStream { continuation in
+            let reader = Task.detached {
+                do {
+                    let handle = try FileHandle(forReadingFrom: url)
+                    defer { try? handle.close() }
+                    while !Task.isCancelled {
+                        guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
+                            break
+                        }
+                        continuation.yield(chunk)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                reader.cancel()
+            }
+        }
+    }
+
+    /// See ``FileSystem/createFile(path:data:)``. Uses an exclusive write so concurrent creators
+    /// cannot overwrite each other.
+    public func createFile(path: WorkspacePath, data: Data) async throws {
+        let configuration = try requireConfiguration()
+        let url = try creationURL(for: path, configuration: configuration)
+        let parent = url.deletingLastPathComponent()
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        do {
+            try data.write(to: url, options: [.withoutOverwriting])
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain, nsError.code == CocoaError.fileWriteFileExists.rawValue {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EEXIST))
+            }
+            throw error
+        }
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.
