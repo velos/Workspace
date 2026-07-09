@@ -96,7 +96,7 @@ let workspace = Workspace(
 )
 ```
 
-`Storage.directory(at:)` writes checkpoint and snapshot JSON plus a `mutations.jsonl` append log (one JSON record per line) under `<url>/<workspaceId>/`. A legacy `mutations.json` array is migrated to JSONL on first access. The store assigns monotonic `sequence` numbers while holding `mutations.lock` (advisory `flock` where the OS supports it), so multiple `Workspace` instances that share a `workspaceId` and store do not collide on mutation sequence. The current checkpoint head is derived from the parent-id graph (unparented tips), not only from `createdAt` ordering, which reduces surprises when wall clocks differ between processes. Listing or loading mutations still reads the full log; very long histories may need application-level rotation. Coordinating multiple hosts or network disks that do not honor `flock` may still require extra synchronization.
+`Storage.directory(at:)` writes checkpoint and snapshot JSON plus a `mutations.jsonl` append log (one JSON record per line) under `<url>/<workspaceId>/`. A legacy `mutations.json` array is migrated to JSONL on first access. The store assigns monotonic `sequence` numbers while holding `mutations.lock` (advisory `flock` where the OS supports it), so multiple `Workspace` instances that share a `workspaceId` and store do not collide on mutation sequence. Appends read only the log's final record to derive the next sequence, and a partial trailing line left by a crashed append is skipped on read and truncated before the next append. The current checkpoint head is derived from the parent-id graph (unparented tips), not only from `createdAt` ordering, which reduces surprises when wall clocks differ between processes. Listing mutations still reads the full log; very long histories may need application-level rotation. Coordinating multiple hosts or network disks that do not honor `flock` may still require extra synchronization.
 
 ### Reads
 
@@ -227,7 +227,7 @@ print(merged.mergedFromWorkspaceId == branch.workspaceId)   // true
 print(merged.mergedFromCheckpointId == branchHead.id)       // true
 ```
 
-`merge(_:)` is optimistic. If the parent workspace head changed after `branch()` was created, merge throws `WorkspaceError.mergeConflict(parentWorkspaceId:expectedBase:actualHead:)`.
+`merge(_:)` is optimistic. If the parent workspace head changed after `branch()` was created, merge throws `WorkspaceError.mergeConflict(parentWorkspaceId:expectedBase:actualHead:)`. If the parent made tracked writes after `branch()` without creating a checkpoint, merge throws `WorkspaceError.mergeUncheckpointedChanges(parentWorkspaceId:baseMutationCursor:currentMutationCursor:)` instead of silently overwriting those edits; create a checkpoint or roll the parent back first.
 
 ## Common Filesystem Patterns
 

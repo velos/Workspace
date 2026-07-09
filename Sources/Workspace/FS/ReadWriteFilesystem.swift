@@ -301,7 +301,23 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         let url = try existingOrPotentialURL(for: virtualPath, configuration: configuration)
         let parent = url.deletingLastPathComponent()
         try ensureInsideRoot(parent, configuration: configuration)
+        try ensureDestinationSymlinkStaysInsideRoot(url, configuration: configuration)
         return url
+    }
+
+    /// The parent containment check never resolves the destination's final component, so a
+    /// pre-existing symlink at the destination could redirect follow-on opens (for example an
+    /// append) outside the configured root. Reject destinations whose final component is a
+    /// symlink resolving outside the root.
+    private func ensureDestinationSymlinkStaysInsideRoot(
+        _ url: URL,
+        configuration: ConfigurationSnapshot
+    ) throws {
+        let attributes = try? fileManager.attributesOfItem(atPath: url.path)
+        guard attributes?[.type] as? FileAttributeType == .typeSymbolicLink else {
+            return
+        }
+        try ensureInsideRoot(url, configuration: configuration)
     }
 
     private func ensureInsideRoot(_ url: URL, configuration: ConfigurationSnapshot) throws {

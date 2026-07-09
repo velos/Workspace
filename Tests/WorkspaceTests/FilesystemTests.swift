@@ -154,6 +154,52 @@ struct FilesystemTests {
         }
     }
 
+    @Test(.tags(.readWrite))
+    func `read-write filesystem rejects writes through symlink escaping root`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let outside = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemOutside")
+        defer { FilesystemTestSupport.removeDirectory(outside) }
+
+        let outsideFile = outside.appendingPathComponent("target.txt")
+        try Data("original".utf8).write(to: outsideFile)
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.createSymlink(path: "/leak", target: outsideFile.path)
+
+        do {
+            try await filesystem.writeFile(path: "/leak", data: Data("injected".utf8), append: true)
+            Issue.record("expected invalid path error for append through escaping symlink")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("invalid path"))
+        }
+
+        do {
+            try await filesystem.writeFile(path: "/leak", data: Data("injected".utf8), append: false)
+            Issue.record("expected invalid path error for write through escaping symlink")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("invalid path"))
+        }
+
+        #expect(try Data(contentsOf: outsideFile) == Data("original".utf8))
+    }
+
+    @Test(.tags(.readWrite))
+    func `read-write filesystem still appends through symlink inside root`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.writeFile(path: "/real.txt", data: Data("one".utf8), append: false)
+        try await filesystem.createSymlink(path: "/alias", target: "real.txt")
+
+        try await filesystem.writeFile(path: "/alias", data: Data(" two".utf8), append: true)
+
+        let data = try await filesystem.readFile(path: "/real.txt")
+        #expect(String(decoding: data, as: UTF8.self) == "one two")
+    }
+
     @Test(.tags(.inMemory))
     func `in-memory filesystem reset clears prior contents`() async throws {
         let filesystem = InMemoryFilesystem()
