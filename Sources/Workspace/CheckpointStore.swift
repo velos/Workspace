@@ -20,6 +20,9 @@ protocol CheckpointStore: AnyObject, Sendable {
     @discardableResult
     func appendMutation(_ mutation: MutationRecord) async throws -> MutationRecord
     func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord]
+    /// Removes mutation records with `sequence <= throughSequence`. The record carrying the
+    /// highest sequence is always retained so later appends stay monotonic.
+    func pruneMutationRecords(workspaceId: UUID, throughSequence: Int) async throws
 }
 
 /// An in-memory checkpoint store for tests and ephemeral workspaces.
@@ -74,6 +77,18 @@ actor InMemoryCheckpointStore: CheckpointStore {
 
     func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
         (mutationsByWorkspace[workspaceId] ?? []).sorted { $0.sequence < $1.sequence }
+    }
+
+    func pruneMutationRecords(workspaceId: UUID, throughSequence: Int) async throws {
+        let records = (mutationsByWorkspace[workspaceId] ?? []).sorted { $0.sequence < $1.sequence }
+        guard let last = records.last else {
+            return
+        }
+        var kept = records.filter { $0.sequence > throughSequence }
+        if kept.isEmpty {
+            kept = [last]
+        }
+        mutationsByWorkspace[workspaceId] = kept
     }
 }
 
@@ -154,9 +169,39 @@ actor FileCheckpointStore: CheckpointStore {
         return result
     }
 
+    /// A persisted snapshot: the tree structure with file contents replaced by content hashes.
+    /// The bytes themselves live in per-workspace `blobs/<sha256>` files, so identical content is
+    /// stored once no matter how many snapshots reference it, and never base64-inflated.
+    private struct SnapshotManifest: Codable {
+        struct Node: Codable {
+            enum Kind: String, Codable {
+                case file, directory, symlink, missing
+            }
+
+            var kind: Kind
+            var path: WorkspacePath
+            var permissions: POSIXPermissions?
+            var contentHash: String?
+            var symlinkTarget: String?
+            var children: [Node]?
+        }
+
+        var version: Int
+        var id: UUID
+        var rootPath: WorkspacePath
+        var root: Node
+    }
+
     func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws {
         try ensureWorkspaceDirectories(for: workspaceId)
-        try write(snapshot, to: snapshotURL(id: snapshot.id, workspaceId: workspaceId))
+        let root = try writeManifestNode(snapshot.entry, workspaceId: workspaceId)
+        let manifest = SnapshotManifest(
+            version: 2,
+            id: snapshot.id,
+            rootPath: snapshot.rootPath,
+            root: root
+        )
+        try write(manifest, to: snapshotURL(id: snapshot.id, workspaceId: workspaceId))
     }
 
     func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
@@ -164,7 +209,97 @@ actor FileCheckpointStore: CheckpointStore {
         guard fileManager.fileExists(atPath: url.path) else {
             return nil
         }
-        return try read(Snapshot.self, from: url)
+        let data = try Data(contentsOf: url)
+        if let manifest = try? decoder.decode(SnapshotManifest.self, from: data) {
+            return Snapshot(
+                id: manifest.id,
+                rootPath: manifest.rootPath,
+                entry: try snapshotEntry(from: manifest.root, workspaceId: workspaceId)
+            )
+        }
+        // Legacy format: the full snapshot tree with inline base64 contents.
+        return try decoder.decode(Snapshot.self, from: data)
+    }
+
+    private func writeManifestNode(
+        _ entry: Snapshot.Entry,
+        workspaceId: UUID
+    ) throws -> SnapshotManifest.Node {
+        switch entry {
+        case let .missing(missing):
+            return SnapshotManifest.Node(kind: .missing, path: missing.path)
+        case let .file(file):
+            let hash = SHA256.hexDigest(of: file.data)
+            let url = blobURL(hash: hash, workspaceId: workspaceId)
+            if !fileManager.fileExists(atPath: url.path) {
+                try file.data.write(to: url, options: .atomic)
+            }
+            return SnapshotManifest.Node(
+                kind: .file,
+                path: file.path,
+                permissions: file.permissions,
+                contentHash: hash
+            )
+        case let .symlink(symlink):
+            return SnapshotManifest.Node(
+                kind: .symlink,
+                path: symlink.path,
+                permissions: symlink.permissions,
+                symlinkTarget: symlink.target
+            )
+        case let .directory(directory):
+            return SnapshotManifest.Node(
+                kind: .directory,
+                path: directory.path,
+                permissions: directory.permissions,
+                children: try directory.children.map {
+                    try writeManifestNode($0, workspaceId: workspaceId)
+                }
+            )
+        }
+    }
+
+    private func snapshotEntry(
+        from node: SnapshotManifest.Node,
+        workspaceId: UUID
+    ) throws -> Snapshot.Entry {
+        switch node.kind {
+        case .missing:
+            return .missing(Snapshot.Missing(path: node.path))
+        case .file:
+            guard let hash = node.contentHash else {
+                throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has no content hash")
+            }
+            let url = blobURL(hash: hash, workspaceId: workspaceId)
+            guard fileManager.fileExists(atPath: url.path) else {
+                throw WorkspaceError.storageCorrupted("missing content blob \(hash) for \(node.path)")
+            }
+            return .file(
+                Snapshot.File(
+                    path: node.path,
+                    data: try Data(contentsOf: url),
+                    permissions: node.permissions ?? POSIXPermissions(0o644)
+                )
+            )
+        case .symlink:
+            return .symlink(
+                Snapshot.Symlink(
+                    path: node.path,
+                    target: node.symlinkTarget ?? "",
+                    permissions: node.permissions ?? POSIXPermissions(0o777)
+                )
+            )
+        case .directory:
+            return .directory(
+                Snapshot.Directory(
+                    path: node.path,
+                    permissions: node.permissions ?? POSIXPermissions(0o755),
+                    children: try (node.children ?? []).map {
+                        try snapshotEntry(from: $0, workspaceId: workspaceId)
+                    }
+                )
+            )
+        }
     }
 
     @discardableResult
@@ -207,6 +342,30 @@ actor FileCheckpointStore: CheckpointStore {
         return try Self.withMutationsExclusiveLock(at: lockURL) {
             try loadAllMutations(jsonl: jsonl, legacy: legacy)
                 .sorted { $0.sequence < $1.sequence }
+        }
+    }
+
+    func pruneMutationRecords(workspaceId: UUID, throughSequence: Int) async throws {
+        let jsonl = mutationsJsonlURL(workspaceId: workspaceId)
+        let legacy = legacyMutationsArrayURL(workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: jsonl.path) || fileManager.fileExists(atPath: legacy.path) else {
+            return
+        }
+        let lockURL = mutationsLockURL(workspaceId: workspaceId)
+        try Self.withMutationsExclusiveLock(at: lockURL) {
+            let records = try loadAllMutations(jsonl: jsonl, legacy: legacy)
+                .sorted { $0.sequence < $1.sequence }
+            guard let last = records.last else {
+                return
+            }
+            var kept = records.filter { $0.sequence > throughSequence }
+            if kept.isEmpty {
+                kept = [last]
+            }
+            guard kept.count != records.count else {
+                return
+            }
+            try writeAllMutationsAsJSONL(kept, to: jsonl)
         }
     }
 
@@ -359,6 +518,7 @@ actor FileCheckpointStore: CheckpointStore {
         try fileManager.createDirectory(at: workspaceDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
         try fileManager.createDirectory(at: checkpointsDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
         try fileManager.createDirectory(at: snapshotsDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: blobsDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
     }
 
     private func workspaceDirectoryURL(workspaceId: UUID) -> URL {
@@ -379,6 +539,14 @@ actor FileCheckpointStore: CheckpointStore {
 
     private func snapshotURL(id: UUID, workspaceId: UUID) -> URL {
         snapshotsDirectoryURL(workspaceId: workspaceId).appendingPathComponent("\(id.uuidString).json", isDirectory: false)
+    }
+
+    private func blobsDirectoryURL(workspaceId: UUID) -> URL {
+        workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("blobs", isDirectory: true)
+    }
+
+    private func blobURL(hash: String, workspaceId: UUID) -> URL {
+        blobsDirectoryURL(workspaceId: workspaceId).appendingPathComponent(hash, isDirectory: false)
     }
 
     private func mutationsJsonlURL(workspaceId: UUID) -> URL {

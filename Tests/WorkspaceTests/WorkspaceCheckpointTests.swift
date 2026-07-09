@@ -82,6 +82,10 @@ private actor FlakySnapshotCheckpointStore: CheckpointStore {
     func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
         try await base.listMutationRecords(workspaceId: workspaceId)
     }
+
+    func pruneMutationRecords(workspaceId: UUID, throughSequence: Int) async throws {
+        try await base.pruneMutationRecords(workspaceId: workspaceId, throughSequence: throughSequence)
+    }
 }
 
 @Suite("Workspace checkpoints")
@@ -133,6 +137,42 @@ struct WorkspaceCheckpointTests {
         #expect(events.count == 1)
         #expect(events[0].kind == .rolledBack)
         #expect(events[0].checkpoint == rollbackCheckpoint)
+    }
+
+    @Test
+    func `rollback appends a rollback mutation record`() async throws {
+        let workspace = Workspace(filesystem: InMemoryFilesystem())
+        try await workspace.writeFile("/file.txt", content: "one")
+        let checkpoint = try await workspace.createCheckpoint(label: "v1")
+        try await workspace.writeFile("/file.txt", content: "two")
+
+        _ = try await workspace.rollback(to: checkpoint.id)
+
+        let mutations = try await workspace.mutationRecords()
+        #expect(mutations.map(\.kind) == [.writeFile, .writeFile, .rollback])
+        #expect(mutations.last?.touchedPaths == ["/file.txt"])
+        #expect(mutations.last?.fileChanges.first?.diff?.hunks.isEmpty == false)
+        #expect(try await workspace.readFile("/file.txt") == "one")
+    }
+
+    @Test
+    func `pruneMutationHistory bounds the log while keeping sequences monotonic`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspace = Workspace(filesystem: InMemoryFilesystem(), storage: .directory(at: root))
+        for index in 0..<5 {
+            try await workspace.writeFile("/file.txt", content: "revision \(index)")
+        }
+
+        try await workspace.pruneMutationHistory(throughSequence: 3)
+        #expect(try await workspace.mutationRecords().map(\.sequence) == [4, 5])
+
+        try await workspace.pruneMutationHistory(throughSequence: 100)
+        #expect(try await workspace.mutationRecords().map(\.sequence) == [5])
+
+        try await workspace.writeFile("/file.txt", content: "after prune")
+        #expect(try await workspace.mutationRecords().map(\.sequence) == [5, 6])
     }
 
     @Test

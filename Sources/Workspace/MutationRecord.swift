@@ -15,6 +15,7 @@ struct MutationRecord: Sendable, Codable, Equatable {
         case applyEdits
         case applyReplacement
         case restoreSnapshot
+        case rollback
         case mergeWorkspace
     }
 

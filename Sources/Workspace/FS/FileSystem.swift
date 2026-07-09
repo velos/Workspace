@@ -33,6 +33,8 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
     case mergeUncheckpointedChanges(parentWorkspaceId: UUID, baseMutationCursor: Int, currentMutationCursor: Int)
     /// A tracked workspace mutation could not be recorded.
     case mutationFailed(String)
+    /// Persisted checkpoint or snapshot storage is damaged (for example, a missing content blob).
+    case storageCorrupted(String)
 
     /// A human-readable description of the error.
     public var description: String {
@@ -66,6 +68,8 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
             return "cannot merge branch into workspace \(parentWorkspaceId.uuidString): the workspace has uncheckpointed changes (mutation sequence \(currentMutationCursor), branch base \(baseMutationCursor)); create a checkpoint or roll back before merging"
         case let .mutationFailed(message):
             return message
+        case let .storageCorrupted(message):
+            return "workspace storage is corrupted: \(message)"
         }
     }
 }

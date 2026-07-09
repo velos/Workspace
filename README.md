@@ -96,7 +96,7 @@ let workspace = Workspace(
 )
 ```
 
-`Storage.directory(at:)` writes checkpoint and snapshot JSON plus a `mutations.jsonl` append log (one JSON record per line) under `<url>/<workspaceId>/`. A legacy `mutations.json` array is migrated to JSONL on first access. The store assigns monotonic `sequence` numbers while holding `mutations.lock` (advisory `flock` where the OS supports it), so multiple `Workspace` instances that share a `workspaceId` and store do not collide on mutation sequence. Appends read only the log's final record to derive the next sequence, and a partial trailing line left by a crashed append is skipped on read and truncated before the next append. The current checkpoint head is derived from the parent-id graph (unparented tips), not only from `createdAt` ordering, which reduces surprises when wall clocks differ between processes. Listing mutations still reads the full log; very long histories may need application-level rotation. Coordinating multiple hosts or network disks that do not honor `flock` may still require extra synchronization.
+`Storage.directory(at:)` writes checkpoint metadata, snapshot manifests, and a `mutations.jsonl` append log (one JSON record per line) under `<url>/<workspaceId>/`. Snapshots are content-addressed: file bytes are stored once per unique content in `blobs/<sha256>`, and each snapshot manifest references them by hash — so consecutive checkpoints share unchanged file content instead of re-serializing the whole tree, and contents are stored raw rather than base64-inflated. Legacy inline-snapshot JSON files and a legacy `mutations.json` array are still read (the latter is migrated to JSONL on first access). Blobs are retained until pruned by future GC tooling. The store assigns monotonic `sequence` numbers while holding `mutations.lock` (advisory `flock` where the OS supports it), so multiple `Workspace` instances that share a `workspaceId` and store do not collide on mutation sequence. Appends read only the log's final record to derive the next sequence, and a partial trailing line left by a crashed append is skipped on read and truncated before the next append. The current checkpoint head is derived from the parent-id graph (unparented tips), not only from `createdAt` ordering, which reduces surprises when wall clocks differ between processes. Listing mutations still reads the full log; very long histories may need application-level rotation. Coordinating multiple hosts or network disks that do not honor `flock` may still require extra synchronization.
 
 ### Reads
 
@@ -216,7 +216,7 @@ print(all.count)
 print(snapshot.rootPath)
 ```
 
-Public `restoreSnapshot(_:)` is also tracked as a workspace mutation. Checkpoint rollback uses an internal untracked restore so the rollback is represented by the rollback checkpoint, not by a second restore mutation.
+Public `restoreSnapshot(_:)` is also tracked as a workspace mutation. Checkpoint rollback records the tree changes it performs as a `rollback` mutation in addition to the rollback checkpoint, so the mutation log remains a complete account of filesystem changes. Long-running workspaces can bound the log with `pruneMutationHistory(throughSequence:)`, which always retains the newest record so sequence numbers stay monotonic.
 
 ### Branch And Merge
 

@@ -47,6 +47,8 @@ private actor CountingCheckpointStore: CheckpointStore {
         return mutations.filter { $0.workspaceId == workspaceId }
     }
 
+    func pruneMutationRecords(workspaceId: UUID, throughSequence: Int) async throws {}
+
     func listCounts() -> (checkpoints: Int, mutations: Int) {
         (checkpointListCount, mutationListCount)
     }
