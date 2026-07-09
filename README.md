@@ -33,7 +33,7 @@ Many agent and tooling flows need more than plain disk I/O:
 - `FileSystem`: low-level protocol for custom filesystem backends
 - `ReadWriteFilesystem`: real disk access rooted to a configured directory
 - `InMemoryFilesystem`: fully in-memory filesystem for isolated workspaces and tests
-- `OverlayFilesystem`: snapshot a disk root and keep writes in memory
+- `OverlayFilesystem`: lazy copy-on-write view of a disk root — reads pass through, writes stay in memory
 - `MountableFilesystem`: compose multiple filesystems under one virtual tree
 - `PermissionedFileSystem`: wrap any filesystem with operation-level approvals
 - `SandboxFilesystem`: convenience wrapper for app sandbox roots
@@ -262,6 +262,8 @@ let workspace = Workspace(filesystem: filesystem)
 let preview = try await workspace.summarizeTree("/Sources", maxDepth: 2)
 try await workspace.writeFile("/SCRATCH.md", content: "overlay-only change\n")
 ```
+
+The overlay is lazy: nothing is copied at configuration time, reads pass through to the source directory (so files that change on disk are visible immediately), and only mutated entries are copied up into memory. Deletions are recorded as whiteouts that hide the source entry without touching the disk. `reload()` discards all overlay writes and whiteouts.
 
 ### Mounted Workspaces
 

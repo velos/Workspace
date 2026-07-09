@@ -763,6 +763,101 @@ struct FilesystemTests {
     }
 
     @Test(.tags(.overlay))
+    func `overlay reads pass through lazily and writes stay in memory`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayLazy")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let noteURL = root.appendingPathComponent("note.txt")
+        try Data("disk".utf8).write(to: noteURL)
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk".utf8))
+
+        // A file added on disk after configuration is visible without reload: reads are lazy.
+        try Data("late".utf8).write(to: root.appendingPathComponent("late.txt"))
+        #expect(try await filesystem.readFile(path: "/late.txt") == Data("late".utf8))
+
+        // Overlay writes shadow the source without touching it.
+        try await filesystem.writeFile(path: "/note.txt", data: Data("overlay".utf8), append: false)
+        #expect(try await filesystem.readFile(path: "/note.txt") == Data("overlay".utf8))
+        #expect(try Data(contentsOf: noteURL) == Data("disk".utf8))
+    }
+
+    @Test(.tags(.overlay))
+    func `overlay deletions hide lower entries and re-creation yields a fresh directory`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayWhiteout")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let dirURL = root.appendingPathComponent("dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        try Data("a".utf8).write(to: dirURL.appendingPathComponent("a.txt"))
+        try Data("b".utf8).write(to: dirURL.appendingPathComponent("b.txt"))
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+
+        try await filesystem.remove(path: "/dir/a.txt", recursive: false)
+        #expect(!(await filesystem.exists(path: "/dir/a.txt")))
+        #expect((try await filesystem.listDirectory(path: "/dir")).map(\.name) == ["b.txt"])
+        #expect(FileManager.default.fileExists(atPath: dirURL.appendingPathComponent("a.txt").path))
+
+        // Removing the whole directory and re-creating it must not resurrect lower children.
+        try await filesystem.remove(path: "/dir", recursive: true)
+        #expect(!(await filesystem.exists(path: "/dir")))
+        try await filesystem.createDirectory(path: "/dir", recursive: false)
+        #expect((try await filesystem.listDirectory(path: "/dir")).isEmpty)
+
+        // reload drops all overlay state.
+        try await filesystem.reload()
+        #expect(try await filesystem.readFile(path: "/dir/a.txt") == Data("a".utf8))
+    }
+
+    @Test(.tags(.overlay))
+    func `overlay copies up on append and merges listings across layers`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayCopyUp")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        try Data("one".utf8).write(to: root.appendingPathComponent("log.txt"))
+        let subURL = root.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: subURL, withIntermediateDirectories: true)
+        try Data("k".utf8).write(to: subURL.appendingPathComponent("keep.txt"))
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+
+        try await filesystem.writeFile(path: "/log.txt", data: Data(" two".utf8), append: true)
+        #expect(try await filesystem.readFile(path: "/log.txt") == Data("one two".utf8))
+        #expect(try Data(contentsOf: root.appendingPathComponent("log.txt")) == Data("one".utf8))
+
+        try await filesystem.writeFile(path: "/sub/new.txt", data: Data("n".utf8), append: false)
+        #expect((try await filesystem.listDirectory(path: "/sub")).map(\.name) == ["keep.txt", "new.txt"])
+
+        try await filesystem.move(from: "/sub/keep.txt", to: "/sub/moved.txt")
+        #expect(!(await filesystem.exists(path: "/sub/keep.txt")))
+        #expect(try await filesystem.readFile(path: "/sub/moved.txt") == Data("k".utf8))
+        #expect(FileManager.default.fileExists(atPath: subURL.appendingPathComponent("keep.txt").path))
+    }
+
+    @Test(.tags(.overlay))
+    func `overlay stat passes through source metadata for untouched files`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayMetadata")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let fileURL = root.appendingPathComponent("old.txt")
+        try Data("old".utf8).write(to: fileURL)
+        let past = Date(timeIntervalSince1970: 946_684_800)
+        try FileManager.default.setAttributes(
+            [.modificationDate: past, .posixPermissions: 0o640],
+            ofItemAtPath: fileURL.path
+        )
+
+        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        let info = try await filesystem.stat(path: "/old.txt")
+
+        #expect(info.permissions == POSIXPermissions(0o640))
+        let mtime = try #require(info.modificationDate)
+        #expect(abs(mtime.timeIntervalSince(past)) < 1.5)
+    }
+
+    @Test(.tags(.overlay))
     func `overlay filesystem reload requires a configured root and treats missing roots as empty`() async throws {
         let unconfigured = OverlayFilesystem()
 

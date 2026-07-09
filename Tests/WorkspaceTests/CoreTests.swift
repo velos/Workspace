@@ -1191,7 +1191,7 @@ struct CoreTests {
         #expect(WorkspacePath.globToRegex("file?.[ch]") == "^file[^/]\\.[ch]$")
         #expect(WorkspacePath.globToRegex("file[") == "^file\\[$")
         #expect(WorkspacePath.globToRegex("*.txt") == "^[^/]*\\.txt$")
-        #expect(WorkspacePath.globToRegex("**/*.txt") == "^.*/[^/]*\\.txt$")
+        #expect(WorkspacePath.globToRegex("**/*.txt") == "^.*\\/[^/]*\\.txt$")
         #expect(WorkspacePath.globToRegex("[!ab]") == "^[^ab]$")
 
         let encoded = try JSONEncoder().encode(WorkspacePath(normalizing: "/tmp/../file.txt"))
