@@ -252,6 +252,20 @@ print(merged.mergedFromCheckpointId == branchHead.id)       // true
 
 `merge(_:)` is optimistic. If the parent workspace head changed after `branch()` was created, merge throws `WorkspaceError.mergeConflict(parentWorkspaceId:expectedBase:actualHead:)`. If the parent made tracked writes after `branch()` without creating a checkpoint, merge throws `WorkspaceError.mergeUncheckpointedChanges(parentWorkspaceId:baseMutationCursor:currentMutationCursor:)` instead of silently overwriting those edits; create a checkpoint or roll the parent back first.
 
+`mergeThreeWay(_:label:)` merges even when both sides advanced. Each path is resolved against the branch's base checkpoint: the side that changed wins, identical changes merge cleanly, and when both sides changed the same path differently the merge applies nothing and returns structured conflicts instead of throwing:
+
+```swift
+let result = try await workspace.mergeThreeWay(branch, label: "merge draft")
+if result.applied {
+    print("merged as checkpoint \(result.checkpoint!.id)")
+} else {
+    for conflict in result.conflicts {
+        print("conflict at \(conflict.path): \(conflict.kind)")
+        // conflict.oursDiff / conflict.theirsDiff carry base→side diffs for text files
+    }
+}
+```
+
 ## Common Filesystem Patterns
 
 ### Rooted Disk Workspace
