@@ -7,9 +7,12 @@ on:
       - reopened
       - synchronize
       - ready_for_review
+  push:
+    branches:
+      - "claude/**"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -93,7 +96,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: pr-test-results-${{ github.event.pull_request.number }}
+          name: pr-test-results-${{ github.event.pull_request.number || github.run_id }}
           if-no-files-found: warn
           include-hidden-files: true
           path: |
