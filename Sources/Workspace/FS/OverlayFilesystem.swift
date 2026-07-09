@@ -143,12 +143,12 @@ public actor OverlayFilesystem: FileSystem {
     }
 
     private func importItem(at url: URL, virtualPath: WorkspacePath, into overlay: InMemoryFilesystem) async throws {
-        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        let fileType = attributes[.type] as? FileAttributeType
         let permissionBits = (attributes[.posixPermissions] as? NSNumber)?.intValue
         let permissions = permissionBits.map(POSIXPermissions.init(_:))
 
-        if values.isSymbolicLink == true {
+        if fileType == .typeSymbolicLink {
             let target = try fileManager.destinationOfSymbolicLink(atPath: url.path)
             try await overlay.createSymlink(path: virtualPath, target: target)
             if let permissions {
@@ -157,7 +157,7 @@ public actor OverlayFilesystem: FileSystem {
             return
         }
 
-        if values.isDirectory == true {
+        if fileType == .typeDirectory {
             try await overlay.createDirectory(path: virtualPath, recursive: true)
             if let permissions {
                 try await overlay.setPermissions(path: virtualPath, permissions: permissions)

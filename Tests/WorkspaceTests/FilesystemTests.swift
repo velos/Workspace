@@ -35,11 +35,13 @@ private enum FilesystemTestSupport {
     }
 }
 
+#if canImport(Darwin)
 private final class NilAppGroupFileManager: FileManager {
     override func containerURL(forSecurityApplicationGroupIdentifier groupIdentifier: String) -> URL? {
         nil
     }
 }
+#endif
 
 extension Tag {
     @Tag static var permissions: Self
@@ -731,6 +733,7 @@ struct FilesystemTests {
             #expect(error.description.contains("invalid app group identifier"))
         }
 
+        #if canImport(Darwin)
         do {
             _ = try SandboxFilesystem(
                 root: .appGroup("group.workspace.tests.missing"),
@@ -740,6 +743,14 @@ struct FilesystemTests {
         } catch let error as WorkspaceError {
             #expect(error.description.contains("app group container unavailable"))
         }
+        #else
+        do {
+            _ = try SandboxFilesystem(root: .appGroup("group.workspace.tests.missing"))
+            Issue.record("expected unavailable app group rejection")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("app group container unavailable"))
+        }
+        #endif
 
         let firstRoot = try FilesystemTestSupport.makeTempDirectory(prefix: "SandboxFirst")
         defer { FilesystemTestSupport.removeDirectory(firstRoot) }

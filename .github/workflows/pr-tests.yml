@@ -7,15 +7,24 @@ on:
       - reopened
       - synchronize
       - ready_for_review
+  push:
+    branches:
+      - core-improvements
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   swift-tests:
-    name: Swift Tests
-    runs-on: macos-latest
+    name: Swift Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-24.04
     timeout-minutes: 15
 
     permissions:
@@ -49,7 +58,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: dorny/test-reporter@v3
         with:
-          name: Swift Test Report
+          name: Swift Test Report (${{ matrix.os }})
           path: .build/test-results/xunit.xml
           reporter: swift-xunit
           fail-on-error: false
@@ -93,7 +102,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: pr-test-results-${{ github.event.pull_request.number }}
+          name: pr-test-results-${{ matrix.os }}-${{ github.event.pull_request.number || github.run_id }}
           if-no-files-found: warn
           include-hidden-files: true
           path: |

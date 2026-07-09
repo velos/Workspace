@@ -125,10 +125,14 @@ public final class SandboxFilesystem: FileSystem, Sendable {
             guard identifier.hasPrefix("group.") else {
                 throw WorkspaceError.unsupported("invalid app group identifier: \(identifier)")
             }
+            #if canImport(Darwin)
             guard let url = fileManager.containerURL(forSecurityApplicationGroupIdentifier: identifier) else {
                 throw WorkspaceError.unsupported("app group container unavailable: \(identifier)")
             }
             return url
+            #else
+            throw WorkspaceError.unsupported("app group container unavailable: \(identifier)")
+            #endif
         case let .url(url):
             return url
         }

@@ -1,3 +1,4 @@
+#if canImport(Darwin)
 import Foundation
 
 /// A disk-backed filesystem rooted at a security-scoped URL.
@@ -257,3 +258,4 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
     private static let bookmarkResolutionOptions: URL.BookmarkResolutionOptions = []
     #endif
 }
+#endif
