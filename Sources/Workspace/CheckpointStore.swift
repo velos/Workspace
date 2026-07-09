@@ -284,7 +284,7 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     private func lastLine(at url: URL) throws -> Data? {
-        let handle = try FileHandle(forReading: url)
+        let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let size = try handle.seekToEnd()
         guard size > 1 else { return nil }
