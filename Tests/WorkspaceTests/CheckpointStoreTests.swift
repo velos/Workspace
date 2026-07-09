@@ -399,6 +399,96 @@ struct CheckpointStoreTests {
         #expect(Set(mutations.map(\.sequence)) == expectedSequences)
     }
 
+    @Test
+    func `FileCheckpointStore skips and repairs a torn trailing mutation line`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let store = FileCheckpointStore(rootDirectory: root)
+
+        for index in 0..<2 {
+            let mutation = MutationRecord(
+                sequence: 0,
+                workspaceId: workspaceId,
+                kind: .writeFile,
+                touchedPaths: [WorkspacePath(normalizing: "/file-\(index).txt")],
+                fileChanges: []
+            )
+            try await store.appendMutation(mutation)
+        }
+
+        // Simulate a crash mid-append: a partial record with no trailing newline.
+        let jsonl = mutationsJsonlURL(root: root, workspaceId: workspaceId)
+        let handle = try FileHandle(forWritingTo: jsonl)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"sequence\":3,\"worksp".utf8))
+        try handle.close()
+
+        // Reads skip the torn tail instead of poisoning the whole log.
+        let reader = FileCheckpointStore(rootDirectory: root)
+        let beforeRepair = try await reader.listMutationRecords(workspaceId: workspaceId)
+        #expect(beforeRepair.map(\.sequence) == [1, 2])
+
+        // The next append truncates the torn tail and continues the sequence.
+        let appended = try await reader.appendMutation(
+            MutationRecord(
+                sequence: 0,
+                workspaceId: workspaceId,
+                kind: .writeFile,
+                touchedPaths: [WorkspacePath(normalizing: "/file-2.txt")],
+                fileChanges: []
+            )
+        )
+        #expect(appended.sequence == 3)
+
+        let afterRepair = try await reader.listMutationRecords(workspaceId: workspaceId)
+        #expect(afterRepair.map(\.sequence) == [1, 2, 3])
+        #expect(afterRepair.allSatisfy { $0.workspaceId == workspaceId })
+    }
+
+    @Test
+    func `FileCheckpointStore still surfaces corruption before the final line`() async throws {
+        let root = try makeTempDirectory()
+        defer { removeTempDirectory(root) }
+
+        let workspaceId = UUID()
+        let store = FileCheckpointStore(rootDirectory: root)
+
+        for index in 0..<2 {
+            let mutation = MutationRecord(
+                sequence: 0,
+                workspaceId: workspaceId,
+                kind: .writeFile,
+                touchedPaths: [WorkspacePath(normalizing: "/file-\(index).txt")],
+                fileChanges: []
+            )
+            try await store.appendMutation(mutation)
+        }
+
+        // Corrupt the first record while keeping the file newline-terminated: this is real
+        // mid-file damage, not a torn append, and must not be silently skipped.
+        let jsonl = mutationsJsonlURL(root: root, workspaceId: workspaceId)
+        let contents = try String(contentsOf: jsonl, encoding: .utf8)
+        var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        lines[0] = "not json"
+        try Data(lines.joined(separator: "\n").utf8).write(to: jsonl)
+
+        let reader = FileCheckpointStore(rootDirectory: root)
+        do {
+            _ = try await reader.listMutationRecords(workspaceId: workspaceId)
+            Issue.record("expected mid-file corruption to surface as an error")
+        } catch {
+            // Expected: only a torn tail without a trailing newline is tolerated.
+        }
+    }
+
+    private func mutationsJsonlURL(root: URL, workspaceId: UUID) -> URL {
+        root
+            .appendingPathComponent(workspaceId.uuidString, isDirectory: true)
+            .appendingPathComponent("mutations.jsonl", isDirectory: false)
+    }
+
     private func makeTempDirectory() throws -> URL {
         let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         let url = base.appendingPathComponent("CheckpointStoreTests-\(UUID().uuidString)", isDirectory: true)

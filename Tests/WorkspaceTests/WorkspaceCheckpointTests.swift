@@ -195,6 +195,52 @@ struct WorkspaceCheckpointTests {
     }
 
     @Test
+    func `merge refuses when parent has uncheckpointed tracked changes`() async throws {
+        let workspace = Workspace(filesystem: InMemoryFilesystem())
+        try await workspace.writeFile("/note.txt", content: "base")
+        _ = try await workspace.createCheckpoint(label: "base")
+
+        let branch = try await workspace.branch()
+        try await branch.writeFile("/note.txt", content: "branch")
+        _ = try await branch.createCheckpoint(label: "branch head")
+
+        // Tracked parent edits after branching, without a checkpoint: the head still matches the
+        // branch base, so only the mutation cursor can reveal them.
+        try await workspace.writeFile("/parent-only.txt", content: "keep me")
+
+        do {
+            _ = try await workspace.merge(branch)
+            Issue.record("expected merge to refuse uncheckpointed parent changes")
+        } catch let error as WorkspaceError {
+            guard case let .mergeUncheckpointedChanges(parentWorkspaceId, baseCursor, currentCursor) = error else {
+                Issue.record("unexpected workspace error: \(error)")
+                return
+            }
+            #expect(parentWorkspaceId == workspace.workspaceId)
+            #expect(currentCursor > baseCursor)
+        }
+
+        #expect(try await workspace.readFile("/parent-only.txt") == "keep me")
+        #expect(try await workspace.readFile("/note.txt") == "base")
+    }
+
+    @Test
+    func `merge allows parent writes made before the branch`() async throws {
+        let workspace = Workspace(filesystem: InMemoryFilesystem())
+        try await workspace.writeFile("/note.txt", content: "base")
+        _ = try await workspace.createCheckpoint(label: "base")
+        try await workspace.writeFile("/pre-branch.txt", content: "pre")
+
+        let branch = try await workspace.branch()
+        try await branch.writeFile("/note.txt", content: "branch")
+
+        _ = try await workspace.merge(branch)
+
+        #expect(try await workspace.readFile("/note.txt") == "branch")
+        #expect(try await workspace.readFile("/pre-branch.txt") == "pre")
+    }
+
+    @Test
     func `file backed storage reloads checkpoint snapshot artifacts`() async throws {
         let root = try makeTempDirectory()
         defer { removeTempDirectory(root) }

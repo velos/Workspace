@@ -31,6 +31,9 @@ public actor Workspace {
     public nonisolated let filesystem: any FileSystem
     let store: any CheckpointStore
     let baseCheckpointId: UUID?
+    /// The parent's mutation sequence at the moment this workspace was branched. Merge uses it to
+    /// detect tracked-but-uncheckpointed parent edits that a snapshot restore would discard.
+    let baseMutationCursor: Int?
 
     var loadTask: Task<Void, Error>?
     var didLoadStoreState = false
@@ -77,12 +80,14 @@ public actor Workspace {
         workspaceId: UUID = UUID(),
         filesystem: any FileSystem,
         store: any CheckpointStore,
-        baseCheckpointId: UUID? = nil
+        baseCheckpointId: UUID? = nil,
+        baseMutationCursor: Int? = nil
     ) {
         self.workspaceId = workspaceId
         self.filesystem = filesystem
         self.store = store
         self.baseCheckpointId = baseCheckpointId
+        self.baseMutationCursor = baseMutationCursor
     }
 
     static func makeStore(for storage: Storage) -> any CheckpointStore {

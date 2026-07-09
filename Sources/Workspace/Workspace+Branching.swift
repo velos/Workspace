@@ -25,7 +25,8 @@ extension Workspace {
             workspaceId: UUID(),
             filesystem: branchFilesystem,
             store: store,
-            baseCheckpointId: baseCheckpointId
+            baseCheckpointId: baseCheckpointId,
+            baseMutationCursor: latestMutationSequence()
         )
         _ = try await branch.seedBranchCheckpoint(
             snapshot: snapshot,
@@ -36,6 +37,12 @@ extension Workspace {
     }
 
     /// Merges another workspace into this workspace when this workspace still points at the other's base.
+    ///
+    /// The merge is refused when this workspace's checkpoint head moved past the branch's base
+    /// (``WorkspaceError/mergeConflict(parentWorkspaceId:expectedBase:actualHead:)``) or when this
+    /// workspace has tracked mutations that no checkpoint captures
+    /// (``WorkspaceError/mergeUncheckpointedChanges(parentWorkspaceId:baseMutationCursor:currentMutationCursor:)``),
+    /// since restoring the branch snapshot would silently discard those edits.
     public func merge(_ other: Workspace, label: String? = nil) async throws -> Checkpoint {
         try await ensureLoaded()
         try await reconcileCheckpointsWithStore()
@@ -48,6 +55,20 @@ extension Workspace {
                 expectedBase: expectedBase,
                 actualHead: headCheckpointId
             )
+        }
+
+        // The head comparison only sees checkpoints. Tracked writes made after the branch was
+        // created leave the head untouched, so restoring the branch snapshot would silently
+        // discard them; refuse the merge instead.
+        if let expectedCursor = await other.mergeBaseMutationCursor() {
+            let currentCursor = latestMutationSequence()
+            guard currentCursor <= expectedCursor else {
+                throw WorkspaceError.mergeUncheckpointedChanges(
+                    parentWorkspaceId: workspaceId,
+                    baseMutationCursor: expectedCursor,
+                    currentMutationCursor: currentCursor
+                )
+            }
         }
 
         let previousSnapshot = try await captureSnapshot()
@@ -97,6 +118,10 @@ extension Workspace {
 
     func mergeBaseCheckpointId() -> UUID? {
         baseCheckpointId
+    }
+
+    func mergeBaseMutationCursor() -> Int? {
+        baseMutationCursor
     }
 
     func currentHeadCheckpointId() async throws -> UUID? {

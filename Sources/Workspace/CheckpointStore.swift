@@ -80,7 +80,9 @@ actor InMemoryCheckpointStore: CheckpointStore {
 /// A JSON file-backed checkpoint store.
 ///
 /// Mutations are stored as one JSON line per record in `mutations.jsonl` (append-friendly under
-/// the lock) so each append rewrites a tiny tail instead of the entire log. A legacy
+/// the lock). Appends derive the next sequence from the log's final record instead of re-reading
+/// the whole log, so appends stay cheap as histories grow. A partial trailing line left by a
+/// crashed append is skipped when reading and truncated before the next append. A legacy
 /// `mutations.json` array is migrated to JSONL on the next read or append. Writes are
 /// synchronized through a persistent sidecar lockfile (`mutations.lock`) with an advisory
 /// exclusive lock when the platform supports it (`flock`), so concurrent ``FileCheckpointStore``
@@ -172,10 +174,19 @@ actor FileCheckpointStore: CheckpointStore {
         let legacy = legacyMutationsArrayURL(workspaceId: mutation.workspaceId)
         let lockURL = mutationsLockURL(workspaceId: mutation.workspaceId)
         return try Self.withMutationsExclusiveLock(at: lockURL) {
-            let existing = try loadAllMutations(jsonl: jsonl, legacy: legacy)
-            let next = (existing.map(\.sequence).max() ?? 0) + 1
+            let lastSequence: Int
+            if fileManager.fileExists(atPath: jsonl.path) {
+                if fileManager.fileExists(atPath: legacy.path) {
+                    try? fileManager.removeItem(at: legacy)
+                }
+                try repairTornTail(at: jsonl)
+                lastSequence = try lastPersistedSequence(at: jsonl)
+            } else {
+                // First write, or a legacy `mutations.json` array awaiting migration.
+                lastSequence = try loadAllMutations(jsonl: jsonl, legacy: legacy).map(\.sequence).max() ?? 0
+            }
             var record = mutation
-            record.sequence = next
+            record.sequence = lastSequence + 1
 
             if fileManager.fileExists(atPath: jsonl.path) {
                 try appendJSONLLine(encode: record, to: jsonl)
@@ -222,14 +233,86 @@ actor FileCheckpointStore: CheckpointStore {
     private func loadMutationsFromJSONL(at url: URL) throws -> [MutationRecord] {
         let data = try Data(contentsOf: url)
         if data.isEmpty { return [] }
+        let endsWithNewline = data.last == UInt8(ascii: "\n")
         let text = String(data: data, encoding: .utf8) ?? ""
+        let lines = text.split(whereSeparator: \.isNewline)
         var out: [MutationRecord] = []
-        out.reserveCapacity(64)
-        for line in text.split(whereSeparator: \.isNewline) {
+        out.reserveCapacity(lines.count)
+        for (index, line) in lines.enumerated() {
             if line.isEmpty { continue }
-            out.append(try decoder.decode(MutationRecord.self, from: Data(String(line).utf8)))
+            do {
+                out.append(try decoder.decode(MutationRecord.self, from: Data(String(line).utf8)))
+            } catch {
+                // A crashed append leaves a strict prefix of `<json>\n`: an undecodable final
+                // line with no trailing newline. Tolerate exactly that torn tail; anything else
+                // is real corruption and must surface.
+                if index == lines.count - 1, !endsWithNewline {
+                    continue
+                }
+                throw error
+            }
         }
         return out
+    }
+
+    /// Truncates a partial trailing line left behind by a crashed append so subsequent appends
+    /// do not glue new records onto the torn fragment. A torn append never contains a newline
+    /// (it is a strict prefix of `<json>\n`), so everything after the final newline — or the
+    /// whole file when none exists — is the torn region. Must be called under the mutations lock.
+    private func repairTornTail(at url: URL) throws {
+        let handle = try FileHandle(forUpdating: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        guard size > 0 else { return }
+        try handle.seek(toOffset: size - 1)
+        let lastByte = try handle.read(upToCount: 1)
+        guard lastByte != Data("\n".utf8) else { return }
+        let newlineOffset = try Self.lastNewlineOffset(in: handle, before: size - 1)
+        try handle.truncate(atOffset: newlineOffset.map { $0 + 1 } ?? 0)
+    }
+
+    /// Returns the sequence of the final record without loading the whole log. Appends are
+    /// strictly monotonic and full rewrites are sorted by sequence, so the last line always
+    /// carries the maximum. Falls back to a full scan for unusual tails such as blank trailing
+    /// lines. Must be called under the mutations lock, after ``repairTornTail(at:)``.
+    private func lastPersistedSequence(at url: URL) throws -> Int {
+        if let line = try lastLine(at: url),
+           let record = try? decoder.decode(MutationRecord.self, from: line) {
+            return record.sequence
+        }
+        return try loadMutationsFromJSONL(at: url).map(\.sequence).max() ?? 0
+    }
+
+    private func lastLine(at url: URL) throws -> Data? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        guard size > 1 else { return nil }
+        // The file ends with `\n` after tail repair; the last line spans the byte after the
+        // previous newline through the byte before the trailing newline.
+        let lineEnd = size - 1
+        let newlineOffset = try Self.lastNewlineOffset(in: handle, before: lineEnd)
+        let lineStart = newlineOffset.map { $0 + 1 } ?? 0
+        guard lineEnd > lineStart else { return nil }
+        try handle.seek(toOffset: lineStart)
+        let line = try handle.read(upToCount: Int(lineEnd - lineStart)) ?? Data()
+        return line.isEmpty ? nil : line
+    }
+
+    /// Scans backwards in chunks for the offset of the last `\n` strictly before `end`.
+    private static func lastNewlineOffset(in handle: FileHandle, before end: UInt64) throws -> UInt64? {
+        let chunkSize: UInt64 = 65536
+        var cursor = end
+        while cursor > 0 {
+            let chunkStart = cursor > chunkSize ? cursor - chunkSize : 0
+            try handle.seek(toOffset: chunkStart)
+            let chunk = try handle.read(upToCount: Int(cursor - chunkStart)) ?? Data()
+            if let index = chunk.lastIndex(of: UInt8(ascii: "\n")) {
+                return chunkStart + UInt64(chunk.distance(from: chunk.startIndex, to: index))
+            }
+            cursor = chunkStart
+        }
+        return nil
     }
 
     private func writeAllMutationsAsJSONL(_ records: [MutationRecord], to url: URL) throws {
