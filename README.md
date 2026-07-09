@@ -111,6 +111,8 @@ let tree = try await workspace.walkTree("/")
 let summary = try await workspace.summarizeTree("/")
 ```
 
+Glob wildcards use shell semantics: `*` and `?` match within a single path component, `**` matches recursively across components, and character classes support negation (`[!abc]`).
+
 JSON helpers encode and decode through `Codable`:
 
 ```swift
@@ -308,6 +310,7 @@ let workspace = Workspace(filesystem: filesystem)
 ## Security Notes
 
 - Jail and root enforcement belong to the underlying filesystem implementation.
+- `ReadWriteFilesystem` uses `lstat` semantics for entry-level operations (`stat`, `exists`, `remove`, `move` source, `readSymlink`): a symlink is handled as the link itself, never its target, so links pointing outside the root can be inspected and deleted but not read or written through.
 - Permission checks are additive. They do not replace path normalization or jail enforcement.
 - If you expose `Workspace` to model-driven or remote callers, the host still needs to define what roots, mounts, and permissions are acceptable.
 

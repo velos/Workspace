@@ -188,6 +188,102 @@ struct FilesystemTests {
     }
 
     @Test(.tags(.readWrite))
+    func `read-write filesystem manages external symlinks without following them`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let outside = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemOutside")
+        defer { FilesystemTestSupport.removeDirectory(outside) }
+
+        let outsideFile = outside.appendingPathComponent("target.txt")
+        try Data("secret".utf8).write(to: outsideFile)
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.createSymlink(path: "/leak", target: outsideFile.path)
+
+        // lstat semantics: the link itself is visible and manageable...
+        #expect(await filesystem.exists(path: "/leak"))
+        #expect((try await filesystem.stat(path: "/leak")).kind == .symlink)
+        #expect(try await filesystem.readSymlink(path: "/leak") == outsideFile.path)
+
+        // ...but its contents stay unreachable.
+        do {
+            _ = try await filesystem.readFile(path: "/leak")
+            Issue.record("expected invalid path error")
+        } catch let error as WorkspaceError {
+            #expect(error.description.contains("invalid path"))
+        }
+
+        // The link can be renamed and deleted without touching its target.
+        try await filesystem.move(from: "/leak", to: "/renamed-leak")
+        #expect(await filesystem.exists(path: "/renamed-leak"))
+        try await filesystem.remove(path: "/renamed-leak", recursive: false)
+        #expect(!(await filesystem.exists(path: "/renamed-leak")))
+        #expect(FileManager.default.fileExists(atPath: outsideFile.path))
+    }
+
+    @Test(.tags(.readWrite))
+    func `read-write filesystem exists does not probe outside the root`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let outside = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemOutside")
+        defer { FilesystemTestSupport.removeDirectory(outside) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let missingTarget = outside.appendingPathComponent("missing.txt").path
+        try await filesystem.createSymlink(path: "/dangling", target: missingTarget)
+
+        // The link exists regardless of whether its external target does: existence checks never
+        // dereference the final component, so they reveal nothing about paths outside the root.
+        #expect(await filesystem.exists(path: "/dangling"))
+        #expect((try await filesystem.stat(path: "/dangling")).kind == .symlink)
+
+        try Data("now present".utf8).write(to: URL(fileURLWithPath: missingTarget))
+        #expect(await filesystem.exists(path: "/dangling"))
+    }
+
+    @Test(.tags(.readWrite))
+    func `read-write filesystem removes a directory symlink without touching its target`() async throws {
+        let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
+        defer { FilesystemTestSupport.removeDirectory(root) }
+
+        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        try await filesystem.createDirectory(path: "/real", recursive: true)
+        try await filesystem.writeFile(path: "/real/keep.txt", data: Data("keep".utf8), append: false)
+        try await filesystem.createSymlink(path: "/alias", target: "real")
+
+        try await filesystem.remove(path: "/alias", recursive: false)
+
+        #expect(!(await filesystem.exists(path: "/alias")))
+        #expect(await filesystem.exists(path: "/real/keep.txt"))
+    }
+
+    @Test(.tags(.inMemory))
+    func `glob wildcards stay within a single path component`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.createDirectory(path: "/docs/sub", recursive: true)
+        try await filesystem.writeFile(path: "/docs/top.txt", data: FilesystemTestSupport.data("a"), append: false)
+        try await filesystem.writeFile(path: "/docs/sub/deep.txt", data: FilesystemTestSupport.data("b"), append: false)
+        try await filesystem.writeFile(path: "/docs/note.md", data: FilesystemTestSupport.data("c"), append: false)
+
+        #expect(try await filesystem.glob(pattern: "/docs/*.txt", currentDirectory: "/") == ["/docs/top.txt"])
+        #expect(try await filesystem.glob(pattern: "/docs/**", currentDirectory: "/").contains("/docs/sub/deep.txt"))
+        #expect(try await filesystem.glob(pattern: "/docs/?op.txt", currentDirectory: "/") == ["/docs/top.txt"])
+        #expect(try await filesystem.glob(pattern: "/docs/**/*.txt", currentDirectory: "/").contains("/docs/sub/deep.txt"))
+    }
+
+    @Test(.tags(.inMemory))
+    func `glob character classes support shell negation`() async throws {
+        let filesystem = InMemoryFilesystem()
+        try await filesystem.writeFile(path: "/a.txt", data: FilesystemTestSupport.data("a"), append: false)
+        try await filesystem.writeFile(path: "/b.txt", data: FilesystemTestSupport.data("b"), append: false)
+
+        #expect(try await filesystem.glob(pattern: "/[!a].txt", currentDirectory: "/") == ["/b.txt"])
+        #expect(try await filesystem.glob(pattern: "/[ab].txt", currentDirectory: "/") == ["/a.txt", "/b.txt"])
+    }
+
+    @Test(.tags(.readWrite))
     func `read-write filesystem still appends through symlink inside root`() async throws {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
         defer { FilesystemTestSupport.removeDirectory(root) }

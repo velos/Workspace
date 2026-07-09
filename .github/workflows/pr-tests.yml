@@ -19,12 +19,16 @@ jobs:
   swift-tests:
     name: Swift Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Linux runs inside the official Swift image; macOS installs a toolchain via setup-swift.
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - macos-latest
-          - ubuntu-24.04
+        include:
+          - os: macos-latest
+            container: ""
+          - os: ubuntu-24.04
+            container: swift:6.2-noble
     timeout-minutes: 15
 
     permissions:
@@ -37,6 +41,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Set up Swift
+        if: runner.os == 'macOS'
         uses: swift-actions/setup-swift@v3
         with:
           swift-version: "6.2"
@@ -68,7 +73,8 @@ jobs:
           list-tests: failed
 
       - name: Publish coverage summary
-        if: always()
+        # The Swift Linux container does not ship python3; the macOS job covers the summary.
+        if: always() && runner.os == 'macOS'
         shell: bash
         run: |
           python3 <<'PY'
