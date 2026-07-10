@@ -10,7 +10,7 @@ import Glibc
 ///
 /// Paths are resolved relative to the configured root and constrained so callers cannot escape that root
 /// through traversal or symlink resolution.
-public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
+public final class LocalFileSystem: FileSystem, @unchecked Sendable {
     private let fileManager: FileManager
     private let stateLock = NSLock()
     private var rootURL: URL?
@@ -22,18 +22,23 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// Creates an unconfigured disk-backed filesystem.
-    public init(fileManager: FileManager = .default) {
+    init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
     }
 
     /// Creates and configures a disk-backed filesystem rooted at `rootDirectory`.
-    public convenience init(rootDirectory: URL, fileManager: FileManager = .default) throws {
+    convenience init(rootDirectory: URL, fileManager: FileManager = .default) throws {
         self.init(fileManager: fileManager)
         try applyConfiguration(rootDirectory: rootDirectory)
     }
 
+    /// Creates a disk-backed filesystem with an immutable public root.
+    public convenience init(root: URL, fileManager: FileManager = .default) throws {
+        try self.init(rootDirectory: root, fileManager: fileManager)
+    }
+
     /// See ``FileSystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) async throws {
+    func configure(rootDirectory: URL) async throws {
         try applyConfiguration(rootDirectory: rootDirectory)
     }
 
@@ -110,7 +115,7 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// See ``FileSystem/capabilities()``.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         [.symlinks, .hardLinks, .permissions, .realPathResolution]
     }
 
@@ -469,7 +474,7 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard let rootURL, let resolvedRootPath else {
-            throw WorkspaceError.notConfigured
+            throw WorkspaceError.unsupported("local filesystem requires a root")
         }
         return ConfigurationSnapshot(rootURL: rootURL, resolvedRootPath: resolvedRootPath)
     }

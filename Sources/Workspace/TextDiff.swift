@@ -1,21 +1,41 @@
 import Foundation
 
-/// A line-based diff between two text snapshots.
+/// A structured line-based diff between two text values.
 public struct TextDiff: Sendable, Equatable, Codable {
-    /// A contiguous hunk in a structured text diff.
+    /// Aggregate line statistics for the complete values being compared.
+    public struct Statistics: Sendable, Equatable, Codable {
+        public var originalLineCount: Int
+        public var updatedLineCount: Int
+        public var additions: Int
+        public var deletions: Int
+
+        public init(originalLineCount: Int, updatedLineCount: Int, additions: Int, deletions: Int) {
+            self.originalLineCount = originalLineCount
+            self.updatedLineCount = updatedLineCount
+            self.additions = additions
+            self.deletions = deletions
+        }
+    }
+
+    /// A UTF-16 range suitable for editor and `NSRange` interop.
+    public struct IntralineRange: Sendable, Equatable, Codable {
+        public var location: Int
+        public var length: Int
+
+        public init(location: Int, length: Int) {
+            self.location = location
+            self.length = length
+        }
+    }
+
+    /// A contiguous diff hunk.
     public struct Hunk: Sendable, Equatable, Codable {
-        /// The 1-based starting line number in the original content.
         public var oldStartLine: Int
-        /// The number of original lines represented in the hunk.
         public var oldLineCount: Int
-        /// The 1-based starting line number in the updated content.
         public var newStartLine: Int
-        /// The number of updated lines represented in the hunk.
         public var newLineCount: Int
-        /// The context and changed lines in the hunk.
         public var lines: [Line]
 
-        /// Creates a diff hunk.
         public init(
             oldStartLine: Int,
             oldLineCount: Int,
@@ -31,76 +51,70 @@ public struct TextDiff: Sendable, Equatable, Codable {
         }
     }
 
-    /// A single line in a structured text diff.
+    /// A single line in a hunk.
     public struct Line: Sendable, Equatable, Codable {
-        /// The line classification used within a text diff.
         public enum Kind: String, Sendable, Codable {
-            /// A context line that is unchanged between the old and new content.
             case context
-            /// A line present only in the new content.
             case added
-            /// A line present only in the old content.
             case removed
         }
 
-        /// The role of the line within the diff.
         public var kind: Kind
-        /// The line content without a trailing newline character.
         public var text: String
-        /// Whether the original line ended with a trailing newline.
         public var hasTrailingNewline: Bool
-        /// The original 1-based line number when present.
         public var oldLineNumber: Int?
-        /// The updated 1-based line number when present.
         public var newLineNumber: Int?
+        public var intralineRanges: [IntralineRange]
 
-        /// Creates a diff line.
         public init(
             kind: Kind,
             text: String,
             hasTrailingNewline: Bool,
             oldLineNumber: Int? = nil,
-            newLineNumber: Int? = nil
+            newLineNumber: Int? = nil,
+            intralineRanges: [IntralineRange] = []
         ) {
             self.kind = kind
             self.text = text
             self.hasTrailingNewline = hasTrailingNewline
             self.oldLineNumber = oldLineNumber
             self.newLineNumber = newLineNumber
+            self.intralineRanges = intralineRanges
         }
     }
 
-    /// The hunks that make up the diff.
+    public var originalLineCount: Int
+    public var updatedLineCount: Int
     public var hunks: [Hunk]
 
-    /// Creates a text diff.
-    public init(hunks: [Hunk]) {
+    public var statistics: Statistics {
+        Statistics(
+            originalLineCount: originalLineCount,
+            updatedLineCount: updatedLineCount,
+            additions: hunks.flatMap(\.lines).count { $0.kind == .added },
+            deletions: hunks.flatMap(\.lines).count { $0.kind == .removed }
+        )
+    }
+
+    public init(originalLineCount: Int, updatedLineCount: Int, hunks: [Hunk]) {
+        self.originalLineCount = originalLineCount
+        self.updatedLineCount = updatedLineCount
         self.hunks = hunks
     }
-}
 
-// MARK: - Line-based diff (shared with ``Workspace`` previews)
-
-extension TextDiff {
-    /// A line-based diff between two UTF-8 text blobs, using the same algorithm as
-    /// ``Workspace`` replacement and batch-edit previews.
+    /// Builds a line diff with three context lines and UTF-16 intra-line ranges.
     public static func lineBased(from originalContent: String, to updatedContent: String) -> TextDiff {
         let originalLines = diffLineTokens(in: originalContent)
         let updatedLines = diffLineTokens(in: updatedContent)
         let changes = Array(updatedLines.difference(from: originalLines))
 
         let removals = Dictionary(grouping: changes.compactMap { change -> (Int, DiffLineToken)? in
-            if case let .remove(offset, element, _) = change {
-                return (offset, element)
-            }
-            return nil
+            guard case let .remove(offset, element, _) = change else { return nil }
+            return (offset, element)
         }, by: \.0)
-
         let insertions = Dictionary(grouping: changes.compactMap { change -> (Int, DiffLineToken)? in
-            if case let .insert(offset, element, _) = change {
-                return (offset, element)
-            }
-            return nil
+            guard case let .insert(offset, element, _) = change else { return nil }
+            return (offset, element)
         }, by: \.0)
 
         var lines: [Line] = []
@@ -125,7 +139,6 @@ extension TextDiff {
                 }
                 continue
             }
-
             if let inserted = insertions[updatedIndex] {
                 for (_, token) in inserted {
                     lines.append(
@@ -141,11 +154,7 @@ extension TextDiff {
                 }
                 continue
             }
-
-            guard originalIndex < originalLines.count, updatedIndex < updatedLines.count else {
-                break
-            }
-
+            guard originalIndex < originalLines.count, updatedIndex < updatedLines.count else { break }
             let updatedLine = updatedLines[updatedIndex]
             lines.append(
                 Line(
@@ -162,9 +171,10 @@ extension TextDiff {
             updatedLineNumber += 1
         }
 
+        applyIntralineRanges(to: &lines)
         let changedIndices = lines.indices.filter { lines[$0].kind != .context }
         guard !changedIndices.isEmpty else {
-            return TextDiff(hunks: [])
+            return TextDiff(originalLineCount: originalLines.count, updatedLineCount: updatedLines.count, hunks: [])
         }
 
         var ranges: [Range<Int>] = []
@@ -180,18 +190,21 @@ extension TextDiff {
 
         let hunks = ranges.map { range in
             let hunkLines = Array(lines[range])
-            let originalLineNumbers = hunkLines.compactMap(\.oldLineNumber)
-            let updatedLineNumbers = hunkLines.compactMap(\.newLineNumber)
+            let originalNumbers = hunkLines.compactMap(\.oldLineNumber)
+            let updatedNumbers = hunkLines.compactMap(\.newLineNumber)
             return Hunk(
-                oldStartLine: originalLineNumbers.first ?? 1,
-                oldLineCount: originalLineNumbers.count,
-                newStartLine: updatedLineNumbers.first ?? 1,
-                newLineCount: updatedLineNumbers.count,
+                oldStartLine: originalNumbers.first ?? 1,
+                oldLineCount: originalNumbers.count,
+                newStartLine: updatedNumbers.first ?? 1,
+                newLineCount: updatedNumbers.count,
                 lines: hunkLines
             )
         }
-
-        return TextDiff(hunks: hunks)
+        return TextDiff(
+            originalLineCount: originalLines.count,
+            updatedLineCount: updatedLines.count,
+            hunks: hunks
+        )
     }
 }
 
@@ -201,10 +214,7 @@ private struct DiffLineToken: Hashable {
 }
 
 private func diffLineTokens(in text: String) -> [DiffLineToken] {
-    guard !text.isEmpty else {
-        return []
-    }
-
+    guard !text.isEmpty else { return [] }
     var tokens: [DiffLineToken] = []
     var current = ""
     for character in text {
@@ -215,10 +225,72 @@ private func diffLineTokens(in text: String) -> [DiffLineToken] {
             current.append(character)
         }
     }
-
     if !current.isEmpty || text.last != "\n" {
         tokens.append(DiffLineToken(text: current, hasTrailingNewline: false))
     }
-
     return tokens
+}
+
+private func applyIntralineRanges(to lines: inout [TextDiff.Line]) {
+    var index = 0
+    while index < lines.count {
+        guard lines[index].kind != .context else {
+            index += 1
+            continue
+        }
+        let blockStart = index
+        while index < lines.count, lines[index].kind != .context { index += 1 }
+        let removed = (blockStart..<index).filter { lines[$0].kind == .removed }
+        let added = (blockStart..<index).filter { lines[$0].kind == .added }
+        for pairIndex in 0..<min(removed.count, added.count) {
+            let oldIndex = removed[pairIndex]
+            let newIndex = added[pairIndex]
+            let ranges = characterDifferenceRanges(from: lines[oldIndex].text, to: lines[newIndex].text)
+            lines[oldIndex].intralineRanges = ranges.old
+            lines[newIndex].intralineRanges = ranges.new
+        }
+    }
+}
+
+private func characterDifferenceRanges(
+    from original: String,
+    to updated: String
+) -> (old: [TextDiff.IntralineRange], new: [TextDiff.IntralineRange]) {
+    let oldCharacters = Array(original)
+    let newCharacters = Array(updated)
+    let difference = newCharacters.difference(from: oldCharacters)
+    let removed = difference.compactMap { change -> Int? in
+        guard case let .remove(offset, _, _) = change else { return nil }
+        return offset
+    }
+    let inserted = difference.compactMap { change -> Int? in
+        guard case let .insert(offset, _, _) = change else { return nil }
+        return offset
+    }
+    return (
+        collapsedUTF16Ranges(characterOffsets: removed, in: original),
+        collapsedUTF16Ranges(characterOffsets: inserted, in: updated)
+    )
+}
+
+private func collapsedUTF16Ranges(characterOffsets: [Int], in text: String) -> [TextDiff.IntralineRange] {
+    guard !characterOffsets.isEmpty else { return [] }
+    let characters = Array(text)
+    let sorted = Array(Set(characterOffsets)).sorted()
+    var characterRanges: [Range<Int>] = []
+    for offset in sorted where offset < characters.count {
+        if let last = characterRanges.last, offset == last.upperBound {
+            characterRanges[characterRanges.count - 1] = last.lowerBound..<(offset + 1)
+        } else {
+            characterRanges.append(offset..<(offset + 1))
+        }
+    }
+    return characterRanges.map { range in
+        let prefix = String(characters[..<range.lowerBound])
+        let fragment = String(characters[range])
+        return TextDiff.IntralineRange(
+            location: prefix.utf16.count,
+            length: fragment.utf16.count
+        )
+    }
 }

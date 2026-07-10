@@ -10,8 +10,6 @@ import Glibc
 public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
     /// The caller supplied a path that cannot be represented safely.
     case invalidPath(String)
-    /// The filesystem has no backing root configured.
-    case notConfigured
     /// Mutations are not allowed (for example, read-only access).
     case readOnly
     /// File content is not valid for the requested operation (for example, not UTF-8 text).
@@ -24,13 +22,8 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
     case unsupported(String)
     /// The requested checkpoint does not exist for this workspace.
     case checkpointNotFound(UUID)
-    /// The snapshot artifact for a checkpoint is missing.
-    case snapshotNotFound(UUID)
-    /// The parent workspace changed after a branch was created, so the branch cannot be merged.
-    case mergeConflict(parentWorkspaceId: UUID, expectedBase: UUID?, actualHead: UUID?)
-    /// The parent workspace has tracked mutations that no checkpoint captures, so merging would
-    /// silently discard them.
-    case mergeUncheckpointedChanges(parentWorkspaceId: UUID, baseMutationCursor: Int, currentMutationCursor: Int)
+    /// Persisted revision data for a checkpoint is missing.
+    case revisionDataNotFound(UUID)
     /// A tracked workspace mutation could not be recorded.
     case mutationFailed(String)
     /// Persisted checkpoint or snapshot storage is damaged (for example, a missing content blob).
@@ -44,8 +37,6 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
                 return "path contains null byte"
             }
             return "invalid path: \(path)"
-        case .notConfigured:
-            return "filesystem is not configured"
         case .readOnly:
             return "filesystem is read-only"
         case let .invalidEncoding(path):
@@ -58,14 +49,8 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
             return message
         case let .checkpointNotFound(checkpointId):
             return "workspace checkpoint not found: \(checkpointId.uuidString)"
-        case let .snapshotNotFound(snapshotId):
-            return "workspace snapshot not found: \(snapshotId.uuidString)"
-        case let .mergeConflict(parentWorkspaceId, expectedBase, actualHead):
-            let expected = expectedBase?.uuidString ?? "nil"
-            let actual = actualHead?.uuidString ?? "nil"
-            return "cannot merge branch into workspace \(parentWorkspaceId.uuidString): expected base \(expected), current head is \(actual)"
-        case let .mergeUncheckpointedChanges(parentWorkspaceId, baseMutationCursor, currentMutationCursor):
-            return "cannot merge branch into workspace \(parentWorkspaceId.uuidString): the workspace has uncheckpointed changes (mutation sequence \(currentMutationCursor), branch base \(baseMutationCursor)); create a checkpoint or roll back before merging"
+        case let .revisionDataNotFound(id):
+            return "workspace revision data not found: \(id.uuidString)"
         case let .mutationFailed(message):
             return message
         case let .storageCorrupted(message):
@@ -121,7 +106,7 @@ public struct DirectoryEntry: Sendable, Codable {
 ///
 /// Callers can branch on capabilities instead of probing operations and catching
 /// ``WorkspaceError/unsupported(_:)``.
-public struct FileSystemCapabilities: OptionSet, Sendable {
+public struct FileSystemFeatures: OptionSet, Sendable {
     public let rawValue: Int
 
     public init(rawValue: Int) {
@@ -129,17 +114,17 @@ public struct FileSystemCapabilities: OptionSet, Sendable {
     }
 
     /// Symbolic links can be created and read.
-    public static let symlinks = FileSystemCapabilities(rawValue: 1 << 0)
+    public static let symlinks = FileSystemFeatures(rawValue: 1 << 0)
     /// Hard links can be created.
-    public static let hardLinks = FileSystemCapabilities(rawValue: 1 << 1)
+    public static let hardLinks = FileSystemFeatures(rawValue: 1 << 1)
     /// POSIX permissions can be read and mutated.
-    public static let permissions = FileSystemCapabilities(rawValue: 1 << 2)
+    public static let permissions = FileSystemFeatures(rawValue: 1 << 2)
     /// ``FileSystem/resolveRealPath(path:)`` resolves symlink chains.
-    public static let realPathResolution = FileSystemCapabilities(rawValue: 1 << 3)
+    public static let realPathResolution = FileSystemFeatures(rawValue: 1 << 3)
 }
 
-/// Read-only filesystem capabilities.
-public protocol ReadableFileSystem: AnyObject, Sendable {
+/// The low-level interface implemented by workspace storage backends.
+public protocol FileSystem: AnyObject, Sendable {
     /// Returns metadata for the entry at `path`.
     func stat(path: WorkspacePath) async throws -> FileInfo
     /// Lists the direct children of the directory at `path`.
@@ -150,10 +135,6 @@ public protocol ReadableFileSystem: AnyObject, Sendable {
     func exists(path: WorkspacePath) async -> Bool
     /// Expands a glob pattern relative to `currentDirectory`.
     func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath]
-}
-
-/// Writable filesystem capabilities.
-public protocol WritableFileSystem: ReadableFileSystem {
     /// Writes `data` to `path`, optionally appending instead of replacing.
     func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws
     /// Creates a directory at `path`.
@@ -164,15 +145,6 @@ public protocol WritableFileSystem: ReadableFileSystem {
     func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws
     /// Copies an entry.
     func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws
-}
-
-/// The common interface for workspace filesystem implementations.
-///
-/// Paths are expressed as ``WorkspacePath`` values so callers can work with virtual paths that may
-/// be backed by memory, overlays, mounts, sandboxes, or real disk storage.
-public protocol FileSystem: WritableFileSystem {
-    /// Configures the filesystem to use `rootDirectory` as its backing root when applicable.
-    func configure(rootDirectory: URL) async throws
     /// Creates a symbolic link at `path` pointing to `target`.
     func createSymlink(path: WorkspacePath, target: String) async throws
     /// Creates a hard link at `path` pointing to `target`.
@@ -184,7 +156,7 @@ public protocol FileSystem: WritableFileSystem {
     /// Resolves the real path of `path`, following symlinks.
     func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath
     /// Returns the optional features this filesystem supports.
-    func capabilities() async -> FileSystemCapabilities
+    func capabilities() async -> FileSystemFeatures
     /// Reads up to `length` bytes starting at `offset`. Passing `nil` reads to the end of the
     /// file; an offset at or past the end returns empty data.
     func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data
@@ -195,12 +167,6 @@ public protocol FileSystem: WritableFileSystem {
 }
 
 extension FileSystem {
-    /// The default implementation throws ``WorkspaceError/notConfigured``.
-    public func configure(rootDirectory: URL) async throws {
-        _ = rootDirectory
-        throw WorkspaceError.notConfigured
-    }
-
     /// The default implementation throws ``WorkspaceError/unsupported(_:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
         _ = path
@@ -235,7 +201,7 @@ extension FileSystem {
     }
 
     /// The default implementation advertises no optional features.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         []
     }
 
@@ -284,3 +250,5 @@ extension FileSystem {
         try await writeFile(path: path, data: data, append: false)
     }
 }
+
+typealias FileSystemCapabilities = FileSystemFeatures

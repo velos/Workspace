@@ -1,358 +1,232 @@
 # Workspace
 
-`Workspace` is a shell-agnostic Swift package for building agent and tool runtimes around a controlled filesystem model.
+`Workspace` is a Swift package for agent and tool runtimes that need controlled filesystem access, structured edits, revision history, and isolated transactions without shell parsing.
 
-It gives you:
-- virtual filesystem abstractions
-- rooted and jailed disk access
-- in-memory filesystems
-- copy-on-write overlays
-- mounted multi-root workspaces
-- explicit permission checks for file operations
-- one `Workspace` actor for reads, tracked writes, tree summaries, snapshots, checkpoints, rollback, branching, and merge
-
-`Workspace` is beta software and should be used at your own risk. It is useful for app and agent workflows, but it is not a hardened sandbox or a security boundary by itself.
-
-## Why
-
-Many agent and tooling flows need more than plain disk I/O:
-- one isolated workspace per task
-- a shared scratch or memory area
-- the ability to read a real project without writing back to it
-- explicit approvals before reads or writes
-- tree summaries, JSON helpers, batched edits, and checkpoints without shell parsing
-
-`Workspace` provides one model for those cases. You can back it with memory, a rooted directory on disk, an overlay snapshot, or a mounted combination of several filesystems.
-
-## What It Provides
-
-- `Workspace`: high-level actor API for file operations, mutation tracking, snapshots, checkpoints, rollback, branch, and merge
-- `Checkpoint` and `CheckpointEvent`: public checkpoint metadata and event stream values
-- `Snapshot`: durable capture/restore of a subtree
-- `ChangeEvent`: structured change notifications emitted by `Workspace.watchChanges(at:recursive:)`
-- `FileSystem`: low-level protocol for custom filesystem backends
-- `ReadWriteFilesystem`: real disk access rooted to a configured directory
-- `InMemoryFilesystem`: fully in-memory filesystem for isolated workspaces and tests
-- `OverlayFilesystem`: lazy copy-on-write view of a disk root — reads pass through, writes stay in memory
-- `MountableFilesystem`: compose multiple filesystems under one virtual tree
-- `PermissionedFileSystem`: wrap any filesystem with operation-level approvals
-- `SandboxFilesystem`: convenience wrapper for app sandbox roots
-- `SecurityScopedFilesystem`: security-scoped URL and bookmark-backed access
-- `WorkspacePath`: path normalization and joining helpers
+The package is beta software. Its rooted filesystems, authorization rules, and limits are useful safety layers, but they are not a hardened process sandbox.
 
 ## Installation
-
-Until this package is published to a remote, use it as a local SwiftPM dependency:
 
 ```swift
 .dependencies: [
     .package(path: "../Workspace")
-],
-.targets: [
-    .target(
-        name: "YourTarget",
-        dependencies: ["Workspace"]
-    )
 ]
 ```
 
-## Workspace
+The package contains one library product, `Workspace`, and has no external dependencies.
 
-Create an ephemeral workspace with the default initializer:
+## The Model
+
+The public API centers on a small set of concepts:
+
+- `Workspace` owns current mutable state, history, checkpoints, and events.
+- `Revision` addresses either the current state or a checkpoint.
+- `Edit` describes a mutation.
+- `ChangeSet` is the common result used by previews, edits, history, events, diffs, and transactions.
+- `Workspace.Transaction` provides isolated preview, three-way commit, and discard.
+- `FileSystem` is the low-level protocol for custom storage backends.
+
+## Create a Workspace
+
+An empty in-memory workspace needs no configuration:
 
 ```swift
 import Workspace
 
 let workspace = Workspace()
-try await workspace.writeFile("/notes/todo.txt", content: "ship it")
-
-let text = try await workspace.readFile("/notes/todo.txt")
-print(text) // ship it
+try await workspace.writeText("/notes/todo.txt", "ship it\n")
+let text = try await workspace.readText("/notes/todo.txt")
 ```
 
-Use a custom filesystem when the files should come from memory, disk, an overlay, a mount table, or a permission wrapper:
+Use a rooted local filesystem and persisted revision store when state should survive process exit:
 
 ```swift
-let filesystem = InMemoryFilesystem()
-let workspace = Workspace(filesystem: filesystem)
-```
-
-After a workspace is created, `workspace.filesystem` exposes the backing filesystem as a normal
-`FileSystem`. The property itself is immutable, but the returned filesystem keeps its read/write
-capabilities:
-
-```swift
-let filesystem: any FileSystem = workspace.filesystem
-let data = try await filesystem.readFile(path: "/notes/todo.txt")
-```
-
-Persist checkpoint artifacts with file-backed storage:
-
-```swift
-let root = URL(fileURLWithPath: "/tmp/workspace-checkpoints", isDirectory: true)
+let files = try LocalFileSystem(root: projectURL)
 let workspace = Workspace(
-    filesystem: InMemoryFilesystem(),
-    storage: .directory(at: root)
+    workspaceID: projectID,
+    fileSystem: files,
+    persistence: .directory(historyURL),
+    recording: .full(maxTextBytes: 1_000_000)
 )
 ```
 
-`Storage.directory(at:)` writes checkpoint metadata, snapshot manifests, and a `mutations.jsonl` append log (one JSON record per line) under `<url>/<workspaceId>/`. Snapshots are content-addressed: file bytes are stored once per unique content in `blobs/<sha256>`, and each snapshot manifest references them by hash — so consecutive checkpoints share unchanged file content instead of re-serializing the whole tree, and contents are stored raw rather than base64-inflated. Legacy inline-snapshot JSON files and a legacy `mutations.json` array are still read (the latter is migrated to JSONL on first access). Blobs are retained until pruned by future GC tooling. The store assigns monotonic `sequence` numbers while holding `mutations.lock` (advisory `flock` where the OS supports it), so multiple `Workspace` instances that share a `workspaceId` and store do not collide on mutation sequence. Appends read only the log's final record to derive the next sequence, and a partial trailing line left by a crashed append is skipped on read and truncated before the next append. The current checkpoint head is derived from the parent-id graph (unparented tips), not only from `createdAt` ordering, which reduces surprises when wall clocks differ between processes. Listing mutations still reads the full log; very long histories may need application-level rotation. Coordinating multiple hosts or network disks that do not honor `flock` may still require extra synchronization.
+The injected filesystem is intentionally not exposed from `Workspace`; mutations through it would bypass workspace history and events.
 
-### Reads
+## Edits and Changes
 
-```swift
-let data = try await workspace.readData(from: "/blob.bin")
-let text = try await workspace.readFile("/notes/todo.txt")
-let exists = await workspace.exists("/notes/todo.txt")
-let info = try await workspace.fileInfo(at: "/notes/todo.txt")
-let entries = try await workspace.listDirectory(at: "/notes")
-let matches = try await workspace.glob("/notes/*.txt", currentDirectory: "/")
-let tree = try await workspace.walkTree("/")
-let summary = try await workspace.summarizeTree("/")
-```
-
-Glob wildcards use shell semantics: `*` and `?` match within a single path component, `**` matches recursively across components, and character classes support negation (`[!abc]`).
-
-Ranged reads avoid loading whole files when the backing filesystem supports seeking:
+Every mutation returns the same structured `ChangeSet`:
 
 ```swift
-let slice = try await workspace.readData(from: "/blob.bin", offset: 1024, length: 4096)
-```
-
-At the `FileSystem` level, implementations also provide `readFileChunks(path:chunkSize:)` for streaming reads, `createFile(path:data:)` for exclusive creation (fails with `EEXIST`), and `capabilities()` to query optional features (symlinks, hard links, permissions, real-path resolution) without probe-and-catch.
-
-JSON helpers encode and decode through `Codable`:
-
-```swift
-struct Config: Codable {
-    var name: String
-    var enabled: Bool
-}
-
-try await workspace.writeJSON(Config(name: "demo", enabled: true), to: "/config.json")
-let config: Config = try await workspace.readJSON(from: "/config.json")
-print(config.enabled) // true
-```
-
-### Tracked Writes
-
-Every public write records a mutation. The history is public — `mutationRecords()` returns the ordered records including per-file effects and text diffs — and the amount of detail is configurable per workspace:
-
-```swift
-let workspace = Workspace(
-    filesystem: InMemoryFilesystem(),
-    tracking: .fullDiffs(maxDiffBytes: 1_000_000) // cap diff computation to 1 MB files
-)
-// .full        — full diffs, no size cap (default)
-// .pathsOnly   — touched paths and effects, no text diffs
-// .disabled    — no history at all; change events still fire, but merge cannot
-//                detect uncheckpointed edits made in this mode
-```
-
-Tracked writes:
-
-```swift
-try await workspace.writeFile("/notes/todo.txt", content: "one")
-try await workspace.appendFile("/notes/todo.txt", content: " two")
-try await workspace.writeData(Data([0xDE, 0xAD]), to: "/blob.bin")
-try await workspace.createDirectory(at: "/docs")
-try await workspace.copyItem(from: "/notes/todo.txt", to: "/docs/todo.txt")
-try await workspace.moveItem(from: "/docs/todo.txt", to: "/docs/done.txt")
-try await workspace.removeItem(at: "/docs/done.txt")
-```
-
-Batched edits and replacements can be previewed before execution:
-
-```swift
-let preview = try await workspace.previewEdits([
-    .createDirectory(path: "/src"),
-    .writeFile(path: "/src/a.txt", content: "one"),
+let preview = try await workspace.preview([
+    .createDirectory("/Sources"),
+    .writeText("/Sources/main.swift", "print(\"hello\")\n")
 ])
 
-let result = try await workspace.applyEdits([
-    .appendFile(path: "/src/a.txt", content: " two"),
+let result = try await workspace.apply([
+    .createDirectory("/Sources"),
+    .writeText("/Sources/main.swift", "print(\"hello\")\n")
 ])
 
-let replacement = try await workspace.applyReplacement(
-    ReplacementRequest(pattern: "/src/*.txt", search: "one", replacement: "1")
+print(result.changes.touchedPaths)
+print(result.changes.statistics.additions)
+```
+
+`apply` is atomic by default. `.stopOnError` and `.continueAfterError` expose partial failures explicitly.
+
+Direct conveniences—`writeText`, `writeData`, `appendText`, `createDirectory`, `remove`, `copy`, `move`, link creation, and permission changes—use the same edit pipeline.
+
+Text replacement is an edit and shares its file selection and pattern engine with search:
+
+```swift
+let swiftFiles = FileSelection(
+    root: "/Sources",
+    include: ["**/*.swift"],
+    exclude: ["**/Generated/**"]
 )
 
-print(preview.mode)       // preview
-print(result.mode)        // execution
-print(replacement.mode)   // execution
+try await workspace.apply([
+    .replace(files: swiftFiles, pattern: .literal("OldName"), with: "NewName")
+])
 ```
 
-`applyEdits` and `applyReplacement` use logical rollback when `failurePolicy` is `.rollback`. Other policies may leave partial changes in place.
-
-### Watchers
+## Search
 
 ```swift
-let changes = await workspace.watchChanges(at: "/notes")
+let result = try await workspace.search(
+    SearchRequest(
+        pattern: .regularExpression(#"\bTODO\b"#),
+        files: swiftFiles,
+        contextLines: 2
+    )
+)
 
+for match in result.matches {
+    print("\(match.path):\(match.lineNumber): \(match.line)")
+}
+```
+
+Search is deterministic, line-oriented, does not follow symlinks, and reports binary, oversized, or truncated work as structured result data.
+
+## Checkpoints, Revisions, and Diffs
+
+Checkpoints are persisted revisions; there is no second public snapshot representation.
+
+```swift
+let before = try await workspace.createCheckpoint(label: "before")
+try await workspace.writeText("/README.md", "Updated\n")
+let after = try await workspace.createCheckpoint(label: "after")
+
+let oldText = try await workspace.readText(
+    "/README.md",
+    at: .checkpoint(before.id)
+)
+
+let changes = try await workspace.diff(
+    from: .checkpoint(before.id),
+    to: .checkpoint(after.id)
+)
+```
+
+Checkpoint reads use manifest metadata and load only selected blobs. `TextDiff` includes total line counts, addition/deletion statistics, hunks, and UTF-16 intra-line ranges.
+
+Use `Workspace.Archive` only when a fully materialized, portable subtree is actually required:
+
+```swift
+let archive = try await workspace.archive(at: "/Sources")
+try await anotherWorkspace.restore(archive, at: "/Imported")
+```
+
+## Transactions
+
+Transactions replace separate branch and merge APIs:
+
+```swift
+let transaction = try await workspace.beginTransaction(label: "agent draft")
+try await transaction.writeText("/README.md", "Draft\n")
+
+let preview = try await transaction.preview()
+let commit = try await transaction.commit(strategy: .threeWay)
+
+if !commit.applied {
+    for conflict in commit.conflicts {
+        print(conflict.path, conflict.kind)
+    }
+    try await transaction.discard()
+}
+```
+
+Manual conflicted transactions remain active. The scoped convenience commits on success and discards on failure or conflict:
+
+```swift
+let result = try await workspace.transaction { transaction in
+    try await transaction.writeText("/result.txt", "done\n")
+    return "agent result"
+}
+```
+
+Transactions are logically atomic within cooperative workspace use. They are not crash-safe against an external process racing the commit.
+
+## Events and History
+
+```swift
+let events = await workspace.events()
 Task {
-    for await change in changes {
-        print(change.kind, change.path)
+    for await event in events {
+        print(event)
     }
 }
 
-try await workspace.writeFile("/notes/todo.txt", content: "ship it")
+let mutations = try await workspace.history()
 ```
 
-Checkpoint events are separate from file change events:
+Change events, returned edit results, and mutation history all carry the same `ChangeSet` representation. Checkpoint events share the same stream.
+
+## Filesystems and Safety Layers
+
+Built-in filesystems use consistent names and constructor-driven configuration:
+
+- `InMemoryFileSystem`
+- `LocalFileSystem`
+- `OverlayFileSystem`
+- `MountedFileSystem`
+- `SandboxFileSystem`
+- `SecurityScopedFileSystem`
+- `AuthorizedFileSystem`
+- `LimitedFileSystem`
+
+Compose wrappers explicitly:
 
 ```swift
-let checkpoints = try await workspace.watchCheckpointEvents()
+let local = try LocalFileSystem(root: projectURL)
+let limited = LimitedFileSystem(
+    base: local,
+    limits: FileSystemLimits(
+        maxTotalBytes: 50_000_000,
+        maxEntryCount: 10_000,
+        maxWriteBytes: 1_000_000
+    )
+)
 
-Task {
-    for await event in checkpoints {
-        print(event.kind, event.checkpoint.label ?? "")
-    }
-}
-```
-
-### Snapshots And Checkpoints
-
-Snapshots capture filesystem contents. Checkpoints persist a snapshot plus lineage and summary metadata.
-
-```swift
-try await workspace.writeFile("/readme.txt", content: "v1")
-let checkpoint = try await workspace.createCheckpoint(label: "before edits")
-
-try await workspace.writeFile("/readme.txt", content: "v2")
-let rollback = try await workspace.rollback(to: checkpoint.id, label: "restore v1")
-
-let all = try await workspace.listCheckpoints()
-let snapshot = try await workspace.snapshot(for: checkpoint)
-
-print(rollback.rollbackSourceCheckpointId == checkpoint.id) // true
-print(all.count)
-print(snapshot.rootPath)
-```
-
-Public `restoreSnapshot(_:)` is also tracked as a workspace mutation. Checkpoint rollback records the tree changes it performs as a `rollback` mutation in addition to the rollback checkpoint, so the mutation log remains a complete account of filesystem changes. Long-running workspaces can bound the log with `pruneMutationHistory(throughSequence:)`, which always retains the newest record so sequence numbers stay monotonic.
-
-### Branch And Merge
-
-Branches are isolated `Workspace` actors cloned from the parent's current snapshot. They share the checkpoint store but not the filesystem, watchers, or mutation sequence. By default `branch()` materializes the snapshot into a new `InMemoryFilesystem`; pass `filesystem:` to use another implementation (for example a `ReadWriteFilesystem` if the branch should live on disk).
-
-```swift
-try await workspace.writeFile("/readme.txt", content: "base")
-let base = try await workspace.createCheckpoint(label: "base")
-
-let branch = try await workspace.branch(label: "agent draft")
-try await branch.writeFile("/readme.txt", content: "draft")
-let branchHead = try await branch.createCheckpoint(label: "draft ready")
-
-let merged = try await workspace.merge(branch, label: "merge draft")
-
-print(merged.parentCheckpointId == base.id)                 // true
-print(merged.mergedFromWorkspaceId == branch.workspaceId)   // true
-print(merged.mergedFromCheckpointId == branchHead.id)       // true
-```
-
-`merge(_:)` is optimistic. If the parent workspace head changed after `branch()` was created, merge throws `WorkspaceError.mergeConflict(parentWorkspaceId:expectedBase:actualHead:)`. If the parent made tracked writes after `branch()` without creating a checkpoint, merge throws `WorkspaceError.mergeUncheckpointedChanges(parentWorkspaceId:baseMutationCursor:currentMutationCursor:)` instead of silently overwriting those edits; create a checkpoint or roll the parent back first.
-
-`mergeThreeWay(_:label:)` merges even when both sides advanced. Each path is resolved against the branch's base checkpoint: the side that changed wins, identical changes merge cleanly, and when both sides changed the same path differently the merge applies nothing and returns structured conflicts instead of throwing:
-
-```swift
-let result = try await workspace.mergeThreeWay(branch, label: "merge draft")
-if result.applied {
-    print("merged as checkpoint \(result.checkpoint!.id)")
-} else {
-    for conflict in result.conflicts {
-        print("conflict at \(conflict.path): \(conflict.kind)")
-        // conflict.oursDiff / conflict.theirsDiff carry base→side diffs for text files
-    }
-}
-```
-
-## Common Filesystem Patterns
-
-### Rooted Disk Workspace
-
-```swift
-let root = URL(fileURLWithPath: "/tmp/demo-workspace", isDirectory: true)
-let filesystem = try ReadWriteFilesystem(rootDirectory: root)
-let workspace = Workspace(filesystem: filesystem)
-
-try await workspace.createDirectory(at: "/src", recursive: false)
-try await workspace.writeFile("/src/main.swift", content: "print(\"hello\")\n")
-```
-
-### Overlay On Top Of A Real Project
-
-```swift
-let projectRoot = URL(fileURLWithPath: "/path/to/project", isDirectory: true)
-let filesystem = try await OverlayFilesystem(rootDirectory: projectRoot)
-let workspace = Workspace(filesystem: filesystem)
-
-let preview = try await workspace.summarizeTree("/Sources", maxDepth: 2)
-try await workspace.writeFile("/SCRATCH.md", content: "overlay-only change\n")
-```
-
-The overlay is lazy: nothing is copied at configuration time, reads pass through to the source directory (so files that change on disk are visible immediately), and only mutated entries are copied up into memory. Deletions are recorded as whiteouts that hide the source entry without touching the disk. `reload()` discards all overlay writes and whiteouts.
-
-### Mounted Workspaces
-
-```swift
-let mounted = MountableFilesystem(
-    base: InMemoryFilesystem(),
-    mounts: [
-        .init(mountPoint: "/workspace-a", filesystem: InMemoryFilesystem()),
-        .init(mountPoint: "/workspace-b", filesystem: InMemoryFilesystem()),
-        .init(mountPoint: "/memory", filesystem: InMemoryFilesystem()),
+let rules = RuleBasedPermissionAuthorizer(
+    rules: [
+        PermissionRule(
+            operations: [.readFile, .listDirectory, .stat],
+            pathPrefix: "/Sources",
+            effect: .allow
+        )
     ]
 )
 
-let workspace = Workspace(filesystem: mounted)
-try await workspace.writeFile("/memory/plan.txt", content: "shared notes")
-try await workspace.copyItem(from: "/memory/plan.txt", to: "/workspace-a/plan.txt")
+let authorized = AuthorizedFileSystem(base: limited, authorizer: rules)
+let workspace = Workspace(fileSystem: authorized)
 ```
 
-### Operation-Level Permissions
-
-```swift
-let filesystem = PermissionedFileSystem(
-    base: InMemoryFilesystem(),
-    authorizer: PermissionAuthorizer { request in
-        switch request.operation {
-        case .readFile, .listDirectory, .stat:
-            return .allowForSession
-        default:
-            return .deny(message: "write access denied")
-        }
-    }
-)
-
-let workspace = Workspace(filesystem: filesystem)
-```
-
-## Important Behavior
-
-- Reads do not load checkpoint state. Writes, checkpoint calls, rollback, branch, and merge do.
-- All checkpoint reads share the workspace actor barrier with file I/O, so they serialize behind in-flight writes.
-- `writeJSON` ends the file with a single trailing newline; `readJSON` decodes the value as usual. Checkpoint event polling (when using `watchCheckpointEvents`) uses `Workspace.checkpointEventPollInterval` (500 ms by default; shorten in tests to reduce wait time).
-- `.inMemory` storage still records one mutation per write in memory, including old-content capture for text diffs.
-- Branches created with `.directory(at:)` share the same storage directory as the parent but are partitioned by `workspaceId`.
-- `walkTree` and `summarizeTree` return stable path ordering, which is useful for deterministic tool output.
-
-## Limitations
-
-- `Workspace` is not a hardened sandbox.
-- Logical rollback is not crash-safe and does not coordinate with external processes.
-- `OverlayFilesystem` does not persist writes back to the original root.
-- Hard links across mounts are not supported.
-- Some filesystem types still use `@unchecked Sendable`; treat shared mutable class-based implementations carefully unless their synchronization guarantees are documented.
-
-## Security Notes
-
-- Jail and root enforcement belong to the underlying filesystem implementation.
-- `ReadWriteFilesystem` uses `lstat` semantics for entry-level operations (`stat`, `exists`, `remove`, `move` source, `readSymlink`): a symlink is handled as the link itself, never its target, so links pointing outside the root can be inspected and deleted but not read or written through.
-- Permission checks are additive. They do not replace path normalization or jail enforcement.
-- If you expose `Workspace` to model-driven or remote callers, the host still needs to define what roots, mounts, and permissions are acceptable.
+Authorization supports one-shot, duration-limited, and session approvals plus bounded audit records. Prefix rules use path-component boundaries and require both paths to match for copy and move.
 
 ## Testing
 
 ```bash
-swift test
+swift build
+swift test --disable-xctest --enable-swift-testing
 ```
+
+CI runs Swift 6.2 tests on macOS and Linux.

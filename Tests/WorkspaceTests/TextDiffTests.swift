@@ -84,7 +84,7 @@ struct TextDiffTests {
     }
 
     @Test
-    func `lineBased matches Workspace previewReplacement diff for the same edit`() async throws {
+    func `lineBased matches Workspace replacement preview for the same edit`() async throws {
         let original = """
         red
         green
@@ -96,12 +96,16 @@ struct TextDiffTests {
         blue
         """
 
-        let workspace = Workspace(filesystem: InMemoryFilesystem())
-        try await workspace.writeFile("/colors.txt", content: original)
+        let workspace = Workspace(fileSystem: InMemoryFileSystem())
+        try await workspace.writeText("/colors.txt", original)
 
-        let preview = try await workspace.previewReplacement(
-            ReplacementRequest(pattern: "/colors.txt", search: "green", replacement: "teal")
-        )
+        let preview = try await workspace.preview([
+            .replace(
+                files: FileSelection(include: ["/colors.txt"]),
+                pattern: .literal("green"),
+                with: "teal"
+            )
+        ])
         let workspaceDiff = try #require(preview.changes.first?.diff)
 
         let utilityDiff = TextDiff.lineBased(from: original, to: updated)

@@ -8,7 +8,7 @@ import Glibc
 
 /// Persistence for workspace checkpoints, snapshots, and mutation logs.
 ///
-/// The store is the **source of truth** for `MutationRecord.sequence` values. Callers may pass
+/// The store is the **source of truth** for `Mutation.sequence` values. Callers may pass
 /// any placeholder sequence; ``appendMutation(_:)`` returns the record with the next persisted
 /// monotonic number for that workspace, serialized under the mutations lock.
 protocol CheckpointStore: AnyObject, Sendable {
@@ -17,19 +17,27 @@ protocol CheckpointStore: AnyObject, Sendable {
     func listCheckpoints(workspaceId: UUID) async throws -> [Checkpoint]
     func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws
     func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot?
+    func loadRevisionIndex(id: UUID, workspaceId: UUID) async throws -> RevisionIndex?
+    func readSnapshotFile(
+        id: UUID,
+        workspaceId: UUID,
+        path: WorkspacePath,
+        offset: UInt64,
+        length: Int?
+    ) async throws -> Data?
     @discardableResult
-    func appendMutation(_ mutation: MutationRecord) async throws -> MutationRecord
-    func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord]
+    func appendMutation(_ mutation: Mutation) async throws -> Mutation
+    func listMutations(workspaceId: UUID) async throws -> [Mutation]
     /// Removes mutation records with `sequence <= throughSequence`. The record carrying the
     /// highest sequence is always retained so later appends stay monotonic.
-    func pruneMutationRecords(workspaceId: UUID, throughSequence: Int) async throws
+    func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws
 }
 
 /// An in-memory checkpoint store for tests and ephemeral workspaces.
 actor InMemoryCheckpointStore: CheckpointStore {
     private var checkpointsByWorkspace: [UUID: [Checkpoint]] = [:]
     private var snapshotsByWorkspace: [UUID: [UUID: Snapshot]] = [:]
-    private var mutationsByWorkspace: [UUID: [MutationRecord]] = [:]
+    private var mutationsByWorkspace: [UUID: [Mutation]] = [:]
 
     init() {}
 
@@ -64,22 +72,44 @@ actor InMemoryCheckpointStore: CheckpointStore {
         snapshotsByWorkspace[workspaceId]?[id]
     }
 
+    func loadRevisionIndex(id: UUID, workspaceId: UUID) async throws -> RevisionIndex? {
+        snapshotsByWorkspace[workspaceId]?[id].map(RevisionIndex.init)
+    }
+
+    func readSnapshotFile(
+        id: UUID,
+        workspaceId: UUID,
+        path: WorkspacePath,
+        offset: UInt64,
+        length: Int?
+    ) async throws -> Data? {
+        guard let snapshot = snapshotsByWorkspace[workspaceId]?[id],
+              let entry = Workspace.snapshotEntry(at: path, in: snapshot.entry),
+              case let .file(file) = entry
+        else { return nil }
+        guard offset < UInt64(file.data.count) else { return Data() }
+        let start = file.data.index(file.data.startIndex, offsetBy: Int(offset))
+        let end = length.map { file.data.index(start, offsetBy: $0, limitedBy: file.data.endIndex) ?? file.data.endIndex }
+            ?? file.data.endIndex
+        return Data(file.data[start..<end])
+    }
+
     @discardableResult
-    func appendMutation(_ mutation: MutationRecord) async throws -> MutationRecord {
-        var list = mutationsByWorkspace[mutation.workspaceId, default: []]
+    func appendMutation(_ mutation: Mutation) async throws -> Mutation {
+        var list = mutationsByWorkspace[mutation.workspaceID, default: []]
         let next = (list.map(\.sequence).max() ?? 0) + 1
         var record = mutation
         record.sequence = next
         list.append(record)
-        mutationsByWorkspace[mutation.workspaceId] = list
+        mutationsByWorkspace[mutation.workspaceID] = list
         return record
     }
 
-    func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
+    func listMutations(workspaceId: UUID) async throws -> [Mutation] {
         (mutationsByWorkspace[workspaceId] ?? []).sorted { $0.sequence < $1.sequence }
     }
 
-    func pruneMutationRecords(workspaceId: UUID, throughSequence: Int) async throws {
+    func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws {
         let records = (mutationsByWorkspace[workspaceId] ?? []).sorted { $0.sequence < $1.sequence }
         guard let last = records.last else {
             return
@@ -97,8 +127,7 @@ actor InMemoryCheckpointStore: CheckpointStore {
 /// Mutations are stored as one JSON line per record in `mutations.jsonl` (append-friendly under
 /// the lock). Appends derive the next sequence from the log's final record instead of re-reading
 /// the whole log, so appends stay cheap as histories grow. A partial trailing line left by a
-/// crashed append is skipped when reading and truncated before the next append. A legacy
-/// `mutations.json` array is migrated to JSONL on the next read or append. Writes are
+/// crashed append is skipped when reading and truncated before the next append. Writes are
 /// synchronized through a persistent sidecar lockfile (`mutations.lock`) with an advisory
 /// exclusive lock when the platform supports it (`flock`), so concurrent ``FileCheckpointStore``
 /// instances in the same process and across cooperating processes do not lose appends. Checkpoint
@@ -131,6 +160,7 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> Checkpoint? {
+        try validateWorkspaceFormatIfPresent(workspaceId)
         let url = checkpointURL(id: id, workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: url.path) else {
             return nil
@@ -139,6 +169,7 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func listCheckpoints(workspaceId: UUID) async throws -> [Checkpoint] {
+        try validateWorkspaceFormatIfPresent(workspaceId)
         let directoryURL = checkpointsDirectoryURL(workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: directoryURL.path) else {
             listCheckpointsCache[workspaceId] = nil
@@ -182,6 +213,7 @@ actor FileCheckpointStore: CheckpointStore {
             var path: WorkspacePath
             var permissions: POSIXPermissions?
             var contentHash: String?
+            var contentSize: UInt64? = nil
             var symlinkTarget: String?
             var children: [Node]?
         }
@@ -205,20 +237,98 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
+        try validateWorkspaceFormatIfPresent(workspaceId)
         let url = snapshotURL(id: id, workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: url.path) else {
             return nil
         }
-        let data = try Data(contentsOf: url)
-        if let manifest = try? decoder.decode(SnapshotManifest.self, from: data) {
-            return Snapshot(
-                id: manifest.id,
-                rootPath: manifest.rootPath,
-                entry: try snapshotEntry(from: manifest.root, workspaceId: workspaceId)
+        let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+        return Snapshot(
+            id: manifest.id,
+            rootPath: manifest.rootPath,
+            entry: try snapshotEntry(from: manifest.root, workspaceId: workspaceId)
+        )
+    }
+
+    func loadRevisionIndex(id: UUID, workspaceId: UUID) async throws -> RevisionIndex? {
+        try validateWorkspaceFormatIfPresent(workspaceId)
+        let url = snapshotURL(id: id, workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+        return RevisionIndex(
+            id: manifest.id,
+            root: manifest.rootPath,
+            entry: try revisionEntry(from: manifest.root, workspaceId: workspaceId)
+        )
+    }
+
+    func readSnapshotFile(
+        id: UUID,
+        workspaceId: UUID,
+        path: WorkspacePath,
+        offset: UInt64,
+        length: Int?
+    ) async throws -> Data? {
+        try validateWorkspaceFormatIfPresent(workspaceId)
+        if let length, length < 0 {
+            throw WorkspaceError.unsupported("read length must not be negative")
+        }
+        let url = snapshotURL(id: id, workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+        guard let node = manifestNode(at: path, in: manifest.root), node.kind == .file,
+              let hash = node.contentHash
+        else { return nil }
+        let blob = blobURL(hash: hash, workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: blob.path) else {
+            throw WorkspaceError.storageCorrupted("missing content blob \(hash) for \(path)")
+        }
+        let handle = try FileHandle(forReadingFrom: blob)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        guard offset < size else { return Data() }
+        try handle.seek(toOffset: offset)
+        return try handle.read(upToCount: length ?? Int(size - offset)) ?? Data()
+    }
+
+    private func revisionEntry(
+        from node: SnapshotManifest.Node,
+        workspaceId: UUID
+    ) throws -> RevisionIndex.Entry {
+        switch node.kind {
+        case .missing:
+            return .missing(path: node.path)
+        case .file:
+            guard let hash = node.contentHash else {
+                throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has no content hash")
+            }
+            return .file(
+                path: node.path,
+                size: node.contentSize ?? 0,
+                permissions: node.permissions ?? .defaultFile,
+                contentID: hash
+            )
+        case .directory:
+            return .directory(
+                path: node.path,
+                permissions: node.permissions ?? .defaultDirectory,
+                children: try (node.children ?? []).map { try revisionEntry(from: $0, workspaceId: workspaceId) }
+            )
+        case .symlink:
+            return .symbolicLink(
+                path: node.path,
+                target: node.symlinkTarget ?? "",
+                permissions: node.permissions ?? POSIXPermissions(0o777)
             )
         }
-        // Legacy format: the full snapshot tree with inline base64 contents.
-        return try decoder.decode(Snapshot.self, from: data)
+    }
+
+    private func manifestNode(at path: WorkspacePath, in node: SnapshotManifest.Node) -> SnapshotManifest.Node? {
+        if node.path == path { return node }
+        for child in node.children ?? [] where child.path == path || path.string.hasPrefix(child.path.string + "/") {
+            return manifestNode(at: path, in: child)
+        }
+        return nil
     }
 
     private func writeManifestNode(
@@ -238,7 +348,8 @@ actor FileCheckpointStore: CheckpointStore {
                 kind: .file,
                 path: file.path,
                 permissions: file.permissions,
-                contentHash: hash
+                contentHash: hash,
+                contentSize: UInt64(file.data.count)
             )
         case let .symlink(symlink):
             return SnapshotManifest.Node(
@@ -303,22 +414,17 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     @discardableResult
-    func appendMutation(_ mutation: MutationRecord) async throws -> MutationRecord {
-        try ensureWorkspaceDirectories(for: mutation.workspaceId)
-        let jsonl = mutationsJsonlURL(workspaceId: mutation.workspaceId)
-        let legacy = legacyMutationsArrayURL(workspaceId: mutation.workspaceId)
-        let lockURL = mutationsLockURL(workspaceId: mutation.workspaceId)
-        return try Self.withMutationsExclusiveLock(at: lockURL) {
+    func appendMutation(_ mutation: Mutation) async throws -> Mutation {
+        try ensureWorkspaceDirectories(for: mutation.workspaceID)
+        let jsonl = mutationsJsonlURL(workspaceId: mutation.workspaceID)
+        let lockURL = mutationsLockURL(workspaceId: mutation.workspaceID)
+        return try Self.withExclusiveLock(at: lockURL) {
             let lastSequence: Int
             if fileManager.fileExists(atPath: jsonl.path) {
-                if fileManager.fileExists(atPath: legacy.path) {
-                    try? fileManager.removeItem(at: legacy)
-                }
                 try repairTornTail(at: jsonl)
                 lastSequence = try lastPersistedSequence(at: jsonl)
             } else {
-                // First write, or a legacy `mutations.json` array awaiting migration.
-                lastSequence = try loadAllMutations(jsonl: jsonl, legacy: legacy).map(\.sequence).max() ?? 0
+                lastSequence = 0
             }
             var record = mutation
             record.sequence = lastSequence + 1
@@ -332,28 +438,28 @@ actor FileCheckpointStore: CheckpointStore {
         }
     }
 
-    func listMutationRecords(workspaceId: UUID) async throws -> [MutationRecord] {
+    func listMutations(workspaceId: UUID) async throws -> [Mutation] {
+        try validateWorkspaceFormatIfPresent(workspaceId)
         let jsonl = mutationsJsonlURL(workspaceId: workspaceId)
-        let legacy = legacyMutationsArrayURL(workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: jsonl.path) || fileManager.fileExists(atPath: legacy.path) else {
+        guard fileManager.fileExists(atPath: jsonl.path) else {
             return []
         }
         let lockURL = mutationsLockURL(workspaceId: workspaceId)
-        return try Self.withMutationsExclusiveLock(at: lockURL) {
-            try loadAllMutations(jsonl: jsonl, legacy: legacy)
+        return try Self.withExclusiveLock(at: lockURL) {
+            try loadMutationsFromJSONL(at: jsonl)
                 .sorted { $0.sequence < $1.sequence }
         }
     }
 
-    func pruneMutationRecords(workspaceId: UUID, throughSequence: Int) async throws {
+    func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws {
+        try validateWorkspaceFormatIfPresent(workspaceId)
         let jsonl = mutationsJsonlURL(workspaceId: workspaceId)
-        let legacy = legacyMutationsArrayURL(workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: jsonl.path) || fileManager.fileExists(atPath: legacy.path) else {
+        guard fileManager.fileExists(atPath: jsonl.path) else {
             return
         }
         let lockURL = mutationsLockURL(workspaceId: workspaceId)
-        try Self.withMutationsExclusiveLock(at: lockURL) {
-            let records = try loadAllMutations(jsonl: jsonl, legacy: legacy)
+        try Self.withExclusiveLock(at: lockURL) {
+            let records = try loadMutationsFromJSONL(at: jsonl)
                 .sorted { $0.sequence < $1.sequence }
             guard let last = records.last else {
                 return
@@ -369,38 +475,18 @@ actor FileCheckpointStore: CheckpointStore {
         }
     }
 
-    private func loadAllMutations(jsonl: URL, legacy: URL) throws -> [MutationRecord] {
-        if fileManager.fileExists(atPath: jsonl.path) {
-            if fileManager.fileExists(atPath: legacy.path) {
-                try? fileManager.removeItem(at: legacy)
-            }
-            return try loadMutationsFromJSONL(at: jsonl)
-        }
-        if fileManager.fileExists(atPath: legacy.path) {
-            let data = try Data(contentsOf: legacy)
-            if data.isEmpty { return [] }
-            let records = try decoder.decode([MutationRecord].self, from: data)
-            if !records.isEmpty {
-                try fileManager.removeItem(at: legacy)
-                try writeAllMutationsAsJSONL(records, to: jsonl)
-            }
-            return records
-        }
-        return []
-    }
-
-    private func loadMutationsFromJSONL(at url: URL) throws -> [MutationRecord] {
+    private func loadMutationsFromJSONL(at url: URL) throws -> [Mutation] {
         let data = try Data(contentsOf: url)
         if data.isEmpty { return [] }
         let endsWithNewline = data.last == UInt8(ascii: "\n")
         let text = String(data: data, encoding: .utf8) ?? ""
         let lines = text.split(whereSeparator: \.isNewline)
-        var out: [MutationRecord] = []
+        var out: [Mutation] = []
         out.reserveCapacity(lines.count)
         for (index, line) in lines.enumerated() {
             if line.isEmpty { continue }
             do {
-                out.append(try decoder.decode(MutationRecord.self, from: Data(String(line).utf8)))
+                out.append(try decoder.decode(Mutation.self, from: Data(String(line).utf8)))
             } catch {
                 // A crashed append leaves a strict prefix of `<json>\n`: an undecodable final
                 // line with no trailing newline. Tolerate exactly that torn tail; anything else
@@ -436,7 +522,7 @@ actor FileCheckpointStore: CheckpointStore {
     /// lines. Must be called under the mutations lock, after ``repairTornTail(at:)``.
     private func lastPersistedSequence(at url: URL) throws -> Int {
         if let line = try lastLine(at: url),
-           let record = try? decoder.decode(MutationRecord.self, from: line) {
+           let record = try? decoder.decode(Mutation.self, from: line) {
             return record.sequence
         }
         return try loadMutationsFromJSONL(at: url).map(\.sequence).max() ?? 0
@@ -474,7 +560,7 @@ actor FileCheckpointStore: CheckpointStore {
         return nil
     }
 
-    private func writeAllMutationsAsJSONL(_ records: [MutationRecord], to url: URL) throws {
+    private func writeAllMutationsAsJSONL(_ records: [Mutation], to url: URL) throws {
         if records.isEmpty {
             if fileManager.fileExists(atPath: url.path) {
                 try fileManager.removeItem(at: url)
@@ -490,7 +576,7 @@ actor FileCheckpointStore: CheckpointStore {
         try data.write(to: url, options: .atomic)
     }
 
-    private func appendJSONLLine(encode record: MutationRecord, to url: URL) throws {
+    private func appendJSONLLine(encode record: Mutation, to url: URL) throws {
         var line = try compactEncoder.encode(record)
         line.append(Data("\n".utf8))
         if fileManager.fileExists(atPath: url.path) {
@@ -515,10 +601,50 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     private func ensureWorkspaceDirectories(for workspaceId: UUID) throws {
-        try fileManager.createDirectory(at: workspaceDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        try Self.withExclusiveLock(at: formatLockURL(workspaceId: workspaceId)) {
+            try ensureWorkspaceDirectoriesLocked(for: workspaceId)
+        }
+    }
+
+    private func ensureWorkspaceDirectoriesLocked(for workspaceId: UUID) throws {
+        let workspaceURL = workspaceDirectoryURL(workspaceId: workspaceId)
+        let existed = fileManager.fileExists(atPath: workspaceURL.path)
+        try fileManager.createDirectory(at: workspaceURL, withIntermediateDirectories: true)
+        let formatURL = workspaceURL.appendingPathComponent("format.json")
+        if fileManager.fileExists(atPath: formatURL.path) {
+            try validateWorkspaceFormatLocked(workspaceId)
+        } else {
+            if existed,
+               !(try fileManager.contentsOfDirectory(at: workspaceURL, includingPropertiesForKeys: nil)).isEmpty
+            {
+                throw WorkspaceError.storageCorrupted("workspace store has no format version")
+            }
+            try encoder.encode(StoreFormat(version: StoreFormat.currentVersion)).write(to: formatURL, options: .atomic)
+        }
         try fileManager.createDirectory(at: checkpointsDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
         try fileManager.createDirectory(at: snapshotsDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
         try fileManager.createDirectory(at: blobsDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
+    }
+
+    private func validateWorkspaceFormatIfPresent(_ workspaceId: UUID) throws {
+        let workspaceURL = workspaceDirectoryURL(workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: workspaceURL.path) else { return }
+        try Self.withExclusiveLock(at: formatLockURL(workspaceId: workspaceId)) {
+            try validateWorkspaceFormatLocked(workspaceId)
+        }
+    }
+
+    private func validateWorkspaceFormatLocked(_ workspaceId: UUID) throws {
+        let workspaceURL = workspaceDirectoryURL(workspaceId: workspaceId)
+        let formatURL = workspaceURL.appendingPathComponent("format.json")
+        guard fileManager.fileExists(atPath: formatURL.path) else {
+            throw WorkspaceError.storageCorrupted("workspace store has no format version")
+        }
+        let format = try decoder.decode(StoreFormat.self, from: Data(contentsOf: formatURL))
+        guard format.version == StoreFormat.currentVersion else {
+            throw WorkspaceError.storageCorrupted("unsupported store format version \(format.version)")
+        }
     }
 
     private func workspaceDirectoryURL(workspaceId: UUID) -> URL {
@@ -553,18 +679,17 @@ actor FileCheckpointStore: CheckpointStore {
         workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.jsonl", isDirectory: false)
     }
 
-    private func legacyMutationsArrayURL(workspaceId: UUID) -> URL {
-        workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.json", isDirectory: false)
-    }
-
-    /// A persistent sidecar lockfile used by ``withMutationsExclusiveLock(at:_:)``.
+    /// A persistent sidecar lockfile used to serialize mutation-log access.
     ///
     /// The mutations log is append-only; we still take the lock on a **stable** sidecar so the lock
     /// is not taken on a file that is unlinked/renamed by atomic write helpers in other
-    /// subsystems. Mutations are written to `mutations.jsonl` (or created there after migrating
-    /// from a legacy `mutations.json` array on first access).
+    /// subsystems. Mutations are written to `mutations.jsonl`.
     private func mutationsLockURL(workspaceId: UUID) -> URL {
         workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.lock", isDirectory: false)
+    }
+
+    private func formatLockURL(workspaceId: UUID) -> URL {
+        rootDirectory.appendingPathComponent(".\(workspaceId.uuidString).format.lock", isDirectory: false)
     }
 
     private func write<T: Encodable>(_ value: T, to url: URL) throws {
@@ -575,28 +700,33 @@ actor FileCheckpointStore: CheckpointStore {
         try decoder.decode(type, from: Data(contentsOf: url))
     }
 
-    private struct MutationsFileError: Error {
+    private struct LockFileError: Error {
         var message: String
     }
 
+    private struct StoreFormat: Codable {
+        static let currentVersion = 1
+        var version: Int
+    }
+
 #if canImport(Darwin) || canImport(Glibc)
-    private static func withMutationsExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
+    private static func withExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
         let path = url.path
         let fd = open(path, O_RDWR | O_CREAT, 0o644)
         guard fd >= 0 else {
-            throw MutationsFileError(message: "could not open mutations file at \(path)")
+            throw LockFileError(message: "could not open lock file at \(path)")
         }
         defer { close(fd) }
         while flock(fd, LOCK_EX) != 0 {
             if errno != EINTR {
-                throw MutationsFileError(message: "could not acquire exclusive lock on mutations file at \(path)")
+                throw LockFileError(message: "could not acquire exclusive lock at \(path)")
             }
         }
         defer { _ = flock(fd, LOCK_UN) }
         return try body()
     }
 #else
-    private static func withMutationsExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
+    private static func withExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
         try body()
     }
 #endif

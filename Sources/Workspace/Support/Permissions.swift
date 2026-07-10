@@ -35,7 +35,7 @@ public enum PermissionOperation: String, Sendable, Hashable, Codable {
 }
 
 /// A permission request describing the operation and paths involved.
-public struct PermissionRequest: Sendable, Hashable {
+public struct PermissionRequest: Sendable, Hashable, Codable {
     /// The operation being requested.
     public var operation: PermissionOperation
     /// The primary path associated with the request when applicable.
@@ -73,8 +73,37 @@ public enum PermissionDecision: Sendable {
     case allow
     /// Allows the operation and caches the decision for equivalent future requests in the session.
     case allowForSession
+    /// Allows equivalent requests for the supplied duration.
+    case allowFor(Duration)
     /// Denies the operation, optionally providing a user-facing message.
     case deny(message: String?)
+}
+
+public struct PermissionAuditRecord: Sendable, Codable, Equatable {
+    public enum Outcome: Sendable, Codable, Equatable {
+        case allowed
+        case denied(message: String?)
+    }
+
+    public enum Source: Sendable, Codable, Equatable {
+        case handler
+        case sessionCache
+        case temporaryCache
+        case rule(Int)
+        case defaultRule
+    }
+
+    public var timestamp: Date
+    public var request: PermissionRequest
+    public var outcome: Outcome
+    public var source: Source
+
+    public init(timestamp: Date = Date(), request: PermissionRequest, outcome: Outcome, source: Source) {
+        self.timestamp = timestamp
+        self.request = request
+        self.outcome = outcome
+        self.source = source
+    }
 }
 
 /// An authorization policy for workspace filesystem operations.
@@ -90,30 +119,149 @@ public actor PermissionAuthorizer: PermissionAuthorizing {
 
     private let handler: Handler
     private var sessionAllows: Set<PermissionRequest> = []
+    private var temporaryAllows: [PermissionRequest: ContinuousClock.Instant] = [:]
+    private var auditRecords: [PermissionAuditRecord] = []
+    private let auditCapacity: Int
+    private let clock = ContinuousClock()
 
     /// Creates an authorizer from an asynchronous decision handler.
-    public init(handler: @escaping Handler) {
+    public init(auditCapacity: Int = 1_000, handler: @escaping Handler) {
         self.handler = handler
+        self.auditCapacity = max(0, auditCapacity)
     }
 
     /// Returns the authorization decision for `request`, reusing session approvals when available.
     public func authorize(_ request: PermissionRequest) async -> PermissionDecision {
         if sessionAllows.contains(request) {
+            record(request, outcome: .allowed, source: .sessionCache)
             return .allow
+        }
+
+        let now = clock.now
+        if let expiration = temporaryAllows[request] {
+            if now < expiration {
+                record(request, outcome: .allowed, source: .temporaryCache)
+                return .allow
+            }
+            temporaryAllows.removeValue(forKey: request)
         }
 
         let decision = await handler(request)
-        if case .allowForSession = decision {
+        switch decision {
+        case .allowForSession:
             sessionAllows.insert(request)
+            record(request, outcome: .allowed, source: .handler)
             return .allow
+        case let .allowFor(duration):
+            temporaryAllows[request] = now.advanced(by: duration)
+            record(request, outcome: .allowed, source: .handler)
+            return .allow
+        case .allow:
+            record(request, outcome: .allowed, source: .handler)
+        case let .deny(message):
+            record(request, outcome: .denied(message: message), source: .handler)
         }
 
+        return decision
+    }
+
+    public func auditLog() -> [PermissionAuditRecord] { auditRecords }
+
+    public func clearAuditLog() { auditRecords.removeAll(keepingCapacity: true) }
+
+    private func record(
+        _ request: PermissionRequest,
+        outcome: PermissionAuditRecord.Outcome,
+        source: PermissionAuditRecord.Source
+    ) {
+        guard auditCapacity > 0 else { return }
+        auditRecords.append(.init(request: request, outcome: outcome, source: source))
+        if auditRecords.count > auditCapacity {
+            auditRecords.removeFirst(auditRecords.count - auditCapacity)
+        }
+    }
+}
+
+public struct PermissionRule: Sendable, Codable, Equatable {
+    public enum Effect: Sendable, Codable, Equatable {
+        case allow
+        case deny(message: String?)
+    }
+
+    public var operations: Set<PermissionOperation>
+    public var pathPrefix: WorkspacePath
+    public var effect: Effect
+
+    public init(operations: Set<PermissionOperation>, pathPrefix: WorkspacePath, effect: Effect) {
+        self.operations = operations
+        self.pathPrefix = pathPrefix
+        self.effect = effect
+    }
+}
+
+/// A deterministic first-match path-prefix authorization policy.
+public actor RuleBasedPermissionAuthorizer: PermissionAuthorizing {
+    private let rules: [PermissionRule]
+    private let defaultEffect: PermissionRule.Effect
+    private let auditCapacity: Int
+    private var auditRecords: [PermissionAuditRecord] = []
+
+    public init(
+        rules: [PermissionRule],
+        defaultEffect: PermissionRule.Effect = .deny(message: nil),
+        auditCapacity: Int = 1_000
+    ) {
+        self.rules = rules
+        self.defaultEffect = defaultEffect
+        self.auditCapacity = max(0, auditCapacity)
+    }
+
+    public func authorize(_ request: PermissionRequest) async -> PermissionDecision {
+        for (index, rule) in rules.enumerated()
+        where rule.operations.contains(request.operation) && Self.matchesPaths(request, prefix: rule.pathPrefix) {
+            return decision(for: rule.effect, request: request, source: .rule(index))
+        }
+        return decision(for: defaultEffect, request: request, source: .defaultRule)
+    }
+
+    public func auditLog() -> [PermissionAuditRecord] { auditRecords }
+    public func clearAuditLog() { auditRecords.removeAll(keepingCapacity: true) }
+
+    private static func matchesPaths(_ request: PermissionRequest, prefix: WorkspacePath) -> Bool {
+        let paths = [request.path, request.sourcePath, request.destinationPath].compactMap { $0 }
+        guard !paths.isEmpty else { return false }
+        return paths.allSatisfy { path in
+            prefix.isRoot || path == prefix || path.string.hasPrefix(prefix.string + "/")
+        }
+    }
+
+    private func decision(
+        for effect: PermissionRule.Effect,
+        request: PermissionRequest,
+        source: PermissionAuditRecord.Source
+    ) -> PermissionDecision {
+        let decision: PermissionDecision
+        let outcome: PermissionAuditRecord.Outcome
+        switch effect {
+        case .allow:
+            decision = .allow
+            outcome = .allowed
+        case let .deny(message):
+            decision = .deny(message: message)
+            outcome = .denied(message: message)
+        }
+        if auditCapacity > 0 {
+            auditRecords.append(.init(request: request, outcome: outcome, source: source))
+            if auditRecords.count > auditCapacity {
+                auditRecords.removeFirst(auditRecords.count - auditCapacity)
+            }
+        }
         return decision
     }
 }
 
 /// A filesystem wrapper that authorizes each operation before forwarding it to another filesystem.
-public final class PermissionedFileSystem: FileSystem, Sendable {
+public final class AuthorizedFileSystem: FileSystem, Sendable {
     private let base: any FileSystem
     private let authorizer: any PermissionAuthorizing
 
@@ -124,11 +272,6 @@ public final class PermissionedFileSystem: FileSystem, Sendable {
     ) {
         self.base = base
         self.authorizer = authorizer
-    }
-
-    /// See ``FileSystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) async throws {
-        try await base.configure(rootDirectory: rootDirectory)
     }
 
     /// See ``FileSystem/stat(path:)``.
@@ -171,7 +314,7 @@ public final class PermissionedFileSystem: FileSystem, Sendable {
     }
 
     /// See ``FileSystem/capabilities()``.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         await base.capabilities()
     }
 

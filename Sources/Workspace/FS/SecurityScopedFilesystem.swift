@@ -5,7 +5,7 @@ import Foundation
 ///
 /// This adapter is intended for iOS and macOS workflows where filesystem access must be granted through
 /// a bookmark or document picker URL.
-public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
+public final class SecurityScopedFileSystem: FileSystem, @unchecked Sendable {
     /// The permitted mutability for the scoped filesystem.
     public enum AccessMode: Sendable {
         /// Only read operations are allowed.
@@ -15,7 +15,7 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
     }
 
     private let mode: AccessMode
-    private let backing: ReadWriteFilesystem
+    private let backing: LocalFileSystem
     private let stateLock = NSLock()
 
     private var scopedURL: URL
@@ -31,7 +31,7 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
     /// Creates a filesystem rooted at a security-scoped URL.
     public init(url: URL, mode: AccessMode = .readWrite, fileManager: FileManager = .default) throws {
         self.mode = mode
-        backing = ReadWriteFilesystem(fileManager: fileManager)
+        backing = LocalFileSystem(fileManager: fileManager)
         scopedURL = url.standardizedFileURL
         cachedBookmarkData = nil
         try configureBackingForCurrentURL()
@@ -43,7 +43,7 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
         throw WorkspaceError.unsupported("security-scoped URLs not supported on this platform")
         #else
         self.mode = mode
-        backing = ReadWriteFilesystem(fileManager: fileManager)
+        backing = LocalFileSystem(fileManager: fileManager)
 
         var isStale = false
         let resolvedURL = try URL(
@@ -111,15 +111,15 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
         store: any BookmarkStore,
         mode: AccessMode = .readWrite,
         fileManager: FileManager = .default
-    ) async throws -> SecurityScopedFilesystem {
+    ) async throws -> SecurityScopedFileSystem {
         guard let data = try await store.loadBookmark(for: id) else {
             throw WorkspaceError.unsupported("bookmark not found: \(id)")
         }
-        return try SecurityScopedFilesystem(bookmarkData: data, mode: mode, fileManager: fileManager)
+        return try SecurityScopedFileSystem(bookmarkData: data, mode: mode, fileManager: fileManager)
     }
 
     /// See ``FileSystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) async throws {
+    func configure(rootDirectory: URL) async throws {
         try withLock {
             stopAccessingSecurityScopeIfNeeded()
             scopedURL = rootDirectory.standardizedFileURL
@@ -163,7 +163,7 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// See ``FileSystem/capabilities()``.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         await backing.capabilities()
     }
 
@@ -282,4 +282,6 @@ public final class SecurityScopedFilesystem: FileSystem, @unchecked Sendable {
     private static let bookmarkResolutionOptions: URL.BookmarkResolutionOptions = []
     #endif
 }
+
+typealias SecurityScopedFilesystem = SecurityScopedFileSystem
 #endif

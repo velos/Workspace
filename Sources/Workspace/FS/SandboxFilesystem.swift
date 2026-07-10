@@ -1,7 +1,7 @@
 import Foundation
 
 /// A disk-backed filesystem rooted in a standard app sandbox location.
-public final class SandboxFilesystem: FileSystem, Sendable {
+public final class SandboxFileSystem: FileSystem, Sendable {
     /// Supported strategies for choosing the sandbox root.
     public enum Root: Sendable {
         /// The user's documents directory.
@@ -16,18 +16,13 @@ public final class SandboxFilesystem: FileSystem, Sendable {
         case url(URL)
     }
 
-    private let backing: ReadWriteFilesystem
+    private let backing: LocalFileSystem
 
     /// Creates a sandbox filesystem rooted according to `root`.
     public init(root: Root, fileManager: FileManager = .default) throws {
-        backing = ReadWriteFilesystem(fileManager: fileManager)
+        backing = LocalFileSystem(fileManager: fileManager)
         let resolvedRoot = try Self.resolveRootURL(root, fileManager: fileManager)
         try backing.applyConfiguration(rootDirectory: resolvedRoot)
-    }
-
-    /// See ``FileSystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) async throws {
-        try await backing.configure(rootDirectory: rootDirectory)
     }
 
     /// See ``FileSystem/stat(path:)``.
@@ -64,7 +59,7 @@ public final class SandboxFilesystem: FileSystem, Sendable {
     }
 
     /// See ``FileSystem/capabilities()``.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         await backing.capabilities()
     }
 
@@ -161,3 +156,5 @@ public final class SandboxFilesystem: FileSystem, Sendable {
         }
     }
 }
+
+typealias SandboxFilesystem = SandboxFileSystem
