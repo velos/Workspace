@@ -22,28 +22,14 @@ extension Workspace {
     func loadStoreState() async throws {
         checkpoints = try await store.listCheckpoints(workspaceId: workspaceId)
         mutations = try await store.listMutations(workspaceId: workspaceId)
-        headCheckpointId = Self.lineageHeadId(in: checkpoints)
+        headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
         didLoadStoreState = true
     }
 
     func reconcileCheckpointsWithStore() async throws {
         try await ensureLoaded()
         checkpoints = try await store.listCheckpoints(workspaceId: workspaceId).sorted(by: checkpointSort)
-        headCheckpointId = Self.lineageHeadId(in: checkpoints)
-    }
-
-    static func lineageHeadId(in checkpoints: [Checkpoint]) -> UUID? {
-        guard !checkpoints.isEmpty else { return nil }
-        let referencedParents = Set(checkpoints.compactMap(\.parentID))
-        let tips = checkpoints.filter { !referencedParents.contains($0.id) }
-        return (tips.isEmpty ? checkpoints : tips).max(by: orderCheckpoints)?.id
-    }
-
-    static func orderCheckpoints(_ lhs: Checkpoint, _ rhs: Checkpoint) -> Bool {
-        if lhs.createdAt == rhs.createdAt {
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
-        return lhs.createdAt < rhs.createdAt
+        headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
     }
 
     func checkpointOrThrow(id: UUID) throws -> Checkpoint {
@@ -65,48 +51,22 @@ extension Workspace {
         snapshot: Snapshot,
         label: String?,
         parentCheckpointId: UUID?,
-        origin: Checkpoint.Origin,
-        comparisonSnapshot: Snapshot? = nil
+        origin: Checkpoint.Origin
     ) async throws -> Checkpoint {
-        try await store.saveSnapshot(snapshot, workspaceId: workspaceId)
-
-        let parent = parentCheckpointId.flatMap { id in checkpoints.first(where: { $0.id == id }) }
-        let previous: Snapshot?
-        if let comparisonSnapshot {
-            previous = comparisonSnapshot
-        } else if let parent {
-            previous = try? await store.loadSnapshot(id: parent.snapshotId, workspaceId: workspaceId)
-        } else {
-            previous = nil
-        }
-        let baseline = previous ?? Snapshot(
-            rootPath: snapshot.rootPath,
-            entry: .missing(.init(path: snapshot.rootPath))
+        let checkpoint = try await store.saveRevision(
+            snapshot,
+            draft: CheckpointDraft(
+                workspaceID: workspaceId,
+                label: label,
+                preferredParentID: parentCheckpointId,
+                origin: origin,
+                mutationCursor: latestMutationSequence()
+            )
         )
-        let summary = ChangeSet.compare(
-            before: baseline,
-            after: snapshot,
-            maxTextBytes: 1_000_000
-        ).summary
-
-        let previousCursor = parent?.mutationCursor ?? 0
-        let currentCursor = latestMutationSequence()
-        let checkpoint = Checkpoint(
-            workspaceId: workspaceId,
-            label: label,
-            parentCheckpointId: parentCheckpointId,
-            origin: origin,
-            firstMutationSequence: currentCursor > previousCursor ? previousCursor + 1 : nil,
-            lastMutationSequence: currentCursor > previousCursor ? currentCursor : nil,
-            mutationCursor: currentCursor,
-            snapshotId: snapshot.id,
-            summary: summary
-        )
-
-        try await store.saveCheckpoint(checkpoint)
+        checkpoints.removeAll { $0.id == checkpoint.id }
         checkpoints.append(checkpoint)
         checkpoints.sort(by: checkpointSort)
-        headCheckpointId = checkpoint.id
+        headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
         emitWorkspaceEvent(.checkpoint(checkpoint))
         return checkpoint
     }
@@ -154,11 +114,8 @@ extension Workspace {
         let newCheckpoints = stored.filter { candidate in
             !checkpoints.contains(where: { $0.id == candidate.id })
         }
-        guard !newCheckpoints.isEmpty else { return }
-
-        checkpoints.append(contentsOf: newCheckpoints)
-        checkpoints.sort(by: checkpointSort)
-        headCheckpointId = Self.lineageHeadId(in: checkpoints)
+        checkpoints = stored.sorted(by: checkpointSort)
+        headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
         if let refreshed = try? await store.listMutations(workspaceId: workspaceId) {
             mutations = refreshed.sorted { $0.sequence < $1.sequence }
         }
@@ -168,6 +125,6 @@ extension Workspace {
     }
 
     func checkpointSort(lhs: Checkpoint, rhs: Checkpoint) -> Bool {
-        Self.orderCheckpoints(lhs, rhs)
+        Checkpoint.orderedBefore(lhs, rhs)
     }
 }

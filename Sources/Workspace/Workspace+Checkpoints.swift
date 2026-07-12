@@ -46,13 +46,13 @@ extension Workspace {
 
     /// Returns one checkpoint owned by this workspace when present.
     public func checkpoint(id: UUID) async throws -> Checkpoint? {
-        try await ensureLoaded()
+        try await reconcileCheckpointsWithStore()
         return checkpoints.first(where: { $0.id == id })
     }
 
     /// Lists this workspace's checkpoints in stable creation order.
     public func checkpoints() async throws -> [Checkpoint] {
-        try await ensureLoaded()
+        try await reconcileCheckpointsWithStore()
         return checkpoints
     }
 

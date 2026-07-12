@@ -30,6 +30,14 @@ public struct Checkpoint: Sendable, Codable, Equatable {
         return nil
     }
 
+    var provenanceCheckpointID: UUID? {
+        switch origin {
+        case let .rollback(from): from
+        case let .transaction(base): base
+        case .manual, .archiveRestore: nil
+        }
+    }
+
     init(
         id: UUID = UUID(),
         workspaceId: UUID,
@@ -55,4 +63,84 @@ public struct Checkpoint: Sendable, Codable, Equatable {
         self.snapshotId = snapshotId
         self.summary = summary
     }
+
+    static func orderedBefore(_ lhs: Checkpoint, _ rhs: Checkpoint) -> Bool {
+        if lhs.createdAt == rhs.createdAt {
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        return lhs.createdAt < rhs.createdAt
+    }
+
+    static func lineageHeadID(in checkpoints: [Checkpoint]) -> UUID? {
+        guard !checkpoints.isEmpty else { return nil }
+        let referencedParents = Set(checkpoints.compactMap(\.parentID))
+        let tips = checkpoints.filter { !referencedParents.contains($0.id) }
+        return (tips.isEmpty ? checkpoints : tips).max(by: orderedBefore)?.id
+    }
+
+    static func make(
+        snapshot: Snapshot,
+        draft: CheckpointDraft,
+        parent: Checkpoint?,
+        parentSnapshot: Snapshot?
+    ) -> Checkpoint {
+        let metadata = revisionMetadata(
+            snapshot: snapshot,
+            parent: parent,
+            parentSnapshot: parentSnapshot,
+            mutationCursor: draft.mutationCursor
+        )
+        return Checkpoint(
+            workspaceId: draft.workspaceID,
+            label: draft.label,
+            parentCheckpointId: parent?.id,
+            origin: draft.origin,
+            firstMutationSequence: metadata.firstMutationSequence,
+            lastMutationSequence: metadata.lastMutationSequence,
+            mutationCursor: draft.mutationCursor,
+            snapshotId: snapshot.id,
+            summary: metadata.summary
+        )
+    }
+
+    func rebased(to parent: Checkpoint?, snapshot: Snapshot, parentSnapshot: Snapshot?) -> Checkpoint {
+        var copy = self
+        copy.parentID = parent?.id
+        let metadata = Self.revisionMetadata(
+            snapshot: snapshot,
+            parent: parent,
+            parentSnapshot: parentSnapshot,
+            mutationCursor: mutationCursor
+        )
+        copy.firstMutationSequence = metadata.firstMutationSequence
+        copy.lastMutationSequence = metadata.lastMutationSequence
+        copy.summary = metadata.summary
+        return copy
+    }
+
+    private static func revisionMetadata(
+        snapshot: Snapshot,
+        parent: Checkpoint?,
+        parentSnapshot: Snapshot?,
+        mutationCursor: Int
+    ) -> (firstMutationSequence: Int?, lastMutationSequence: Int?, summary: ChangeSet.Summary) {
+        let baseline = parentSnapshot ?? Snapshot(
+            rootPath: snapshot.rootPath,
+            entry: .missing(.init(path: snapshot.rootPath))
+        )
+        let previousCursor = parent?.mutationCursor ?? 0
+        return (
+            mutationCursor > previousCursor ? previousCursor + 1 : nil,
+            mutationCursor > previousCursor ? mutationCursor : nil,
+            ChangeSet.compare(before: baseline, after: snapshot, maxTextBytes: 1_000_000).summary
+        )
+    }
+}
+
+struct CheckpointDraft: Sendable {
+    var workspaceID: UUID
+    var label: String?
+    var preferredParentID: UUID?
+    var origin: Checkpoint.Origin
+    var mutationCursor: Int
 }

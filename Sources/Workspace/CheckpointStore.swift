@@ -12,10 +12,9 @@ import Glibc
 /// any placeholder sequence; ``appendMutation(_:)`` returns the record with the next persisted
 /// monotonic number for that workspace, serialized under the mutations lock.
 protocol CheckpointStore: AnyObject, Sendable {
-    func saveCheckpoint(_ checkpoint: Checkpoint) async throws
+    func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint
     func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> Checkpoint?
     func listCheckpoints(workspaceId: UUID) async throws -> [Checkpoint]
-    func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws
     func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot?
     func loadRevisionIndex(id: UUID, workspaceId: UUID) async throws -> RevisionIndex?
     func readSnapshotFile(
@@ -31,6 +30,12 @@ protocol CheckpointStore: AnyObject, Sendable {
     /// Removes mutation records with `sequence <= throughSequence`. The record carrying the
     /// highest sequence is always retained so later appends stay monotonic.
     func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws
+    func storageStatistics(workspaceId: UUID) async throws -> Workspace.StorageStatistics
+    func compact(
+        workspaceId: UUID,
+        retaining retention: Workspace.Retention,
+        dryRun: Bool
+    ) async throws -> StoreCompactionResult
 }
 
 /// An in-memory checkpoint store for tests and ephemeral workspaces.
@@ -41,14 +46,23 @@ actor InMemoryCheckpointStore: CheckpointStore {
 
     init() {}
 
-    func saveCheckpoint(_ checkpoint: Checkpoint) async throws {
-        var list = checkpointsByWorkspace[checkpoint.workspaceId] ?? []
-        if let index = list.firstIndex(where: { $0.id == checkpoint.id }) {
-            list[index] = checkpoint
-        } else {
-            list.append(checkpoint)
+    func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint {
+        var list = checkpointsByWorkspace[draft.workspaceID] ?? []
+        let parent = resolvedParent(for: draft, checkpoints: list)
+        let parentSnapshot = parent.flatMap { snapshotsByWorkspace[draft.workspaceID]?[$0.snapshotId] }
+        if let parent, parentSnapshot == nil {
+            throw WorkspaceError.storageCorrupted("checkpoint \(parent.id) has no snapshot")
         }
-        checkpointsByWorkspace[checkpoint.workspaceId] = list
+        let checkpoint = Checkpoint.make(
+            snapshot: snapshot,
+            draft: draft,
+            parent: parent,
+            parentSnapshot: parentSnapshot
+        )
+        snapshotsByWorkspace[draft.workspaceID, default: [:]][snapshot.id] = snapshot
+        list.append(checkpoint)
+        checkpointsByWorkspace[draft.workspaceID] = list.sorted(by: Checkpoint.orderedBefore)
+        return checkpoint
     }
 
     func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> Checkpoint? {
@@ -62,10 +76,6 @@ actor InMemoryCheckpointStore: CheckpointStore {
             }
             return $0.createdAt < $1.createdAt
         }
-    }
-
-    func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws {
-        snapshotsByWorkspace[workspaceId, default: [:]][snapshot.id] = snapshot
     }
 
     func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
@@ -120,6 +130,82 @@ actor InMemoryCheckpointStore: CheckpointStore {
         }
         mutationsByWorkspace[workspaceId] = kept
     }
+
+    func storageStatistics(workspaceId: UUID) async throws -> Workspace.StorageStatistics {
+        statistics(
+            checkpoints: checkpointsByWorkspace[workspaceId] ?? [],
+            snapshots: snapshotsByWorkspace[workspaceId] ?? [:]
+        )
+    }
+
+    func compact(
+        workspaceId: UUID,
+        retaining retention: Workspace.Retention,
+        dryRun: Bool
+    ) async throws -> StoreCompactionResult {
+        let currentCheckpoints = checkpointsByWorkspace[workspaceId] ?? []
+        let currentSnapshots = snapshotsByWorkspace[workspaceId] ?? [:]
+        let before = statistics(checkpoints: currentCheckpoints, snapshots: currentSnapshots)
+        let plan = try CheckpointRetentionPlanner.plan(checkpoints: currentCheckpoints, retaining: retention)
+        let retained = try CheckpointRetentionPlanner.materialize(plan) { snapshotID in
+            currentSnapshots[snapshotID]
+        }
+
+        let retainedSnapshotIDs = Set(retained.map(\.snapshotId))
+        let retainedSnapshots = currentSnapshots.filter { retainedSnapshotIDs.contains($0.key) }
+        let after = statistics(checkpoints: retained, snapshots: retainedSnapshots)
+        let report = Workspace.CompactionReport(
+            dryRun: dryRun,
+            before: before,
+            after: after,
+            removedCheckpointIDs: plan.removedCheckpointIDs,
+            rebasedCheckpointIDs: plan.rebasedCheckpointIDs
+        )
+
+        if !dryRun {
+            checkpointsByWorkspace[workspaceId] = retained
+            snapshotsByWorkspace[workspaceId] = retainedSnapshots
+        }
+        return StoreCompactionResult(report: report, checkpoints: retained)
+    }
+
+    private func resolvedParent(for draft: CheckpointDraft, checkpoints: [Checkpoint]) -> Checkpoint? {
+        if let preferred = draft.preferredParentID,
+           let parent = checkpoints.first(where: { $0.id == preferred }) {
+            return parent
+        }
+        guard draft.preferredParentID != nil,
+              let headID = Checkpoint.lineageHeadID(in: checkpoints)
+        else { return nil }
+        return checkpoints.first(where: { $0.id == headID })
+    }
+
+    private func statistics(
+        checkpoints: [Checkpoint],
+        snapshots: [UUID: Snapshot]
+    ) -> Workspace.StorageStatistics {
+        var blobs: [String: UInt64] = [:]
+        for snapshot in snapshots.values {
+            collectBlobStatistics(snapshot.entry, into: &blobs)
+        }
+        return Workspace.StorageStatistics(
+            checkpointCount: checkpoints.count,
+            snapshotCount: snapshots.count,
+            blobCount: blobs.count,
+            blobBytes: blobs.values.reduce(0, +)
+        )
+    }
+
+    private func collectBlobStatistics(_ entry: Snapshot.Entry, into blobs: inout [String: UInt64]) {
+        switch entry {
+        case let .file(file):
+            blobs[SHA256.hexDigest(of: file.data)] = UInt64(file.data.count)
+        case let .directory(directory):
+            for child in directory.children { collectBlobStatistics(child, into: &blobs) }
+        case .missing, .symlink:
+            break
+        }
+    }
 }
 
 /// A JSON file-backed checkpoint store.
@@ -130,9 +216,11 @@ actor InMemoryCheckpointStore: CheckpointStore {
 /// crashed append is skipped when reading and truncated before the next append. Writes are
 /// synchronized through a persistent sidecar lockfile (`mutations.lock`) with an advisory
 /// exclusive lock when the platform supports it (`flock`), so concurrent ``FileCheckpointStore``
-/// instances in the same process and across cooperating processes do not lose appends. Checkpoint
-/// and snapshot writes are per-artifact atomic replaces. Coordinating writers on network
-/// filesystems that do not honor `flock` may still require application-level serialization.
+/// instances in the same process and across cooperating processes do not lose appends. A separate
+/// lifecycle lock serializes checkpoint commits, revision reads, and compaction; rebased metadata
+/// is written before unreachable artifacts are removed, keeping interrupted compaction recoverable.
+/// Coordinating writers on network filesystems that do not honor `flock` may still require
+/// application-level serialization.
 actor FileCheckpointStore: CheckpointStore {
     private let rootDirectory: URL
     private let fileManager: FileManager
@@ -153,19 +241,42 @@ actor FileCheckpointStore: CheckpointStore {
         self.compactEncoder = JSONEncoder()
     }
 
-    func saveCheckpoint(_ checkpoint: Checkpoint) async throws {
-        listCheckpointsCache[checkpoint.workspaceId] = nil
-        try ensureWorkspaceDirectories(for: checkpoint.workspaceId)
-        try write(checkpoint, to: checkpointURL(id: checkpoint.id, workspaceId: checkpoint.workspaceId))
+    func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint {
+        try ensureWorkspaceDirectories(for: draft.workspaceID)
+        return try Self.withExclusiveLock(at: lifecycleLockURL(workspaceId: draft.workspaceID)) {
+            let checkpoints = try loadAllCheckpointsUnlocked(workspaceId: draft.workspaceID)
+            let parent = resolvedParent(for: draft, checkpoints: checkpoints)
+            let parentSnapshot = try parent.map {
+                guard let snapshot = try loadSnapshotUnlocked(id: $0.snapshotId, workspaceId: draft.workspaceID) else {
+                    throw WorkspaceError.storageCorrupted("checkpoint \($0.id) has no snapshot")
+                }
+                return snapshot
+            }
+            let checkpoint = Checkpoint.make(
+                snapshot: snapshot,
+                draft: draft,
+                parent: parent,
+                parentSnapshot: parentSnapshot
+            )
+            try writeSnapshotUnlocked(snapshot, workspaceId: draft.workspaceID)
+            try write(checkpoint, to: checkpointURL(id: checkpoint.id, workspaceId: draft.workspaceID))
+            listCheckpointsCache[draft.workspaceID] = nil
+            return checkpoint
+        }
     }
 
     func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> Checkpoint? {
         try validateWorkspaceFormatIfPresent(workspaceId)
-        let url = checkpointURL(id: id, workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: url.path) else {
-            return nil
+        guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else { return nil }
+        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+            let url = checkpointURL(id: id, workspaceId: workspaceId)
+            guard fileManager.fileExists(atPath: url.path) else { return nil }
+            let checkpoint = try read(Checkpoint.self, from: url)
+            guard checkpoint.id == id, checkpoint.workspaceID == workspaceId else {
+                throw WorkspaceError.storageCorrupted("checkpoint metadata does not match its storage path")
+            }
+            return checkpoint
         }
-        return try read(Checkpoint.self, from: url)
     }
 
     func listCheckpoints(workspaceId: UUID) async throws -> [Checkpoint] {
@@ -175,29 +286,18 @@ actor FileCheckpointStore: CheckpointStore {
             listCheckpointsCache[workspaceId] = nil
             return []
         }
-        if let key = try checkpointsDirectoryCacheKey(at: directoryURL),
-           let entry = listCheckpointsCache[workspaceId], entry.cacheKey == key {
-            return entry.checkpoints
-        }
-
-        let result = try fileManager
-            .contentsOfDirectory(
-                at: directoryURL,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            )
-            .filter { $0.pathExtension == "json" }
-            .map { try read(Checkpoint.self, from: $0) }
-            .sorted {
-                if $0.createdAt == $1.createdAt {
-                    return $0.id.uuidString < $1.id.uuidString
-                }
-                return $0.createdAt < $1.createdAt
+        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+            if let key = try checkpointsDirectoryCacheKey(at: directoryURL),
+               let entry = listCheckpointsCache[workspaceId], entry.cacheKey == key {
+                return entry.checkpoints
             }
-        if let key = try checkpointsDirectoryCacheKey(at: directoryURL) {
-            listCheckpointsCache[workspaceId] = (key, result)
+
+            let result = try loadAllCheckpointsUnlocked(workspaceId: workspaceId)
+            if let key = try checkpointsDirectoryCacheKey(at: directoryURL) {
+                listCheckpointsCache[workspaceId] = (key, result)
+            }
+            return result
         }
-        return result
     }
 
     /// A persisted snapshot: the tree structure with file contents replaced by content hashes.
@@ -224,8 +324,7 @@ actor FileCheckpointStore: CheckpointStore {
         var root: Node
     }
 
-    func saveSnapshot(_ snapshot: Snapshot, workspaceId: UUID) async throws {
-        try ensureWorkspaceDirectories(for: workspaceId)
+    private func writeSnapshotUnlocked(_ snapshot: Snapshot, workspaceId: UUID) throws {
         let root = try writeManifestNode(snapshot.entry, workspaceId: workspaceId)
         let manifest = SnapshotManifest(
             version: 2,
@@ -238,28 +337,28 @@ actor FileCheckpointStore: CheckpointStore {
 
     func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
         try validateWorkspaceFormatIfPresent(workspaceId)
-        let url = snapshotURL(id: id, workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: url.path) else {
-            return nil
+        guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else { return nil }
+        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+            try loadSnapshotUnlocked(id: id, workspaceId: workspaceId)
         }
-        let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
-        return Snapshot(
-            id: manifest.id,
-            rootPath: manifest.rootPath,
-            entry: try snapshotEntry(from: manifest.root, workspaceId: workspaceId)
-        )
     }
 
     func loadRevisionIndex(id: UUID, workspaceId: UUID) async throws -> RevisionIndex? {
         try validateWorkspaceFormatIfPresent(workspaceId)
-        let url = snapshotURL(id: id, workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
-        let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
-        return RevisionIndex(
-            id: manifest.id,
-            root: manifest.rootPath,
-            entry: try revisionEntry(from: manifest.root, workspaceId: workspaceId)
-        )
+        guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else { return nil }
+        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+            let url = snapshotURL(id: id, workspaceId: workspaceId)
+            guard fileManager.fileExists(atPath: url.path) else { return nil }
+            let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+            guard manifest.id == id else {
+                throw WorkspaceError.storageCorrupted("snapshot manifest id does not match \(id)")
+            }
+            return RevisionIndex(
+                id: manifest.id,
+                root: manifest.rootPath,
+                entry: try revisionEntry(from: manifest.root, workspaceId: workspaceId)
+            )
+        }
     }
 
     func readSnapshotFile(
@@ -273,22 +372,29 @@ actor FileCheckpointStore: CheckpointStore {
         if let length, length < 0 {
             throw WorkspaceError.unsupported("read length must not be negative")
         }
-        let url = snapshotURL(id: id, workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
-        let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
-        guard let node = manifestNode(at: path, in: manifest.root), node.kind == .file,
-              let hash = node.contentHash
-        else { return nil }
-        let blob = blobURL(hash: hash, workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: blob.path) else {
-            throw WorkspaceError.storageCorrupted("missing content blob \(hash) for \(path)")
+        guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else { return nil }
+        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+            let url = snapshotURL(id: id, workspaceId: workspaceId)
+            guard fileManager.fileExists(atPath: url.path) else { return nil }
+            let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+            guard manifest.id == id else {
+                throw WorkspaceError.storageCorrupted("snapshot manifest id does not match \(id)")
+            }
+            guard let node = manifestNode(at: path, in: manifest.root), node.kind == .file else { return nil }
+            guard let hash = node.contentHash, Self.isValidContentHash(hash) else {
+                throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has an invalid content hash")
+            }
+            let blob = blobURL(hash: hash, workspaceId: workspaceId)
+            guard fileManager.fileExists(atPath: blob.path) else {
+                throw WorkspaceError.storageCorrupted("missing content blob \(hash) for \(path)")
+            }
+            let handle = try FileHandle(forReadingFrom: blob)
+            defer { try? handle.close() }
+            let size = try handle.seekToEnd()
+            guard offset < size else { return Data() }
+            try handle.seek(toOffset: offset)
+            return try handle.read(upToCount: length ?? Int(size - offset)) ?? Data()
         }
-        let handle = try FileHandle(forReadingFrom: blob)
-        defer { try? handle.close() }
-        let size = try handle.seekToEnd()
-        guard offset < size else { return Data() }
-        try handle.seek(toOffset: offset)
-        return try handle.read(upToCount: length ?? Int(size - offset)) ?? Data()
     }
 
     private func revisionEntry(
@@ -299,8 +405,8 @@ actor FileCheckpointStore: CheckpointStore {
         case .missing:
             return .missing(path: node.path)
         case .file:
-            guard let hash = node.contentHash else {
-                throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has no content hash")
+            guard let hash = node.contentHash, Self.isValidContentHash(hash) else {
+                throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has an invalid content hash")
             }
             return .file(
                 path: node.path,
@@ -378,8 +484,8 @@ actor FileCheckpointStore: CheckpointStore {
         case .missing:
             return .missing(Snapshot.Missing(path: node.path))
         case .file:
-            guard let hash = node.contentHash else {
-                throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has no content hash")
+            guard let hash = node.contentHash, Self.isValidContentHash(hash) else {
+                throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has an invalid content hash")
             }
             let url = blobURL(hash: hash, workspaceId: workspaceId)
             guard fileManager.fileExists(atPath: url.path) else {
@@ -473,6 +579,233 @@ actor FileCheckpointStore: CheckpointStore {
             }
             try writeAllMutationsAsJSONL(kept, to: jsonl)
         }
+    }
+
+    func storageStatistics(workspaceId: UUID) async throws -> Workspace.StorageStatistics {
+        try validateWorkspaceFormatIfPresent(workspaceId)
+        guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else {
+            return .empty
+        }
+        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+            try physicalStatisticsUnlocked(workspaceId: workspaceId)
+        }
+    }
+
+    func compact(
+        workspaceId: UUID,
+        retaining retention: Workspace.Retention,
+        dryRun: Bool
+    ) async throws -> StoreCompactionResult {
+        try validateWorkspaceFormatIfPresent(workspaceId)
+        guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else {
+            let plan = try CheckpointRetentionPlanner.plan(checkpoints: [], retaining: retention)
+            return StoreCompactionResult(
+                report: Workspace.CompactionReport(
+                    dryRun: dryRun,
+                    before: .empty,
+                    after: .empty,
+                    removedCheckpointIDs: plan.removedCheckpointIDs,
+                    rebasedCheckpointIDs: plan.rebasedCheckpointIDs
+                ),
+                checkpoints: []
+            )
+        }
+        return try Self.withExclusiveLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+            try compactUnlocked(workspaceId: workspaceId, retaining: retention, dryRun: dryRun)
+        }
+    }
+
+    private func compactUnlocked(
+        workspaceId: UUID,
+        retaining retention: Workspace.Retention,
+        dryRun: Bool
+    ) throws -> StoreCompactionResult {
+        let current = try loadAllCheckpointsUnlocked(workspaceId: workspaceId)
+        let before = try physicalStatisticsUnlocked(workspaceId: workspaceId)
+        let plan = try CheckpointRetentionPlanner.plan(checkpoints: current, retaining: retention)
+        let rebasedIDs = Set(plan.rebasedCheckpointIDs)
+        let retained = try CheckpointRetentionPlanner.materialize(plan) { snapshotID in
+            try loadSnapshotUnlocked(id: snapshotID, workspaceId: workspaceId)
+        }
+
+        let retainedSnapshotIDs = Set(retained.map(\.snapshotId))
+        var retainedBlobHashes: Set<String> = []
+        for checkpoint in retained {
+            let manifestURL = snapshotURL(id: checkpoint.snapshotId, workspaceId: workspaceId)
+            guard fileManager.fileExists(atPath: manifestURL.path) else {
+                throw WorkspaceError.storageCorrupted("checkpoint \(checkpoint.id) has no snapshot")
+            }
+            let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: manifestURL))
+            guard manifest.id == checkpoint.snapshotId else {
+                throw WorkspaceError.storageCorrupted("checkpoint \(checkpoint.id) references a mismatched snapshot")
+            }
+            try collectContentHashes(from: manifest.root, into: &retainedBlobHashes)
+        }
+
+        var retainedBlobBytes: UInt64 = 0
+        for hash in retainedBlobHashes {
+            let url = blobURL(hash: hash, workspaceId: workspaceId)
+            guard fileManager.fileExists(atPath: url.path) else {
+                throw WorkspaceError.storageCorrupted("missing content blob \(hash)")
+            }
+            retainedBlobBytes += try fileSize(at: url)
+        }
+        let after = Workspace.StorageStatistics(
+            checkpointCount: retained.count,
+            snapshotCount: retainedSnapshotIDs.count,
+            blobCount: retainedBlobHashes.count,
+            blobBytes: retainedBlobBytes
+        )
+        let report = Workspace.CompactionReport(
+            dryRun: dryRun,
+            before: before,
+            after: after,
+            removedCheckpointIDs: plan.removedCheckpointIDs,
+            rebasedCheckpointIDs: plan.rebasedCheckpointIDs
+        )
+
+        guard !dryRun else { return StoreCompactionResult(report: report, checkpoints: retained) }
+
+        for checkpoint in retained where rebasedIDs.contains(checkpoint.id) {
+            try write(checkpoint, to: checkpointURL(id: checkpoint.id, workspaceId: workspaceId))
+        }
+        for id in plan.removedCheckpointIDs {
+            try removeIfPresent(checkpointURL(id: id, workspaceId: workspaceId))
+        }
+        for url in try artifactURLs(in: snapshotsDirectoryURL(workspaceId: workspaceId), pathExtension: "json") {
+            guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                  retainedSnapshotIDs.contains(id)
+            else {
+                try fileManager.removeItem(at: url)
+                continue
+            }
+        }
+        for url in try blobURLs(workspaceId: workspaceId)
+        where !retainedBlobHashes.contains(url.lastPathComponent) {
+            try fileManager.removeItem(at: url)
+        }
+        listCheckpointsCache[workspaceId] = nil
+        return StoreCompactionResult(report: report, checkpoints: retained)
+    }
+
+    private func loadAllCheckpointsUnlocked(workspaceId: UUID) throws -> [Checkpoint] {
+        let directory = checkpointsDirectoryURL(workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: directory.path) else { return [] }
+        return try artifactURLs(in: directory, pathExtension: "json").map { url in
+            let checkpoint = try read(Checkpoint.self, from: url)
+            guard UUID(uuidString: url.deletingPathExtension().lastPathComponent) == checkpoint.id,
+                  checkpoint.workspaceID == workspaceId
+            else {
+                throw WorkspaceError.storageCorrupted("checkpoint metadata does not match its storage path")
+            }
+            return checkpoint
+        }.sorted(by: Checkpoint.orderedBefore)
+    }
+
+    private func loadSnapshotUnlocked(id: UUID, workspaceId: UUID) throws -> Snapshot? {
+        let url = snapshotURL(id: id, workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+        guard manifest.id == id else {
+            throw WorkspaceError.storageCorrupted("snapshot manifest id does not match \(id)")
+        }
+        return Snapshot(
+            id: manifest.id,
+            rootPath: manifest.rootPath,
+            entry: try snapshotEntry(from: manifest.root, workspaceId: workspaceId)
+        )
+    }
+
+    private func resolvedParent(for draft: CheckpointDraft, checkpoints: [Checkpoint]) -> Checkpoint? {
+        if let preferred = draft.preferredParentID,
+           let parent = checkpoints.first(where: { $0.id == preferred }) {
+            return parent
+        }
+        guard draft.preferredParentID != nil,
+              let headID = Checkpoint.lineageHeadID(in: checkpoints)
+        else { return nil }
+        return checkpoints.first(where: { $0.id == headID })
+    }
+
+    private func physicalStatisticsUnlocked(workspaceId: UUID) throws -> Workspace.StorageStatistics {
+        let checkpoints = try artifactURLs(
+            in: checkpointsDirectoryURL(workspaceId: workspaceId),
+            pathExtension: "json"
+        )
+        let snapshots = try artifactURLs(
+            in: snapshotsDirectoryURL(workspaceId: workspaceId),
+            pathExtension: "json"
+        )
+        let blobs = try blobURLs(workspaceId: workspaceId)
+        var blobBytes: UInt64 = 0
+        for blob in blobs { blobBytes += try fileSize(at: blob) }
+        return Workspace.StorageStatistics(
+            checkpointCount: checkpoints.count,
+            snapshotCount: snapshots.count,
+            blobCount: blobs.count,
+            blobBytes: blobBytes
+        )
+    }
+
+    private func artifactURLs(in directory: URL, pathExtension: String) throws -> [URL] {
+        guard fileManager.fileExists(atPath: directory.path) else { return [] }
+        return try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ).filter { $0.pathExtension == pathExtension }.map { url in
+            let type = try fileManager.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
+            guard type == .typeRegular else {
+                throw WorkspaceError.storageCorrupted("unexpected artifact: \(url.lastPathComponent)")
+            }
+            return url
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func blobURLs(workspaceId: UUID) throws -> [URL] {
+        let directory = blobsDirectoryURL(workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: directory.path) else { return [] }
+        return try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ).map { url in
+            let type = try fileManager.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType
+            guard type == .typeRegular else {
+                throw WorkspaceError.storageCorrupted("unexpected entry in blob store: \(url.lastPathComponent)")
+            }
+            return url
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func fileSize(at url: URL) throws -> UInt64 {
+        let value = try fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber
+        return value?.uint64Value ?? 0
+    }
+
+    private func collectContentHashes(from node: SnapshotManifest.Node, into hashes: inout Set<String>) throws {
+        switch node.kind {
+        case .file:
+            guard let hash = node.contentHash, Self.isValidContentHash(hash) else {
+                throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has an invalid content hash")
+            }
+            hashes.insert(hash)
+        case .directory:
+            for child in node.children ?? [] { try collectContentHashes(from: child, into: &hashes) }
+        case .missing, .symlink:
+            break
+        }
+    }
+
+    private static func isValidContentHash(_ hash: String) -> Bool {
+        hash.utf8.count == 64 && hash.utf8.allSatisfy { byte in
+            (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
+                || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
+        }
+    }
+
+    private func removeIfPresent(_ url: URL) throws {
+        if fileManager.fileExists(atPath: url.path) { try fileManager.removeItem(at: url) }
     }
 
     private func loadMutationsFromJSONL(at url: URL) throws -> [Mutation] {
@@ -688,6 +1021,11 @@ actor FileCheckpointStore: CheckpointStore {
         workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.lock", isDirectory: false)
     }
 
+    /// Serializes checkpoint, manifest, and blob lifecycle operations across store instances.
+    private func lifecycleLockURL(workspaceId: UUID) -> URL {
+        workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("lifecycle.lock", isDirectory: false)
+    }
+
     private func formatLockURL(workspaceId: UUID) -> URL {
         rootDirectory.appendingPathComponent(".\(workspaceId.uuidString).format.lock", isDirectory: false)
     }
@@ -711,13 +1049,21 @@ actor FileCheckpointStore: CheckpointStore {
 
 #if canImport(Darwin) || canImport(Glibc)
     private static func withExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
+        try withLock(at: url, operation: LOCK_EX, body)
+    }
+
+    private static func withSharedLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
+        try withLock(at: url, operation: LOCK_SH, body)
+    }
+
+    private static func withLock<R>(at url: URL, operation: Int32, _ body: () throws -> R) throws -> R {
         let path = url.path
         let fd = open(path, O_RDWR | O_CREAT, 0o644)
         guard fd >= 0 else {
             throw LockFileError(message: "could not open lock file at \(path)")
         }
         defer { close(fd) }
-        while flock(fd, LOCK_EX) != 0 {
+        while flock(fd, operation) != 0 {
             if errno != EINTR {
                 throw LockFileError(message: "could not acquire exclusive lock at \(path)")
             }
@@ -727,6 +1073,10 @@ actor FileCheckpointStore: CheckpointStore {
     }
 #else
     private static func withExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
+        try body()
+    }
+
+    private static func withSharedLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
         try body()
     }
 #endif

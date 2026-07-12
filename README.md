@@ -135,6 +135,36 @@ let archive = try await workspace.archive(at: "/Sources")
 try await anotherWorkspace.restore(archive, at: "/Imported")
 ```
 
+## Storage Lifecycle
+
+Inspect checkpoint-store usage and preview retention before deleting anything:
+
+```swift
+let usage = try await workspace.storageStatistics()
+
+let preview = try await workspace.compact(
+    retaining: .latest(
+        50,
+        preservingLabeled: true,
+        preserving: [releaseCheckpoint.id]
+    ),
+    dryRun: true
+)
+
+print(preview.removedCheckpointCount)
+print(preview.reclaimedBytes)
+```
+
+Apply the same policy by omitting `dryRun`:
+
+```swift
+let report = try await workspace.compact(retaining: .latest(50))
+```
+
+Compaction rebases retained checkpoints to their nearest retained ancestor and recomputes their summaries. Retained rollback and transaction checkpoints also retain an existing checkpoint they reference as provenance. `.all` keeps every checkpoint while sweeping orphaned manifests and blobs.
+
+Directory-backed stores serialize checkpoint commits, revision reads, and compaction with a persistent lifecycle lock. Mutation history is independent and is not pruned by checkpoint retention.
+
 ## Transactions
 
 Transactions replace separate branch and merge APIs:

@@ -10,10 +10,7 @@ struct CheckpointStoreTests {
         let firstID = UUID()
         let secondID = UUID()
         let snapshot = Self.sampleSnapshot()
-        let checkpoint = Self.sampleCheckpoint(workspaceID: firstID, snapshotID: snapshot.id)
-
-        try await store.saveSnapshot(snapshot, workspaceId: firstID)
-        try await store.saveCheckpoint(checkpoint)
+        let checkpoint = try await store.saveRevision(snapshot, draft: Self.sampleDraft(workspaceID: firstID))
         let first = try await store.appendMutation(Self.sampleMutation(workspaceID: firstID, path: "/a"))
         let second = try await store.appendMutation(Self.sampleMutation(workspaceID: firstID, path: "/b"))
 
@@ -45,10 +42,8 @@ struct CheckpointStoreTests {
                 )
             )
         )
-        let checkpoint = Self.sampleCheckpoint(workspaceID: workspaceID, snapshotID: snapshot.id)
         let writer = FileCheckpointStore(rootDirectory: root)
-        try await writer.saveSnapshot(snapshot, workspaceId: workspaceID)
-        try await writer.saveCheckpoint(checkpoint)
+        let checkpoint = try await writer.saveRevision(snapshot, draft: Self.sampleDraft(workspaceID: workspaceID))
 
         let reader = FileCheckpointStore(rootDirectory: root)
         #expect(try await reader.loadSnapshot(id: snapshot.id, workspaceId: workspaceID) == snapshot)
@@ -139,16 +134,13 @@ struct CheckpointStoreTests {
         )
     }
 
-    private static func sampleCheckpoint(workspaceID: UUID, snapshotID: UUID) -> Checkpoint {
-        Checkpoint(
-            workspaceId: workspaceID,
+    private static func sampleDraft(workspaceID: UUID) -> CheckpointDraft {
+        CheckpointDraft(
+            workspaceID: workspaceID,
             label: "test",
-            parentCheckpointId: nil,
-            firstMutationSequence: nil,
-            lastMutationSequence: nil,
-            mutationCursor: 0,
-            snapshotId: snapshotID,
-            summary: ChangeSet().summary
+            preferredParentID: nil,
+            origin: .manual,
+            mutationCursor: 0
         )
     }
 
