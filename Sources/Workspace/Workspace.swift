@@ -25,6 +25,11 @@ public actor Workspace {
     nonisolated let workspaceId: UUID
     public nonisolated var workspaceID: UUID { workspaceId }
     nonisolated let filesystem: any FileSystem
+    /// The filesystem that owns this workspace's current state.
+    ///
+    /// Direct reads are safe. Direct mutations bypass Workspace history, checkpoints, and events;
+    /// integrations should use the Workspace edit pipeline when those records are required.
+    public nonisolated var fileSystem: any FileSystem { filesystem }
     public nonisolated let recording: RecordingPolicy
     let store: any CheckpointStore
 

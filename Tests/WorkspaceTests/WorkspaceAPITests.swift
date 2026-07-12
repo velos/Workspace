@@ -5,6 +5,17 @@ import Testing
 @Suite("Workspace API")
 struct WorkspaceAPITests {
     @Test
+    func `workspace exposes its injected filesystem authority`() async throws {
+        let files = InMemoryFileSystem()
+        let workspace = Workspace(fileSystem: files)
+
+        try await workspace.fileSystem.writeFile(path: "/direct.txt", data: Data("direct".utf8), append: false)
+
+        #expect(try await workspace.readText("/direct.txt") == "direct")
+        #expect(try await workspace.history().isEmpty)
+    }
+
+    @Test
     func `one changeset flows through preview apply events and history`() async throws {
         let workspace = Workspace()
         let preview = try await workspace.preview([

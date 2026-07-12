@@ -49,7 +49,11 @@ let workspace = Workspace(
 )
 ```
 
-The injected filesystem is intentionally not exposed from `Workspace`; mutations through it would bypass workspace history and events.
+The injected filesystem remains available as `workspace.fileSystem` so one `Workspace` can be
+shared as the filesystem authority across shells, tool runtimes, and other adapters. Reads through
+that reference are always fine. Mutations made directly through it bypass Workspace history,
+checkpoints, and events, so integrations should either route mutations through the Workspace edit
+pipeline or deliberately accept that those changes are unrecorded.
 
 ## Edits and Changes
 
