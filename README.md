@@ -267,6 +267,27 @@ let workspace = Workspace(fileSystem: authorized)
 
 Authorization supports one-shot, duration-limited, and session approvals plus bounded audit records. Prefix rules use path-component boundaries and require both paths to match for copy and move.
 
+## LLM Tool Adapters
+
+`WorkspaceToolAdapter` exposes dependency-free function definitions for read, glob, search, apply,
+diff, and checkpoint operations. Each definition contains an ordinary JSON Schema object, so an
+integration can translate it into its model provider's tool format without adding a provider SDK to
+Workspace:
+
+```swift
+let adapter = WorkspaceToolAdapter(workspace: workspace)
+let definitions = WorkspaceToolAdapter.definitions
+
+let resultJSON = try await adapter.call(
+    name: "workspace_diff",
+    arguments: Data(#"{"from_checkpoint_id":"...","unified_patch":true}"#.utf8)
+)
+```
+
+All mutating adapter calls use the Workspace edit/checkpoint APIs, so they retain the same history,
+event, transaction, authorization, and limit behavior as direct callers. The diff result carries the
+structured `ChangeSet` and can optionally include unified-patch text for prompt or CLI interop.
+
 ## Testing
 
 ```bash
