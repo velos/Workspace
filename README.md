@@ -219,6 +219,12 @@ let mutations = try await workspace.history()
 
 Change events, returned edit results, and mutation history all carry the same `ChangeSet` representation. Checkpoint events share the same stream.
 
+`LocalFileSystem` also pushes out-of-band filesystem invalidations through FSEvents on macOS and
+inotify on Linux. `events()` and the path-focused `watchChanges(at:recursive:)` turn those
+invalidations into structured `ChangeSet` values. External changes remain unrecorded in mutation
+history, matching the direct-filesystem contract above. Directory-backed checkpoint stores use the
+same push model for cross-instance checkpoint events; there is no periodic polling loop.
+
 ## Filesystems and Safety Layers
 
 Built-in filesystems use consistent names and constructor-driven configuration:

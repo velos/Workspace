@@ -22,7 +22,7 @@ public enum WorkspaceEvent: Sendable, Codable, Equatable {
 
 extension Workspace {
     /// Observes workspace changes and checkpoints through one stream.
-    public func events(_ filter: WorkspaceEvent.Filter = .all) -> AsyncStream<WorkspaceEvent> {
+    public func events(_ filter: WorkspaceEvent.Filter = .all) async -> AsyncStream<WorkspaceEvent> {
         let id = UUID()
         var continuation: AsyncStream<WorkspaceEvent>.Continuation?
         let stream = AsyncStream<WorkspaceEvent> { continuation = $0 }
@@ -32,8 +32,9 @@ extension Workspace {
             Task { await self?.removeEventWatcher(id) }
         }
         if filter.includeCheckpoints {
-            ensureCheckpointPolling()
+            await ensureCheckpointObservation()
         }
+        await ensureFilesystemObservation()
         return stream
     }
 
@@ -41,8 +42,13 @@ extension Workspace {
         eventWatchers.removeValue(forKey: id)
         let hasCheckpointEventWatcher = eventWatchers.values.contains { $0.filter.includeCheckpoints }
         if !hasCheckpointEventWatcher {
-            checkpointPollingTask?.cancel()
-            checkpointPollingTask = nil
+            checkpointObservationTask?.cancel()
+            checkpointObservationTask = nil
+        }
+        if eventWatchers.isEmpty {
+            filesystemObservationTask?.cancel()
+            filesystemObservationTask = nil
+            observedFilesystemSnapshot = nil
         }
     }
 
@@ -50,6 +56,14 @@ extension Workspace {
         for watcher in eventWatchers.values where Self.matches(event, filter: watcher.filter) {
             watcher.continuation.yield(event)
         }
+    }
+
+    /// Compatibility spelling for observing future workspace changes at a path.
+    public func watchChanges(
+        at path: WorkspacePath = .root,
+        recursive: Bool = true
+    ) async -> AsyncStream<WorkspaceEvent> {
+        await events(.init(path: path, recursive: recursive, includeCheckpoints: false))
     }
 
     private static func matches(_ event: WorkspaceEvent, filter: WorkspaceEvent.Filter) -> Bool {

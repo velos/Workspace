@@ -16,6 +16,37 @@ struct WorkspaceAPITests {
     }
 
     @Test
+    func `external local filesystem mutations reach watchChanges without entering history`() async throws {
+        let root = try TestSupport.temporaryDirectory("ExternalEvents")
+        defer { TestSupport.remove(root) }
+        let files = try LocalFileSystem(root: root)
+        let workspace = Workspace(fileSystem: files)
+        let stream = await workspace.watchChanges()
+
+        try await files.writeFile(path: "/external.txt", data: Data("outside".utf8), append: false)
+
+        guard case let .changes(changes)? = await nextEvent(in: stream) else {
+            Issue.record("expected an external filesystem change event")
+            return
+        }
+        #expect(changes.touchedPaths == ["/external.txt"])
+        #expect(try await workspace.history().isEmpty)
+    }
+
+    @Test
+    func `local filesystem watcher does not duplicate workspace edit events`() async throws {
+        let root = try TestSupport.temporaryDirectory("EventDeduplication")
+        defer { TestSupport.remove(root) }
+        let workspace = Workspace(fileSystem: try LocalFileSystem(root: root))
+        let stream = await workspace.watchChanges()
+
+        let expected = try await workspace.writeText("/note", "once")
+
+        #expect(await nextEvent(in: stream) == .changes(expected))
+        #expect(await nextEvent(in: stream, timeout: .milliseconds(200)) == nil)
+    }
+
+    @Test
     func `one changeset flows through preview apply events and history`() async throws {
         let workspace = Workspace()
         let preview = try await workspace.preview([
@@ -143,5 +174,24 @@ struct WorkspaceAPITests {
         _ = try await workspace.restore(to: checkpoint)
         #expect(try await workspace.readJSON(Value.self, from: "/value.json") == Value(name: "one"))
         #expect(try await workspace.history().last?.operation == .rollback)
+    }
+}
+
+private func nextEvent(
+    in stream: AsyncStream<WorkspaceEvent>,
+    timeout: Duration = .seconds(2)
+) async -> WorkspaceEvent? {
+    await withTaskGroup(of: WorkspaceEvent?.self) { group in
+        group.addTask {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        group.addTask {
+            try? await Task.sleep(for: timeout)
+            return nil
+        }
+        let result = await group.next() ?? nil
+        group.cancelAll()
+        return result
     }
 }

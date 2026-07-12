@@ -50,6 +50,7 @@ extension Workspace {
         }
 
         let after = try await Snapshot.capture(from: filesystem)
+        noteWorkspaceSnapshot(after)
         let changes = changeSet(from: before, to: after)
         if !changes.isEmpty {
             try await appendMutation(operation: .edit, changes: changes)

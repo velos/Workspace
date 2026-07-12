@@ -37,6 +37,7 @@ extension Workspace {
         let previousSnapshot = try await Snapshot.capture(from: filesystem)
         try await Snapshot.restore(targetSnapshot, to: filesystem)
         let restoredSnapshot = try await Snapshot.capture(from: filesystem)
+        noteWorkspaceSnapshot(restoredSnapshot)
         let changes = changeSet(from: previousSnapshot, to: restoredSnapshot)
 
         if !changes.isEmpty {

@@ -95,18 +95,21 @@ extension Workspace {
         return string
     }
 
-    func ensureCheckpointPolling() {
-        guard checkpointPollingTask == nil else { return }
-        checkpointPollingTask = Task { [weak self] in
-            while !Task.isCancelled, let workspace = self {
-                let interval = await workspace.checkpointEventPollInterval
-                try? await Task.sleep(for: interval)
-                await workspace.pollCheckpointEvents()
+    func ensureCheckpointObservation() async {
+        guard checkpointObservationTask == nil else { return }
+        guard (try? await ensureLoaded()) != nil else { return }
+        let store = store
+        let workspaceID = workspaceId
+        guard let stream = try? await store.changes(workspaceId: workspaceID) else { return }
+        checkpointObservationTask = Task { [weak self] in
+            for await _ in stream where !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(20))
+                await self?.refreshCheckpointEvents()
             }
         }
     }
 
-    func pollCheckpointEvents() async {
+    func refreshCheckpointEvents() async {
         guard eventWatchers.values.contains(where: { $0.filter.includeCheckpoints }) else { return }
         guard (try? await ensureLoaded()) != nil else { return }
         guard let stored = try? await store.listCheckpoints(workspaceId: workspaceId) else { return }
@@ -122,6 +125,36 @@ extension Workspace {
         for checkpoint in newCheckpoints.sorted(by: checkpointSort) {
             emitWorkspaceEvent(.checkpoint(checkpoint))
         }
+    }
+
+    func ensureFilesystemObservation() async {
+        guard filesystemObservationTask == nil,
+              let source = filesystem as? any FileSystemChangeSource
+        else { return }
+        guard let stream = try? await source.changes(),
+              let initial = try? await Snapshot.capture(from: source)
+        else { return }
+        observedFilesystemSnapshot = initial
+        filesystemObservationTask = Task { [weak self] in
+            for await _ in stream where !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(40))
+                await self?.refreshFilesystemEvents()
+            }
+        }
+    }
+
+    func noteWorkspaceSnapshot(_ snapshot: Snapshot) {
+        guard filesystemObservationTask != nil else { return }
+        observedFilesystemSnapshot = snapshot
+    }
+
+    func refreshFilesystemEvents() async {
+        guard let before = observedFilesystemSnapshot,
+              let after = try? await Snapshot.capture(from: filesystem)
+        else { return }
+        observedFilesystemSnapshot = after
+        let changes = changeSet(from: before, to: after)
+        if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
     }
 
     func checkpointSort(lhs: Checkpoint, rhs: Checkpoint) -> Bool {

@@ -166,6 +166,12 @@ public protocol FileSystem: AnyObject, Sendable {
     func createFile(path: WorkspacePath, data: Data) async throws
 }
 
+/// A filesystem that can push invalidations when its contents change outside Workspace APIs.
+public protocol FileSystemChangeSource: FileSystem {
+    /// Emits after one or more entries may have changed. Consumers should re-read the affected tree.
+    func changes() async throws -> AsyncStream<Void>
+}
+
 extension FileSystem {
     /// The default implementation throws ``WorkspaceError/unsupported(_:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {

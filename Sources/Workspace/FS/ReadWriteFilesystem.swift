@@ -2,6 +2,9 @@ import Foundation
 
 #if canImport(Darwin)
 import Darwin
+#if os(macOS)
+import CoreServices
+#endif
 #elseif canImport(Glibc)
 import Glibc
 #endif
@@ -508,3 +511,90 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
         )
     }
 }
+
+#if os(macOS)
+extension LocalFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        let root = try requireConfiguration().rootURL
+        return try FSEventsChangeStream.observe(root)
+    }
+}
+
+enum FSEventsChangeStream {
+    private final class Box: @unchecked Sendable {
+        let continuation: AsyncStream<Void>.Continuation
+        init(_ continuation: AsyncStream<Void>.Continuation) { self.continuation = continuation }
+    }
+
+    private final class Observation: @unchecked Sendable {
+        private let stream: FSEventStreamRef
+        private let box: Unmanaged<Box>
+
+        init(root: URL, continuation: AsyncStream<Void>.Continuation) throws {
+            box = .passRetained(Box(continuation))
+            var context = FSEventStreamContext(
+                version: 0,
+                info: box.toOpaque(),
+                retain: nil,
+                release: nil,
+                copyDescription: nil
+            )
+            let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+                guard let info else { return }
+                Unmanaged<Box>.fromOpaque(info).takeUnretainedValue().continuation.yield()
+            }
+            let flags = FSEventStreamCreateFlags(
+                kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer
+            )
+            guard let stream = FSEventStreamCreate(
+                kCFAllocatorDefault,
+                callback,
+                &context,
+                [root.path] as CFArray,
+                FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+                0.04,
+                flags
+            ) else {
+                box.release()
+                throw WorkspaceError.unsupported("could not create an FSEvents stream")
+            }
+            self.stream = stream
+            FSEventStreamSetDispatchQueue(stream, .global(qos: .utility))
+            guard FSEventStreamStart(stream) else {
+                FSEventStreamInvalidate(stream)
+                FSEventStreamRelease(stream)
+                box.release()
+                throw WorkspaceError.unsupported("could not start an FSEvents stream")
+            }
+        }
+
+        func cancel() {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            box.release()
+        }
+    }
+
+    static func observe(_ root: URL) throws -> AsyncStream<Void> {
+        var failure: Error?
+        let stream = AsyncStream<Void> { continuation in
+            do {
+                let observation = try Observation(root: root, continuation: continuation)
+                continuation.onTermination = { _ in observation.cancel() }
+            } catch {
+                failure = error
+                continuation.finish()
+            }
+        }
+        if let failure { throw failure }
+        return stream
+    }
+}
+#elseif os(Linux)
+extension LocalFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        try DirectoryChangeStream.observe(requireConfiguration().rootURL, recursive: true)
+    }
+}
+#endif

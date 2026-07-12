@@ -118,6 +118,39 @@ struct PersistenceTests {
         let next = try await reloaded.createCheckpoint(label: "next")
         #expect(next.parentID == expectedHead?.id)
     }
+
+    @Test
+    func `checkpoint events are pushed across workspace instances`() async throws {
+        let root = try TestSupport.temporaryDirectory("CheckpointPush")
+        defer { TestSupport.remove(root) }
+        let id = UUID()
+        let reader = Workspace(workspaceID: id, persistence: .directory(root))
+        let writer = Workspace(workspaceID: id, persistence: .directory(root))
+        let stream = await reader.events(.init(includeCheckpoints: true))
+
+        let checkpoint = try await writer.createCheckpoint(label: "pushed")
+
+        #expect(await nextPersistenceEvent(in: stream) == .checkpoint(checkpoint))
+    }
+}
+
+private func nextPersistenceEvent(
+    in stream: AsyncStream<WorkspaceEvent>,
+    timeout: Duration = .seconds(2)
+) async -> WorkspaceEvent? {
+    await withTaskGroup(of: WorkspaceEvent?.self) { group in
+        group.addTask {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        group.addTask {
+            try? await Task.sleep(for: timeout)
+            return nil
+        }
+        let result = await group.next() ?? nil
+        group.cancelAll()
+        return result
+    }
 }
 
 private actor ReadCountingFileSystem: FileSystem {

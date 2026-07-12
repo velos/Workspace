@@ -12,6 +12,7 @@ import Glibc
 /// any placeholder sequence; ``appendMutation(_:)`` returns the record with the next persisted
 /// monotonic number for that workspace, serialized under the mutations lock.
 protocol CheckpointStore: AnyObject, Sendable {
+    func changes(workspaceId: UUID) async throws -> AsyncStream<Void>
     func captureRevision(from filesystem: any FileSystem, draft: CheckpointDraft) async throws -> Checkpoint
     func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint
     func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> Checkpoint?
@@ -46,6 +47,11 @@ actor InMemoryCheckpointStore: CheckpointStore {
     private var mutationsByWorkspace: [UUID: [Mutation]] = [:]
 
     init() {}
+
+    func changes(workspaceId: UUID) async throws -> AsyncStream<Void> {
+        _ = workspaceId
+        return AsyncStream { _ in }
+    }
 
     func captureRevision(from filesystem: any FileSystem, draft: CheckpointDraft) async throws -> Checkpoint {
         try await saveRevision(Snapshot.capture(from: filesystem), draft: draft)
@@ -244,6 +250,11 @@ actor FileCheckpointStore: CheckpointStore {
         self.encoder = encoder
         self.decoder = JSONDecoder()
         self.compactEncoder = JSONEncoder()
+    }
+
+    func changes(workspaceId: UUID) async throws -> AsyncStream<Void> {
+        try ensureWorkspaceDirectories(for: workspaceId)
+        return try DirectoryChangeStream.observe(checkpointsDirectoryURL(workspaceId: workspaceId))
     }
 
     func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint {

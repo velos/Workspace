@@ -387,6 +387,7 @@ extension Workspace {
             throw error
         }
         try await appendMutation(operation: .transaction, changes: applied)
+        noteWorkspaceSnapshot(mergedSnapshot)
         let checkpoint = try await persistCheckpoint(
             snapshot: mergedSnapshot,
             label: label,

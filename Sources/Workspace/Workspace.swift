@@ -39,8 +39,9 @@ public actor Workspace {
     var mutations: [Mutation] = []
     var headCheckpointId: UUID?
     var eventWatchers: [UUID: EventWatcher] = [:]
-    var checkpointPollingTask: Task<Void, Never>?
-    var checkpointEventPollInterval: Duration = .milliseconds(500)
+    var checkpointObservationTask: Task<Void, Never>?
+    var filesystemObservationTask: Task<Void, Never>?
+    var observedFilesystemSnapshot: Snapshot?
 
     /// Creates a workspace over a filesystem.
     public init(

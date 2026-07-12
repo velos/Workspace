@@ -49,6 +49,7 @@ extension Workspace {
         let entry = Self.snapshotEntry(archive.entry, replacing: archive.root, with: destination)
         try await Snapshot.restore(Snapshot(rootPath: destination, entry: entry), to: filesystem)
         let after = try await Snapshot.capture(from: filesystem)
+        noteWorkspaceSnapshot(after)
         let changes = changeSet(from: before, to: after)
         if !changes.isEmpty {
             try await appendMutation(operation: .archiveRestore, changes: changes)
