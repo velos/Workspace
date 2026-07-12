@@ -1,17 +1,14 @@
 import Foundation
 
-/// A durable, in-memory snapshot of a workspace subtree.
+/// The private materialized tree used by revisions, transactions, and archives.
 ///
 /// A snapshot captures the file contents, symbolic links, directory structure, and
 /// POSIX permissions of an entire tree at a single point in time. It is `Codable`
 /// so it can be persisted, transmitted, or compared to other snapshots.
 ///
-/// Capture and restore snapshots through ``Workspace/captureSnapshot(at:)`` and
-/// ``Workspace/restoreSnapshot(_:)``. To inspect the tree captured by a checkpoint,
-/// use ``Workspace/snapshot(for:)``.
-public struct Snapshot: Sendable, Codable, Equatable {
+struct Snapshot: Sendable, Codable, Equatable {
     /// A node within a snapshot tree.
-    public indirect enum Entry: Sendable, Codable, Equatable {
+    indirect enum Entry: Sendable, Codable, Equatable {
         /// A path that did not exist when the snapshot was captured.
         case missing(Missing)
         /// A regular file with captured contents and permissions.
@@ -22,7 +19,7 @@ public struct Snapshot: Sendable, Codable, Equatable {
         case symlink(Symlink)
 
         /// The workspace path of the entry.
-        public var path: WorkspacePath {
+        var path: WorkspacePath {
             switch self {
             case let .missing(entry): entry.path
             case let .file(entry): entry.path
@@ -33,27 +30,27 @@ public struct Snapshot: Sendable, Codable, Equatable {
     }
 
     /// A snapshot entry representing a path that does not exist.
-    public struct Missing: Sendable, Codable, Equatable {
+    struct Missing: Sendable, Codable, Equatable {
         /// The captured path.
-        public var path: WorkspacePath
+        var path: WorkspacePath
 
         /// Creates a missing entry.
-        public init(path: WorkspacePath) {
+        init(path: WorkspacePath) {
             self.path = path
         }
     }
 
     /// A snapshot entry representing a regular file.
-    public struct File: Sendable, Codable, Equatable {
+    struct File: Sendable, Codable, Equatable {
         /// The captured path.
-        public var path: WorkspacePath
+        var path: WorkspacePath
         /// The file's contents at the time of capture.
-        public var data: Data
+        var data: Data
         /// The file's POSIX permissions at the time of capture.
-        public var permissions: POSIXPermissions
+        var permissions: POSIXPermissions
 
         /// Creates a file entry.
-        public init(path: WorkspacePath, data: Data, permissions: POSIXPermissions) {
+        init(path: WorkspacePath, data: Data, permissions: POSIXPermissions) {
             self.path = path
             self.data = data
             self.permissions = permissions
@@ -61,16 +58,16 @@ public struct Snapshot: Sendable, Codable, Equatable {
     }
 
     /// A snapshot entry representing a directory.
-    public struct Directory: Sendable, Codable, Equatable {
+    struct Directory: Sendable, Codable, Equatable {
         /// The captured path.
-        public var path: WorkspacePath
+        var path: WorkspacePath
         /// The directory's POSIX permissions at the time of capture.
-        public var permissions: POSIXPermissions
+        var permissions: POSIXPermissions
         /// The directory's children, sorted by name.
-        public var children: [Entry]
+        var children: [Entry]
 
         /// Creates a directory entry.
-        public init(path: WorkspacePath, permissions: POSIXPermissions, children: [Entry]) {
+        init(path: WorkspacePath, permissions: POSIXPermissions, children: [Entry]) {
             self.path = path
             self.permissions = permissions
             self.children = children
@@ -78,16 +75,16 @@ public struct Snapshot: Sendable, Codable, Equatable {
     }
 
     /// A snapshot entry representing a symbolic link.
-    public struct Symlink: Sendable, Codable, Equatable {
+    struct Symlink: Sendable, Codable, Equatable {
         /// The captured path.
-        public var path: WorkspacePath
+        var path: WorkspacePath
         /// The symbolic link's target string.
-        public var target: String
+        var target: String
         /// The symbolic link's POSIX permissions at the time of capture.
-        public var permissions: POSIXPermissions
+        var permissions: POSIXPermissions
 
         /// Creates a symlink entry.
-        public init(path: WorkspacePath, target: String, permissions: POSIXPermissions) {
+        init(path: WorkspacePath, target: String, permissions: POSIXPermissions) {
             self.path = path
             self.target = target
             self.permissions = permissions
@@ -95,98 +92,17 @@ public struct Snapshot: Sendable, Codable, Equatable {
     }
 
     /// A stable identifier for the snapshot.
-    public var id: UUID
+    var id: UUID
     /// The path that was used as the snapshot root.
-    public var rootPath: WorkspacePath
+    var rootPath: WorkspacePath
     /// The captured root entry.
-    public var entry: Entry
+    var entry: Entry
 
     /// Creates a snapshot from a previously captured tree.
-    public init(id: UUID = UUID(), rootPath: WorkspacePath, entry: Entry) {
+    init(id: UUID = UUID(), rootPath: WorkspacePath, entry: Entry) {
         self.id = id
         self.rootPath = rootPath
         self.entry = entry
-    }
-}
-
-// MARK: - Summary
-
-extension Snapshot {
-    /// Returns a structural summary of the changes between this snapshot and `other`.
-    ///
-    /// Pass `nil` to summarize this snapshot as if every entry were newly created.
-    ///
-    /// This walks every node under the snapshot root twice (current and prior trees). For very large trees,
-    /// prefer caching summaries at checkpoint creation time rather than recomputing on hot paths.
-    ///
-    /// - Parameter other: The snapshot to compare against, typically a parent checkpoint.
-    /// - Returns: A summary describing how many paths changed and whether any of those
-    ///   paths involve UTF-8 decodable text (and therefore have a meaningful textual diff).
-    public func summary(comparedTo other: Snapshot?) -> Checkpoint.Summary {
-        let currentNodes = Self.flattenNodes(entry, rootPath: rootPath)
-        let previousNodes = other.map { Self.flattenNodes($0.entry, rootPath: $0.rootPath) } ?? [:]
-        let allPaths = Set(currentNodes.keys).union(previousNodes.keys).sorted()
-        let changedPaths = allPaths.filter { currentNodes[$0] != previousNodes[$0] }
-        let hasTextDiffs = changedPaths.contains { Self.hasTextualChange(old: previousNodes[$0], new: currentNodes[$0]) }
-
-        return Checkpoint.Summary(
-            changeCount: changedPaths.count,
-            touchedPaths: changedPaths,
-            hasTextDiffs: hasTextDiffs
-        )
-    }
-
-    private struct FlatNode: Equatable {
-        var kind: FileTree.Kind
-        var permissions: POSIXPermissions
-        var fileData: Data?
-        var symlinkTarget: String?
-    }
-
-    private static func flattenNodes(_ entry: Entry, rootPath: WorkspacePath) -> [WorkspacePath: FlatNode] {
-        var nodes: [WorkspacePath: FlatNode] = [:]
-        collectNodes(entry, into: &nodes)
-        nodes.removeValue(forKey: rootPath)
-        return nodes
-    }
-
-    private static func collectNodes(_ entry: Entry, into nodes: inout [WorkspacePath: FlatNode]) {
-        switch entry {
-        case .missing:
-            return
-        case let .file(f):
-            nodes[f.path] = FlatNode(kind: .file, permissions: f.permissions, fileData: f.data)
-        case let .symlink(s):
-            nodes[s.path] = FlatNode(kind: .symlink, permissions: s.permissions, symlinkTarget: s.target)
-        case let .directory(d):
-            nodes[d.path] = FlatNode(kind: .directory, permissions: d.permissions)
-            for child in d.children {
-                collectNodes(child, into: &nodes)
-            }
-        }
-    }
-
-    private static func hasTextualChange(old: FlatNode?, new: FlatNode?) -> Bool {
-        let oldText: String?
-        if let data = old?.fileData {
-            oldText = String(data: data, encoding: .utf8)
-        } else if old == nil {
-            oldText = ""
-        } else {
-            oldText = nil
-        }
-
-        let newText: String?
-        if let data = new?.fileData {
-            newText = String(data: data, encoding: .utf8)
-        } else if new == nil {
-            newText = ""
-        } else {
-            newText = nil
-        }
-
-        guard let oldText, let newText else { return false }
-        return oldText != newText
     }
 }
 

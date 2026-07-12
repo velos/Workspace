@@ -13,7 +13,7 @@ import Glibc
 ///
 /// Actor isolation serializes access to the tree so the filesystem can be shared safely across
 /// concurrent tasks.
-public actor InMemoryFilesystem: FileSystem {
+public actor InMemoryFileSystem: FileSystem {
     private final class Node {
         enum Kind {
             case file(Data)
@@ -81,7 +81,7 @@ public actor InMemoryFilesystem: FileSystem {
     }
 
     /// See ``FileSystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) async throws {
+    func configure(rootDirectory: URL) async throws {
         _ = rootDirectory
         root = Node(kind: .directory([:]), permissions: 0o755)
     }
@@ -126,7 +126,7 @@ public actor InMemoryFilesystem: FileSystem {
     }
 
     /// See ``FileSystem/capabilities()``.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         [.symlinks, .hardLinks, .permissions, .realPathResolution]
     }
 

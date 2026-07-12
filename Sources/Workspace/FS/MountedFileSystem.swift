@@ -10,23 +10,27 @@ import Glibc
 ///
 /// Each mount is exposed at a virtual path, allowing callers to present a single workspace assembled
 /// from multiple independent roots.
-public final class MountableFilesystem: FileSystem, @unchecked Sendable {
+public final class MountedFileSystem: FileSystem, @unchecked Sendable {
     /// A mounted filesystem and the virtual path where it appears.
     public struct Mount: Sendable {
         /// The normalized virtual mount point.
         public var mountPoint: WorkspacePath
         /// The filesystem exposed at `mountPoint`.
-        public var filesystem: any FileSystem
+        public var fileSystem: any FileSystem
 
         /// Creates a mount description from a typed workspace path.
-        public init(mountPoint: WorkspacePath, filesystem: any FileSystem) {
+        public init(mountPoint: WorkspacePath, fileSystem: any FileSystem) {
             self.mountPoint = mountPoint
-            self.filesystem = filesystem
+            self.fileSystem = fileSystem
+        }
+
+        init(mountPoint: WorkspacePath, filesystem: any FileSystem) {
+            self.init(mountPoint: mountPoint, fileSystem: filesystem)
         }
 
         /// Convenience initializer that accepts a string mount point.
-        public init(mountPoint: String, filesystem: any FileSystem) {
-            self.init(mountPoint: WorkspacePath(normalizing: mountPoint), filesystem: filesystem)
+        init(mountPoint: String, filesystem: any FileSystem) {
+            self.init(mountPoint: WorkspacePath(normalizing: mountPoint), fileSystem: filesystem)
         }
     }
 
@@ -46,7 +50,7 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
 
     /// Creates a mountable filesystem with an optional base filesystem and initial mounts.
     public init(
-        base: any FileSystem = InMemoryFilesystem(),
+        base: any FileSystem = InMemoryFileSystem(),
         mounts: [Mount] = []
     ) {
         self.base = base
@@ -54,22 +58,21 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// Adds a filesystem mount at `mountPoint`.
-    public func mount(_ mountPoint: WorkspacePath, filesystem: any FileSystem) {
+    public func mount(_ mountPoint: WorkspacePath, fileSystem: any FileSystem) {
         withLock {
-            let mount = Mount(mountPoint: mountPoint, filesystem: filesystem)
+            let mount = Mount(mountPoint: mountPoint, fileSystem: fileSystem)
             mounts.append(mount)
             mounts.sort { $0.mountPoint.string.count > $1.mountPoint.string.count }
         }
     }
 
-    /// Convenience overload that accepts a string mount point.
-    public func mount(_ mountPoint: String, filesystem: any FileSystem) {
-        mount(WorkspacePath(normalizing: mountPoint), filesystem: filesystem)
+    func mount(_ mountPoint: WorkspacePath, filesystem: any FileSystem) {
+        mount(mountPoint, fileSystem: filesystem)
     }
 
-    /// See ``FileSystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) async throws {
-        try await base.configure(rootDirectory: rootDirectory)
+    /// Convenience overload that accepts a string mount point.
+    func mount(_ mountPoint: String, filesystem: any FileSystem) {
+        mount(WorkspacePath(normalizing: mountPoint), fileSystem: filesystem)
     }
 
     /// See ``FileSystem/stat(path:)``.
@@ -185,10 +188,10 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/capabilities()``. Reports the intersection of the base filesystem's and
     /// every mount's capabilities, since a path may resolve to any of them.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         var combined = await base.capabilities()
         for mount in mountsSnapshot() {
-            combined.formIntersection(await mount.filesystem.capabilities())
+            combined.formIntersection(await mount.fileSystem.capabilities())
         }
         return combined
     }
@@ -424,14 +427,18 @@ public final class MountableFilesystem: FileSystem, @unchecked Sendable {
     {
         for mount in mounts {
             if mount.mountPoint == path {
-                return (mount.mountPoint, mount.filesystem, .root)
+            return (mount.mountPoint, mount.fileSystem, .root)
+            }
+
+            if mount.mountPoint.isRoot {
+                return (mount.mountPoint, mount.fileSystem, path)
             }
 
             if !mount.mountPoint.isRoot, path.string.hasPrefix(mount.mountPoint.string + "/") {
                 let suffix = String(path.string.dropFirst(mount.mountPoint.string.count))
                 return (
                     mount.mountPoint,
-                    mount.filesystem,
+                    mount.fileSystem,
                     WorkspacePath(normalizing: suffix.isEmpty ? "/" : suffix)
                 )
             }

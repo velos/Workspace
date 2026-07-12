@@ -61,7 +61,7 @@ extension Tag {
 struct FilesystemTests {
     @Test(.tags(.permissions))
     func `permissioned filesystem normalizes paths and blocks denied writes`() async throws {
-        let base = InMemoryFilesystem()
+        let base = InMemoryFileSystem()
 
         let recorder = PermissionRecorder()
         let authorizer = PermissionAuthorizer { request in
@@ -71,7 +71,7 @@ struct FilesystemTests {
             }
             return .allow
         }
-        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
+        let filesystem = AuthorizedFileSystem(base: base, authorizer: authorizer)
 
         do {
             try await filesystem.writeFile(path: "/tmp/../note.txt", data: Data("hello".utf8), append: false)
@@ -89,7 +89,7 @@ struct FilesystemTests {
 
     @Test(.tags(.permissions))
     func `permissioned filesystem caches allow-for-session decisions`() async throws {
-        let base = InMemoryFilesystem()
+        let base = InMemoryFileSystem()
         try await base.writeFile(path: "/doc.txt", data: Data("hello".utf8), append: false)
 
         let recorder = PermissionRecorder()
@@ -97,7 +97,7 @@ struct FilesystemTests {
             await recorder.record(request)
             return .allowForSession
         }
-        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
+        let filesystem = AuthorizedFileSystem(base: base, authorizer: authorizer)
 
         _ = try await filesystem.readFile(path: "/doc.txt")
         _ = try await filesystem.readFile(path: "/doc.txt")
@@ -109,13 +109,13 @@ struct FilesystemTests {
 
     @Test(.tags(.permissions))
     func `permissioned mountable filesystem sees mounted virtual paths`() async throws {
-        let docs = InMemoryFilesystem()
+        let docs = InMemoryFileSystem()
         try await docs.writeFile(path: "/guide.txt", data: Data("guide".utf8), append: false)
 
-        let mountable = MountableFilesystem(
-            base: InMemoryFilesystem(),
+        let mountable = MountedFileSystem(
+            base: InMemoryFileSystem(),
             mounts: [
-                MountableFilesystem.Mount(mountPoint: "/docs", filesystem: docs),
+                MountedFileSystem.Mount(mountPoint: "/docs", fileSystem: docs),
             ]
         )
 
@@ -124,7 +124,7 @@ struct FilesystemTests {
             await recorder.record(request)
             return .allow
         }
-        let filesystem = PermissionedFileSystem(base: mountable, authorizer: authorizer)
+        let filesystem = AuthorizedFileSystem(base: mountable, authorizer: authorizer)
 
         let data = try await filesystem.readFile(path: "/docs/guide.txt")
         #expect(String(decoding: data, as: UTF8.self) == "guide")
@@ -145,7 +145,7 @@ struct FilesystemTests {
         let outsideFile = outside.appendingPathComponent("outside.txt")
         try Data("secret".utf8).write(to: outsideFile)
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         try await filesystem.createSymlink(path: "/leak", target: outsideFile.path)
 
         do {
@@ -167,7 +167,7 @@ struct FilesystemTests {
         let outsideFile = outside.appendingPathComponent("target.txt")
         try Data("original".utf8).write(to: outsideFile)
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         try await filesystem.createSymlink(path: "/leak", target: outsideFile.path)
 
         do {
@@ -198,7 +198,7 @@ struct FilesystemTests {
         let outsideFile = outside.appendingPathComponent("target.txt")
         try Data("secret".utf8).write(to: outsideFile)
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         try await filesystem.createSymlink(path: "/leak", target: outsideFile.path)
 
         // lstat semantics: the link itself is visible and manageable...
@@ -230,7 +230,7 @@ struct FilesystemTests {
         let outside = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemOutside")
         defer { FilesystemTestSupport.removeDirectory(outside) }
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         let missingTarget = outside.appendingPathComponent("missing.txt").path
         try await filesystem.createSymlink(path: "/dangling", target: missingTarget)
 
@@ -248,7 +248,7 @@ struct FilesystemTests {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
         defer { FilesystemTestSupport.removeDirectory(root) }
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         try await filesystem.createDirectory(path: "/real", recursive: true)
         try await filesystem.writeFile(path: "/real/keep.txt", data: Data("keep".utf8), append: false)
         try await filesystem.createSymlink(path: "/alias", target: "real")
@@ -261,7 +261,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `glob wildcards stay within a single path component`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.createDirectory(path: "/docs/sub", recursive: true)
         try await filesystem.writeFile(path: "/docs/top.txt", data: FilesystemTestSupport.data("a"), append: false)
         try await filesystem.writeFile(path: "/docs/sub/deep.txt", data: FilesystemTestSupport.data("b"), append: false)
@@ -278,7 +278,7 @@ struct FilesystemTests {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRanged")
         defer { FilesystemTestSupport.removeDirectory(root) }
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         let payload = Data("0123456789".utf8)
         try await filesystem.writeFile(path: "/data.bin", data: payload, append: false)
 
@@ -295,7 +295,7 @@ struct FilesystemTests {
         #expect(chunks.reduce(Data(), +) == payload)
 
         // The protocol's default implementation used by the in-memory backend agrees.
-        let memory = InMemoryFilesystem()
+        let memory = InMemoryFileSystem()
         try await memory.writeFile(path: "/data.bin", data: payload, append: false)
         #expect(try await memory.readFile(path: "/data.bin", offset: 3, length: 4) == Data("3456".utf8))
         #expect(try await memory.readFile(path: "/data.bin", offset: 42, length: 1) == Data())
@@ -312,7 +312,7 @@ struct FilesystemTests {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemCreate")
         defer { FilesystemTestSupport.removeDirectory(root) }
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         try await filesystem.createFile(path: "/fresh/new.txt", data: Data("one".utf8))
         #expect(try await filesystem.readFile(path: "/fresh/new.txt") == Data("one".utf8))
 
@@ -325,7 +325,7 @@ struct FilesystemTests {
         }
         #expect(try await filesystem.readFile(path: "/fresh/new.txt") == Data("one".utf8))
 
-        let memory = InMemoryFilesystem()
+        let memory = InMemoryFileSystem()
         try await memory.createFile(path: "/new.txt", data: Data("one".utf8))
         do {
             try await memory.createFile(path: "/new.txt", data: Data("two".utf8))
@@ -338,18 +338,18 @@ struct FilesystemTests {
 
     @Test(.tags(.permissions))
     func `capabilities are advertised and forwarded through wrappers`() async throws {
-        let memory = InMemoryFilesystem()
+        let memory = InMemoryFileSystem()
         let memoryCapabilities = await memory.capabilities()
         #expect(memoryCapabilities.contains(.symlinks))
         #expect(memoryCapabilities.contains(.permissions))
 
-        let permissioned = PermissionedFileSystem(
+        let permissioned = AuthorizedFileSystem(
             base: memory,
             authorizer: PermissionAuthorizer { _ in .allow }
         )
         #expect(await permissioned.capabilities() == memoryCapabilities)
 
-        let denied = PermissionedFileSystem(
+        let denied = AuthorizedFileSystem(
             base: memory,
             authorizer: PermissionAuthorizer { request in
                 request.operation == .writeFile ? .deny(message: "no writes") : .allow
@@ -365,7 +365,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `glob character classes support shell negation`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.writeFile(path: "/a.txt", data: FilesystemTestSupport.data("a"), append: false)
         try await filesystem.writeFile(path: "/b.txt", data: FilesystemTestSupport.data("b"), append: false)
 
@@ -378,7 +378,7 @@ struct FilesystemTests {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "FilesystemRoot")
         defer { FilesystemTestSupport.removeDirectory(root) }
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         try await filesystem.writeFile(path: "/real.txt", data: Data("one".utf8), append: false)
         try await filesystem.createSymlink(path: "/alias", target: "real.txt")
 
@@ -390,7 +390,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem reset clears prior contents`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.writeFile(path: "/note.txt", data: Data("hello".utf8), append: false)
 
         #expect(await filesystem.exists(path: "/note.txt"))
@@ -409,7 +409,7 @@ struct FilesystemTests {
         let fileURL = root.appendingPathComponent("note.txt")
         try Data("disk".utf8).write(to: fileURL)
 
-        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFileSystem(rootDirectory: root)
         try await filesystem.writeFile(path: "/note.txt", data: Data("overlay".utf8), append: false)
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("overlay".utf8))
 
@@ -421,7 +421,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem handles symlink writes copies moves and configure reset`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.writeFile(path: "/target.txt", data: Data("one".utf8), append: false)
         try await filesystem.createSymlink(path: "/link.txt", target: "target.txt")
 
@@ -448,7 +448,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem reports POSIX errors for invalid operations`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.writeFile(path: "/file.txt", data: Data("data".utf8), append: false)
         try await filesystem.createDirectory(path: "/dir", recursive: true)
         try await filesystem.writeFile(path: "/dir/child.txt", data: Data("child".utf8), append: false)
@@ -553,7 +553,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem detects symlink cycles when resolving paths`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.createSymlink(path: "/loop", target: "/loop")
 
         do {
@@ -567,7 +567,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem move no-op when source and destination are identical`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.writeFile(path: "/a.txt", data: Data("x".utf8), append: false)
         try await filesystem.move(from: "/a.txt", to: "/a.txt")
         #expect(try await filesystem.readFile(path: "/a.txt") == Data("x".utf8))
@@ -575,14 +575,14 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem remove is silent when the path is missing`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.remove(path: "/missing.txt", recursive: false)
         #expect(!(await filesystem.exists(path: "/missing.txt")))
     }
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem glob returns matching paths sorted`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.createDirectory(path: "/docs", recursive: true)
         try await filesystem.writeFile(path: "/docs/a.txt", data: Data(), append: false)
         try await filesystem.writeFile(path: "/docs/b.txt", data: Data(), append: false)
@@ -594,7 +594,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem setPermissions updates stat results`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.writeFile(path: "/x.txt", data: Data("y".utf8), append: false)
 
         try await filesystem.setPermissions(path: "/x.txt", permissions: POSIXPermissions(0o600))
@@ -604,7 +604,7 @@ struct FilesystemTests {
 
     @Test(.tags(.inMemory))
     func `in-memory filesystem stat reports symlink kind for the link path`() async throws {
-        let filesystem = InMemoryFilesystem()
+        let filesystem = InMemoryFileSystem()
         try await filesystem.writeFile(path: "/target.txt", data: Data("z".utf8), append: false)
         try await filesystem.createSymlink(path: "/link.txt", target: "target.txt")
 
@@ -617,7 +617,7 @@ struct FilesystemTests {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "ReadWriteRoot")
         defer { FilesystemTestSupport.removeDirectory(root) }
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
 
         try await filesystem.createDirectory(path: "/docs", recursive: false)
         try await filesystem.writeFile(path: "/docs/note.txt", data: FilesystemTestSupport.data("hello"), append: false)
@@ -676,21 +676,19 @@ struct FilesystemTests {
 
     @Test(.tags(.readWrite))
     func `read-write filesystem reports configuration and directory operation errors`() async throws {
-        let unconfigured = ReadWriteFilesystem()
+        let unconfigured = LocalFileSystem()
 
         do {
             _ = try await unconfigured.stat(path: "/")
             Issue.record("expected unconfigured filesystem error")
         } catch let error as WorkspaceError {
-            #expect(error.description.contains("filesystem is not configured"))
+            #expect(error.description.contains("local filesystem requires a root"))
         }
-
-        #expect(!(await unconfigured.exists(path: "/\u{0}")))
 
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "ReadWriteErrors")
         defer { FilesystemTestSupport.removeDirectory(root) }
 
-        let filesystem = try ReadWriteFilesystem(rootDirectory: root)
+        let filesystem = try LocalFileSystem(rootDirectory: root)
         try await filesystem.createDirectory(path: "/dir", recursive: false)
         try await filesystem.writeFile(path: "/dir/file.txt", data: FilesystemTestSupport.data("x"), append: false)
 
@@ -737,7 +735,7 @@ struct FilesystemTests {
         let symlinkURL = root.appendingPathComponent("alias.txt")
         try FileManager.default.createSymbolicLink(atPath: symlinkURL.path, withDestinationPath: "dir/file.txt")
 
-        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFileSystem(rootDirectory: root)
 
         #expect((try await filesystem.listDirectory(path: "/")).map(\.name) == ["alias.txt", "dir"])
         #expect((try await filesystem.listDirectory(path: "/dir")).map(\.name) == ["file.txt"])
@@ -770,7 +768,7 @@ struct FilesystemTests {
         let noteURL = root.appendingPathComponent("note.txt")
         try Data("disk".utf8).write(to: noteURL)
 
-        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFileSystem(rootDirectory: root)
         #expect(try await filesystem.readFile(path: "/note.txt") == Data("disk".utf8))
 
         // A file added on disk after configuration is visible without reload: reads are lazy.
@@ -793,7 +791,7 @@ struct FilesystemTests {
         try Data("a".utf8).write(to: dirURL.appendingPathComponent("a.txt"))
         try Data("b".utf8).write(to: dirURL.appendingPathComponent("b.txt"))
 
-        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFileSystem(rootDirectory: root)
 
         try await filesystem.remove(path: "/dir/a.txt", recursive: false)
         #expect(!(await filesystem.exists(path: "/dir/a.txt")))
@@ -821,7 +819,7 @@ struct FilesystemTests {
         try FileManager.default.createDirectory(at: subURL, withIntermediateDirectories: true)
         try Data("k".utf8).write(to: subURL.appendingPathComponent("keep.txt"))
 
-        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFileSystem(rootDirectory: root)
 
         try await filesystem.writeFile(path: "/log.txt", data: Data(" two".utf8), append: true)
         #expect(try await filesystem.readFile(path: "/log.txt") == Data("one two".utf8))
@@ -849,7 +847,7 @@ struct FilesystemTests {
             ofItemAtPath: fileURL.path
         )
 
-        let filesystem = try await OverlayFilesystem(rootDirectory: root)
+        let filesystem = try await OverlayFileSystem(rootDirectory: root)
         let info = try await filesystem.stat(path: "/old.txt")
 
         #expect(info.permissions == POSIXPermissions(0o640))
@@ -859,7 +857,7 @@ struct FilesystemTests {
 
     @Test(.tags(.overlay))
     func `overlay filesystem reload requires a configured root and treats missing roots as empty`() async throws {
-        let unconfigured = OverlayFilesystem()
+        let unconfigured = OverlayFileSystem()
 
         do {
             try await unconfigured.reload()
@@ -871,7 +869,7 @@ struct FilesystemTests {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "OverlayMissingRoot")
         try FileManager.default.removeItem(at: root)
 
-        let filesystem = OverlayFilesystem()
+        let filesystem = OverlayFileSystem()
         try await filesystem.configure(rootDirectory: root)
 
         #expect(await filesystem.exists(path: "/"))
@@ -880,13 +878,13 @@ struct FilesystemTests {
 
     @Test(.tags(.permissions))
     func `permissioned filesystem forwards filesystem operations and normalized paths`() async throws {
-        let base = InMemoryFilesystem()
+        let base = InMemoryFileSystem()
         let recorder = PermissionRecorder()
         let authorizer = PermissionAuthorizer { request in
             await recorder.record(request)
             return .allow
         }
-        let filesystem = PermissionedFileSystem(base: base, authorizer: authorizer)
+        let filesystem = AuthorizedFileSystem(base: base, authorizer: authorizer)
 
         try await filesystem.writeFile(path: "/dir/../note.txt", data: FilesystemTestSupport.data("hello"), append: false)
         try await filesystem.createDirectory(path: "/links", recursive: true)
@@ -934,12 +932,12 @@ struct FilesystemTests {
     }
 
     @Test(.tags(.permissions))
-    func `permissioned filesystem forwards configuration and denied remove operations`() async throws {
+    func `authorized filesystem forwards operations and denies remove`() async throws {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "PermissionedConfig")
         defer { FilesystemTestSupport.removeDirectory(root) }
 
-        let base = ReadWriteFilesystem()
-        let filesystem = PermissionedFileSystem(
+        let base = try LocalFileSystem(root: root)
+        let filesystem = AuthorizedFileSystem(
             base: base,
             authorizer: PermissionAuthorizer { request in
                 if request.operation == .remove {
@@ -949,7 +947,6 @@ struct FilesystemTests {
             }
         )
 
-        try await filesystem.configure(rootDirectory: root)
         try await filesystem.writeFile(path: "/note.txt", data: FilesystemTestSupport.data("hello"), append: false)
 
         do {
@@ -959,13 +956,12 @@ struct FilesystemTests {
             #expect(error.description.contains("workspace access denied: remove"))
         }
 
-        let deniedExists = await PermissionedFileSystem(
+        let deniedExists = await AuthorizedFileSystem(
             base: base,
             authorizer: PermissionAuthorizer { _ in .deny(message: "blocked") }
         ).exists(path: "/note.txt")
 
         #expect(!deniedExists)
-        #expect(!(await filesystem.exists(path: "/\u{0}")))
     }
 
     @Test(.tags(.sandbox))
@@ -1040,10 +1036,10 @@ struct FilesystemTests {
         defer { FilesystemTestSupport.removeDirectory(secondRoot) }
 
         let filesystem = try SandboxFilesystem(root: .url(firstRoot))
-        try await filesystem.configure(rootDirectory: secondRoot)
         try await filesystem.writeFile(path: "/configured.txt", data: FilesystemTestSupport.data("configured"), append: false)
 
-        #expect(FileManager.default.fileExists(atPath: secondRoot.appendingPathComponent("configured.txt").path))
+        #expect(FileManager.default.fileExists(atPath: firstRoot.appendingPathComponent("configured.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: secondRoot.appendingPathComponent("configured.txt").path))
     }
 
     @Test(.tags(.bookmarks))

@@ -5,7 +5,7 @@ import Foundation
 /// `WorkspacePath` models shell-style paths independently of the host filesystem so the same value can
 /// be used with in-memory, mounted, overlay, and disk-backed filesystems.
 public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, ExpressibleByStringLiteral,
-    LosslessStringConvertible, CustomStringConvertible
+    CustomStringConvertible
 {
     /// The root path, `/`.
     public static let root = WorkspacePath(unchecked: "/")
@@ -14,19 +14,21 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
 
     /// Creates a normalized path from a string literal.
     public init(stringLiteral value: StringLiteralType) {
-        self.init(normalizing: value)
+        precondition(!value.contains("\u{0}"), "workspace path contains a null byte")
+        storage = Self.normalizedString(path: value, currentDirectory: Self.root.storage)
     }
 
-    /// Creates a validated and normalized path from a string description.
-    ///
-    /// Returns `nil` when the input contains unsupported characters such as a null byte.
-    public init?(_ description: String) {
-        try? self.init(validating: description)
+    /// Creates a validated, normalized path from dynamic text.
+    public init(_ path: String, relativeTo currentDirectory: WorkspacePath = .root) throws {
+        if path.contains("\u{0}") {
+            throw WorkspaceError.invalidPath(path)
+        }
+        storage = Self.normalizedString(path: path, currentDirectory: currentDirectory.storage)
     }
 
     /// Creates a normalized absolute path from a string, resolving it relative to `currentDirectory`
     /// when the input is not already absolute.
-    public init(normalizing path: some StringProtocol, relativeTo currentDirectory: WorkspacePath = .root) {
+    init(normalizing path: some StringProtocol, relativeTo currentDirectory: WorkspacePath = .root) {
         storage = Self.normalizedString(path: String(path), currentDirectory: currentDirectory.storage)
     }
 
@@ -36,7 +38,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     ///   - path: The path text to validate and normalize.
     ///   - currentDirectory: The base path used for relative inputs.
     /// - Throws: ``WorkspaceError/invalidPath(_:)`` when the input contains unsupported characters.
-    public init(validating path: some StringProtocol, relativeTo currentDirectory: WorkspacePath = .root) throws {
+    init(validating path: some StringProtocol, relativeTo currentDirectory: WorkspacePath = .root) throws {
         let string = String(path)
         if string.contains("\u{0}") {
             throw WorkspaceError.invalidPath(string)
@@ -69,14 +71,20 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     }
 
     /// The final path component, or `/` for the root path.
-    public var basename: String {
+    var basename: String {
         Self.basename(storage)
     }
 
+    /// The final path component, or `/` for the root.
+    public var name: String { basename }
+
     /// The parent directory of the path.
-    public var dirname: WorkspacePath {
+    var dirname: WorkspacePath {
         Self.dirname(storage)
     }
+
+    /// The containing path. The root is its own parent.
+    public var parent: WorkspacePath { dirname }
 
     /// Returns a new path by appending `component` and normalizing the result.
     public func appending(_ component: some StringProtocol) -> WorkspacePath {
@@ -131,12 +139,12 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     }
 
     /// Splits an absolute path string into components, excluding the leading `/`.
-    public static func splitComponents(_ absolutePath: some StringProtocol) -> [String] {
+    static func splitComponents(_ absolutePath: some StringProtocol) -> [String] {
         String(absolutePath).split(separator: "/", omittingEmptySubsequences: true).map(String.init)
     }
 
     /// Returns the last component of `path`, or `/` for the root path.
-    public static func basename(_ path: some StringProtocol) -> String {
+    static func basename(_ path: some StringProtocol) -> String {
         let string = String(path)
         let normalized = string == "/" ? "/" : string.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         if normalized == "/" || normalized.isEmpty {
@@ -146,7 +154,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     }
 
     /// Returns the parent directory of `path`.
-    public static func dirname(_ path: some StringProtocol) -> WorkspacePath {
+    static func dirname(_ path: some StringProtocol) -> WorkspacePath {
         let normalized = normalizedString(path: String(path), currentDirectory: "/")
         if normalized == "/" {
             return .root
@@ -161,7 +169,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     }
 
     /// Joins two path fragments and returns the normalized string result.
-    public static func join(_ lhs: some StringProtocol, _ rhs: some StringProtocol) -> String {
+    static func join(_ lhs: some StringProtocol, _ rhs: some StringProtocol) -> String {
         let left = String(lhs)
         let right = String(rhs)
         if right.hasPrefix("/") {
@@ -173,12 +181,12 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     }
 
     /// Joins a base path and a path fragment, returning a normalized ``WorkspacePath``.
-    public static func join(_ lhs: WorkspacePath, _ rhs: some StringProtocol) -> WorkspacePath {
+    static func join(_ lhs: WorkspacePath, _ rhs: some StringProtocol) -> WorkspacePath {
         WorkspacePath(unchecked: join(lhs.storage, String(rhs)))
     }
 
     /// Returns `true` when the token contains glob metacharacters.
-    public static func containsGlob(_ token: some StringProtocol) -> Bool {
+    static func containsGlob(_ token: some StringProtocol) -> Bool {
         let string = String(token)
         return string.contains("*") || string.contains("?") || string.contains("[")
     }
@@ -187,7 +195,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     ///
     /// `*` and `?` match within a single path component (they never cross `/`), `**` matches any
     /// characters including `/`, and character classes support shell-style negation (`[!abc]`).
-    public static func globToRegex(_ pattern: some StringProtocol) -> String {
+    static func globToRegex(_ pattern: some StringProtocol) -> String {
         let pattern = String(pattern)
         var regex = "^"
         var index = pattern.startIndex
@@ -197,8 +205,14 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
             if char == "*" {
                 let nextIndex = pattern.index(after: index)
                 if nextIndex < pattern.endIndex, pattern[nextIndex] == "*" {
-                    regex += ".*"
-                    index = nextIndex
+                    let afterDoubleStar = pattern.index(after: nextIndex)
+                    if afterDoubleStar < pattern.endIndex, pattern[afterDoubleStar] == "/" {
+                        regex += "(?:.*/)?"
+                        index = afterDoubleStar
+                    } else {
+                        regex += ".*"
+                        index = nextIndex
+                    }
                 } else {
                     regex += "[^/]*"
                 }

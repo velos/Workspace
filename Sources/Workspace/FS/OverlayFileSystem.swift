@@ -16,10 +16,10 @@ import Glibc
 ///
 /// `reload()` (or `configure(rootDirectory:)`) discards the upper layer and whiteouts, so the
 /// overlay reflects the source directory's current state again.
-public actor OverlayFilesystem: FileSystem {
+public actor OverlayFileSystem: FileSystem {
     private let fileManager: FileManager
-    private var upper: InMemoryFilesystem
-    private var lower: ReadWriteFilesystem?
+    private var upper: InMemoryFileSystem
+    private var lower: (any FileSystem)?
     private var rootURL: URL?
     /// Paths whose lower-layer entries (including everything beneath them) are hidden from the
     /// merged view. Creating a new entry at a cut path shadows it in the upper layer; the cut
@@ -27,34 +27,58 @@ public actor OverlayFilesystem: FileSystem {
     private var cuts: Set<WorkspacePath> = []
 
     /// Creates an unconfigured overlay filesystem.
-    public init(fileManager: FileManager = .default) {
+    init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
-        upper = InMemoryFilesystem()
+        upper = InMemoryFileSystem()
+    }
+
+    /// Creates a live copy-on-write overlay over any filesystem.
+    public init(over base: any FileSystem) {
+        fileManager = .default
+        upper = InMemoryFileSystem()
+        lower = base
+        rootURL = nil
     }
 
     /// Creates and configures an overlay for `rootDirectory`.
-    public init(rootDirectory: URL, fileManager: FileManager = .default) async throws {
+    init(rootDirectory: URL, fileManager: FileManager = .default) async throws {
         self.fileManager = fileManager
-        upper = InMemoryFilesystem()
+        upper = InMemoryFileSystem()
         try await configure(rootDirectory: rootDirectory)
     }
 
+    /// Creates a disk overlay rooted at `root`.
+    public init(root: URL, fileManager: FileManager = .default) async throws {
+        self.fileManager = fileManager
+        upper = InMemoryFileSystem()
+        try await configure(rootDirectory: root)
+    }
+
     /// See ``FileSystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) async throws {
+    func configure(rootDirectory: URL) async throws {
         rootURL = rootDirectory.standardizedFileURL
         try resetLayers()
     }
 
     /// Discards overlay writes and whiteouts so reads reflect the source directory again.
-    public func reload() async throws {
+    func reload() async throws {
         guard rootURL != nil else {
             throw WorkspaceError.unsupported("overlay filesystem requires rootDirectory")
         }
         try resetLayers()
     }
 
+    /// Discards upper-layer changes and whiteouts.
+    public func discardChanges() async throws {
+        upper = InMemoryFileSystem()
+        cuts = []
+        if rootURL != nil {
+            try resetLayers()
+        }
+    }
+
     private func resetLayers() throws {
-        upper = InMemoryFilesystem()
+        upper = InMemoryFileSystem()
         cuts = []
         guard let rootURL else {
             lower = nil
@@ -62,7 +86,7 @@ public actor OverlayFilesystem: FileSystem {
         }
         var isDirectory: ObjCBool = false
         if fileManager.fileExists(atPath: rootURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
-            lower = try ReadWriteFilesystem(rootDirectory: rootURL, fileManager: fileManager)
+            lower = try LocalFileSystem(rootDirectory: rootURL, fileManager: fileManager)
         } else {
             lower = nil
         }
@@ -173,7 +197,7 @@ public actor OverlayFilesystem: FileSystem {
     }
 
     /// See ``FileSystem/capabilities()``.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         [.symlinks, .hardLinks, .permissions, .realPathResolution]
     }
 

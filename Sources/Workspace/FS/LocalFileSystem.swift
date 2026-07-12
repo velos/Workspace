@@ -2,6 +2,9 @@ import Foundation
 
 #if canImport(Darwin)
 import Darwin
+#if os(macOS)
+import CoreServices
+#endif
 #elseif canImport(Glibc)
 import Glibc
 #endif
@@ -10,7 +13,7 @@ import Glibc
 ///
 /// Paths are resolved relative to the configured root and constrained so callers cannot escape that root
 /// through traversal or symlink resolution.
-public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
+public final class LocalFileSystem: FileSystem, @unchecked Sendable {
     private let fileManager: FileManager
     private let stateLock = NSLock()
     private var rootURL: URL?
@@ -22,18 +25,23 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// Creates an unconfigured disk-backed filesystem.
-    public init(fileManager: FileManager = .default) {
+    init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
     }
 
     /// Creates and configures a disk-backed filesystem rooted at `rootDirectory`.
-    public convenience init(rootDirectory: URL, fileManager: FileManager = .default) throws {
+    convenience init(rootDirectory: URL, fileManager: FileManager = .default) throws {
         self.init(fileManager: fileManager)
         try applyConfiguration(rootDirectory: rootDirectory)
     }
 
+    /// Creates a disk-backed filesystem with an immutable public root.
+    public convenience init(root: URL, fileManager: FileManager = .default) throws {
+        try self.init(rootDirectory: root, fileManager: fileManager)
+    }
+
     /// See ``FileSystem/configure(rootDirectory:)``.
-    public func configure(rootDirectory: URL) async throws {
+    func configure(rootDirectory: URL) async throws {
         try applyConfiguration(rootDirectory: rootDirectory)
     }
 
@@ -110,7 +118,7 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
     }
 
     /// See ``FileSystem/capabilities()``.
-    public func capabilities() async -> FileSystemCapabilities {
+    public func capabilities() async -> FileSystemFeatures {
         [.symlinks, .hardLinks, .permissions, .realPathResolution]
     }
 
@@ -469,7 +477,7 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard let rootURL, let resolvedRootPath else {
-            throw WorkspaceError.notConfigured
+            throw WorkspaceError.unsupported("local filesystem requires a root")
         }
         return ConfigurationSnapshot(rootURL: rootURL, resolvedRootPath: resolvedRootPath)
     }
@@ -503,3 +511,90 @@ public final class ReadWriteFilesystem: FileSystem, @unchecked Sendable {
         )
     }
 }
+
+#if os(macOS)
+extension LocalFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        let root = try requireConfiguration().rootURL
+        return try FSEventsChangeStream.observe(root)
+    }
+}
+
+enum FSEventsChangeStream {
+    private final class Box: @unchecked Sendable {
+        let continuation: AsyncStream<Void>.Continuation
+        init(_ continuation: AsyncStream<Void>.Continuation) { self.continuation = continuation }
+    }
+
+    private final class Observation: @unchecked Sendable {
+        private let stream: FSEventStreamRef
+        private let box: Unmanaged<Box>
+
+        init(root: URL, continuation: AsyncStream<Void>.Continuation) throws {
+            box = .passRetained(Box(continuation))
+            var context = FSEventStreamContext(
+                version: 0,
+                info: box.toOpaque(),
+                retain: nil,
+                release: nil,
+                copyDescription: nil
+            )
+            let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+                guard let info else { return }
+                Unmanaged<Box>.fromOpaque(info).takeUnretainedValue().continuation.yield()
+            }
+            let flags = FSEventStreamCreateFlags(
+                kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer
+            )
+            guard let stream = FSEventStreamCreate(
+                kCFAllocatorDefault,
+                callback,
+                &context,
+                [root.path] as CFArray,
+                FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+                0.04,
+                flags
+            ) else {
+                box.release()
+                throw WorkspaceError.unsupported("could not create an FSEvents stream")
+            }
+            self.stream = stream
+            FSEventStreamSetDispatchQueue(stream, .global(qos: .utility))
+            guard FSEventStreamStart(stream) else {
+                FSEventStreamInvalidate(stream)
+                FSEventStreamRelease(stream)
+                box.release()
+                throw WorkspaceError.unsupported("could not start an FSEvents stream")
+            }
+        }
+
+        func cancel() {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            box.release()
+        }
+    }
+
+    static func observe(_ root: URL) throws -> AsyncStream<Void> {
+        var failure: Error?
+        let stream = AsyncStream<Void> { continuation in
+            do {
+                let observation = try Observation(root: root, continuation: continuation)
+                continuation.onTermination = { _ in observation.cancel() }
+            } catch {
+                failure = error
+                continuation.finish()
+            }
+        }
+        if let failure { throw failure }
+        return stream
+    }
+}
+#elseif os(Linux)
+extension LocalFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        try DirectoryChangeStream.observe(requireConfiguration().rootURL, recursive: true)
+    }
+}
+#endif
