@@ -48,6 +48,37 @@ struct PersistenceTests {
     }
 
     @Test
+    func `directory checkpoints only reread files whose metadata changed`() async throws {
+        let filesRoot = try TestSupport.temporaryDirectory("LazyCaptureFiles")
+        let historyRoot = try TestSupport.temporaryDirectory("LazyCaptureHistory")
+        defer {
+            TestSupport.remove(filesRoot)
+            TestSupport.remove(historyRoot)
+        }
+        let local = try LocalFileSystem(root: filesRoot)
+        let files = ReadCountingFileSystem(base: local)
+        let workspace = Workspace(fileSystem: files, persistence: .directory(historyRoot))
+
+        try await workspace.writeText("/note", "first")
+        await files.resetReadCount()
+        _ = try await workspace.createCheckpoint()
+        #expect(await files.readCount == 1)
+
+        _ = try await workspace.createCheckpoint()
+        #expect(await files.readCount == 1)
+
+        try await workspace.writeText("/note", "second")
+        await files.resetReadCount()
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(10)],
+            ofItemAtPath: filesRoot.appendingPathComponent("note").path
+        )
+        let changed = try await workspace.createCheckpoint()
+        #expect(await files.readCount == 1)
+        #expect(try await workspace.readText("/note", at: .checkpoint(changed.id)) == "second")
+    }
+
+    @Test
     func `torn final JSONL record is ignored and repaired by the next append`() async throws {
         let root = try TestSupport.temporaryDirectory("TornLog")
         defer { TestSupport.remove(root) }
@@ -86,5 +117,46 @@ struct PersistenceTests {
         }
         let next = try await reloaded.createCheckpoint(label: "next")
         #expect(next.parentID == expectedHead?.id)
+    }
+}
+
+private actor ReadCountingFileSystem: FileSystem {
+    let base: any FileSystem
+    private(set) var readCount = 0
+
+    init(base: any FileSystem) { self.base = base }
+
+    func resetReadCount() { readCount = 0 }
+
+    func stat(path: WorkspacePath) async throws -> FileInfo { try await base.stat(path: path) }
+    func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
+        try await base.listDirectory(path: path)
+    }
+    func readFile(path: WorkspacePath) async throws -> Data {
+        readCount += 1
+        return try await base.readFile(path: path)
+    }
+    func exists(path: WorkspacePath) async -> Bool { await base.exists(path: path) }
+    func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
+        try await base.glob(pattern: pattern, currentDirectory: currentDirectory)
+    }
+    func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
+        try await base.writeFile(path: path, data: data, append: append)
+    }
+    func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
+        try await base.createDirectory(path: path, recursive: recursive)
+    }
+    func remove(path: WorkspacePath, recursive: Bool) async throws {
+        try await base.remove(path: path, recursive: recursive)
+    }
+    func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
+        try await base.move(from: sourcePath, to: destinationPath)
+    }
+    func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws {
+        try await base.copy(from: sourcePath, to: destinationPath, recursive: recursive)
+    }
+    func readSymlink(path: WorkspacePath) async throws -> String { try await base.readSymlink(path: path) }
+    func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
+        try await base.setPermissions(path: path, permissions: permissions)
     }
 }

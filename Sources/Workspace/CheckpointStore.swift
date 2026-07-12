@@ -12,6 +12,7 @@ import Glibc
 /// any placeholder sequence; ``appendMutation(_:)`` returns the record with the next persisted
 /// monotonic number for that workspace, serialized under the mutations lock.
 protocol CheckpointStore: AnyObject, Sendable {
+    func captureRevision(from filesystem: any FileSystem, draft: CheckpointDraft) async throws -> Checkpoint
     func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint
     func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> Checkpoint?
     func listCheckpoints(workspaceId: UUID) async throws -> [Checkpoint]
@@ -45,6 +46,10 @@ actor InMemoryCheckpointStore: CheckpointStore {
     private var mutationsByWorkspace: [UUID: [Mutation]] = [:]
 
     init() {}
+
+    func captureRevision(from filesystem: any FileSystem, draft: CheckpointDraft) async throws -> Checkpoint {
+        try await saveRevision(Snapshot.capture(from: filesystem), draft: draft)
+    }
 
     func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint {
         var list = checkpointsByWorkspace[draft.workspaceID] ?? []
@@ -303,8 +308,8 @@ actor FileCheckpointStore: CheckpointStore {
     /// A persisted snapshot: the tree structure with file contents replaced by content hashes.
     /// The bytes themselves live in per-workspace `blobs/<sha256>` files, so identical content is
     /// stored once no matter how many snapshots reference it, and never base64-inflated.
-    private struct SnapshotManifest: Codable {
-        struct Node: Codable {
+    private struct SnapshotManifest: Codable, Sendable {
+        struct Node: Codable, Sendable {
             enum Kind: String, Codable {
                 case file, directory, symlink, missing
             }
@@ -314,6 +319,7 @@ actor FileCheckpointStore: CheckpointStore {
             var permissions: POSIXPermissions?
             var contentHash: String?
             var contentSize: UInt64? = nil
+            var modificationDate: Date? = nil
             var symlinkTarget: String?
             var children: [Node]?
         }
@@ -322,6 +328,72 @@ actor FileCheckpointStore: CheckpointStore {
         var id: UUID
         var rootPath: WorkspacePath
         var root: Node
+    }
+
+    func captureRevision(from filesystem: any FileSystem, draft: CheckpointDraft) async throws -> Checkpoint {
+        try ensureWorkspaceDirectories(for: draft.workspaceID)
+        return try await withExclusiveLifecycleLock(at: lifecycleLockURL(workspaceId: draft.workspaceID)) {
+            let checkpoints = try self.loadAllCheckpointsUnlocked(workspaceId: draft.workspaceID)
+            let parent = self.resolvedParent(for: draft, checkpoints: checkpoints)
+            let parentManifest: SnapshotManifest?
+            if let parent {
+                guard let manifest = try self.loadManifestUnlocked(
+                    id: parent.snapshotId,
+                    workspaceId: draft.workspaceID
+                ) else {
+                    throw WorkspaceError.storageCorrupted("checkpoint \(parent.id) has no snapshot")
+                }
+                parentManifest = manifest
+            } else {
+                parentManifest = nil
+            }
+            let snapshotID = UUID()
+            let root = try await self.captureManifestNode(
+                from: filesystem,
+                at: .root,
+                reusing: parentManifest?.root,
+                workspaceId: draft.workspaceID
+            )
+            let manifest = SnapshotManifest(version: 2, id: snapshotID, rootPath: .root, root: root)
+            let beforeIndex = try parentManifest.map {
+                RevisionIndex(
+                    id: $0.id,
+                    root: $0.rootPath,
+                    entry: try self.revisionEntry(from: $0.root, workspaceId: draft.workspaceID)
+                )
+            } ?? RevisionIndex(
+                id: UUID(),
+                root: .root,
+                entry: .missing(path: .root)
+            )
+            let afterIndex = RevisionIndex(
+                id: snapshotID,
+                root: .root,
+                entry: try self.revisionEntry(from: root, workspaceId: draft.workspaceID)
+            )
+            let blobsRoot = self.blobsDirectoryURL(workspaceId: draft.workspaceID)
+            let beforeRoot = parentManifest?.root
+            let changes = try await ChangeSet.compare(
+                before: beforeIndex,
+                after: afterIndex,
+                maxTextBytes: 1_000_000,
+                loadBefore: { path in try Self.loadManifestFile(path, root: beforeRoot, blobsRoot: blobsRoot) },
+                loadAfter: { path in try Self.loadManifestFile(path, root: root, blobsRoot: blobsRoot) }
+            )
+            let checkpoint = Checkpoint.make(
+                snapshotID: snapshotID,
+                draft: draft,
+                parent: parent,
+                summary: changes.summary
+            )
+            try self.write(manifest, to: self.snapshotURL(id: snapshotID, workspaceId: draft.workspaceID))
+            try self.write(
+                checkpoint,
+                to: self.checkpointURL(id: checkpoint.id, workspaceId: draft.workspaceID)
+            )
+            self.listCheckpointsCache[draft.workspaceID] = nil
+            return checkpoint
+        }
     }
 
     private func writeSnapshotUnlocked(_ snapshot: Snapshot, workspaceId: UUID) throws {
@@ -333,6 +405,120 @@ actor FileCheckpointStore: CheckpointStore {
             root: root
         )
         try write(manifest, to: snapshotURL(id: snapshot.id, workspaceId: workspaceId))
+    }
+
+    private func loadManifestUnlocked(id: UUID, workspaceId: UUID) throws -> SnapshotManifest? {
+        let url = snapshotURL(id: id, workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+        guard manifest.id == id else {
+            throw WorkspaceError.storageCorrupted("snapshot manifest id does not match \(id)")
+        }
+        return manifest
+    }
+
+    private func captureManifestNode(
+        from filesystem: any FileSystem,
+        at path: WorkspacePath,
+        reusing previous: SnapshotManifest.Node?,
+        workspaceId: UUID
+    ) async throws -> SnapshotManifest.Node {
+        guard await filesystem.exists(path: path) else {
+            return SnapshotManifest.Node(kind: .missing, path: path)
+        }
+        let info = try await filesystem.stat(path: path)
+        switch info.kind {
+        case .file:
+            if previous?.kind == .file,
+               previous?.contentSize == info.size,
+               previous?.modificationDate != nil,
+               previous?.modificationDate == info.modificationDate,
+               let hash = previous?.contentHash,
+               Self.isValidContentHash(hash),
+               fileManager.fileExists(atPath: blobURL(hash: hash, workspaceId: workspaceId).path) {
+                return SnapshotManifest.Node(
+                    kind: .file,
+                    path: path,
+                    permissions: info.permissions,
+                    contentHash: hash,
+                    contentSize: info.size,
+                    modificationDate: info.modificationDate
+                )
+            }
+            let data = try await filesystem.readFile(path: path)
+            let hash = SHA256.hexDigest(of: data)
+            let blob = blobURL(hash: hash, workspaceId: workspaceId)
+            if !fileManager.fileExists(atPath: blob.path) { try data.write(to: blob, options: .atomic) }
+            return SnapshotManifest.Node(
+                kind: .file,
+                path: path,
+                permissions: info.permissions,
+                contentHash: hash,
+                contentSize: UInt64(data.count),
+                modificationDate: info.modificationDate
+            )
+        case .directory:
+            var previousChildren: [String: SnapshotManifest.Node] = [:]
+            for child in previous?.kind == .directory ? previous?.children ?? [] : [] {
+                guard previousChildren.updateValue(child, forKey: child.path.name) == nil else {
+                    throw WorkspaceError.storageCorrupted(
+                        "snapshot directory \(path) contains duplicate child \(child.path.name)"
+                    )
+                }
+            }
+            var children: [SnapshotManifest.Node] = []
+            for entry in try await filesystem.listDirectory(path: path).sorted(by: { $0.name < $1.name }) {
+                children.append(
+                    try await captureManifestNode(
+                        from: filesystem,
+                        at: path.appending(entry.name),
+                        reusing: previousChildren[entry.name],
+                        workspaceId: workspaceId
+                    )
+                )
+            }
+            return SnapshotManifest.Node(
+                kind: .directory,
+                path: path,
+                permissions: info.permissions,
+                modificationDate: info.modificationDate,
+                children: children
+            )
+        case .symlink:
+            return SnapshotManifest.Node(
+                kind: .symlink,
+                path: path,
+                permissions: info.permissions,
+                modificationDate: info.modificationDate,
+                symlinkTarget: try await filesystem.readSymlink(path: path)
+            )
+        }
+    }
+
+    private static func loadManifestFile(
+        _ path: WorkspacePath,
+        root: SnapshotManifest.Node?,
+        blobsRoot: URL
+    ) throws -> Data {
+        guard let root, let node = manifestNodeStatic(at: path, in: root), node.kind == .file,
+              let hash = node.contentHash, isValidContentHash(hash)
+        else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)) }
+        let url = blobsRoot.appendingPathComponent(hash, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw WorkspaceError.storageCorrupted("missing content blob \(hash) for \(path)")
+        }
+        return try Data(contentsOf: url)
+    }
+
+    private static func manifestNodeStatic(
+        at path: WorkspacePath,
+        in node: SnapshotManifest.Node
+    ) -> SnapshotManifest.Node? {
+        if node.path == path { return node }
+        for child in node.children ?? [] where child.path == path || path.string.hasPrefix(child.path.string + "/") {
+            return manifestNodeStatic(at: path, in: child)
+        }
+        return nil
     }
 
     func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
@@ -1048,6 +1234,21 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
 #if canImport(Darwin) || canImport(Glibc)
+    private func withExclusiveLifecycleLock<R>(
+        at url: URL,
+        _ body: () async throws -> R
+    ) async throws -> R {
+        let path = url.path
+        let fd = open(path, O_RDWR | O_CREAT, 0o644)
+        guard fd >= 0 else { throw LockFileError(message: "could not open lock file at \(path)") }
+        defer { close(fd) }
+        while flock(fd, LOCK_EX) != 0 {
+            if errno != EINTR { throw LockFileError(message: "could not acquire exclusive lock at \(path)") }
+        }
+        defer { flock(fd, LOCK_UN) }
+        return try await body()
+    }
+
     private static func withExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
         try withLock(at: url, operation: LOCK_EX, body)
     }
@@ -1072,6 +1273,14 @@ actor FileCheckpointStore: CheckpointStore {
         return try body()
     }
 #else
+    private func withExclusiveLifecycleLock<R>(
+        at url: URL,
+        _ body: () async throws -> R
+    ) async throws -> R {
+        _ = url
+        return try await body()
+    }
+
     private static func withExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
         try body()
     }

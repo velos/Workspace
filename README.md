@@ -169,6 +169,11 @@ Compaction rebases retained checkpoints to their nearest retained ancestor and r
 
 Directory-backed stores serialize checkpoint commits, revision reads, and compaction with a persistent lifecycle lock. Mutation history is independent and is not pruned by checkpoint retention.
 
+Directory-backed checkpoint capture also reuses existing CAS blobs when a file's size and available
+modification timestamp are unchanged. It still walks directory metadata for correctness, but only
+reads and hashes file contents that appear changed. Filesystems that do not provide modification
+timestamps safely fall back to reading those files.
+
 ## Transactions
 
 Transactions replace separate branch and merge APIs:

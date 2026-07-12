@@ -103,6 +103,26 @@ public struct Checkpoint: Sendable, Codable, Equatable {
         )
     }
 
+    static func make(
+        snapshotID: UUID,
+        draft: CheckpointDraft,
+        parent: Checkpoint?,
+        summary: ChangeSet.Summary
+    ) -> Checkpoint {
+        let previousCursor = parent?.mutationCursor ?? 0
+        return Checkpoint(
+            workspaceId: draft.workspaceID,
+            label: draft.label,
+            parentCheckpointId: parent?.id,
+            origin: draft.origin,
+            firstMutationSequence: draft.mutationCursor > previousCursor ? previousCursor + 1 : nil,
+            lastMutationSequence: draft.mutationCursor > previousCursor ? draft.mutationCursor : nil,
+            mutationCursor: draft.mutationCursor,
+            snapshotId: snapshotID,
+            summary: summary
+        )
+    }
+
     func rebased(to parent: Checkpoint?, snapshot: Snapshot, parentSnapshot: Snapshot?) -> Checkpoint {
         var copy = self
         copy.parentID = parent?.id

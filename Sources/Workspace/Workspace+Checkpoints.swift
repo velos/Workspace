@@ -5,13 +5,21 @@ extension Workspace {
     public func createCheckpoint(label: String? = nil) async throws -> Checkpoint {
         try await ensureLoaded()
         try await reconcileCheckpointsWithStore()
-        let snapshot = try await Snapshot.capture(from: filesystem)
-        return try await persistCheckpoint(
-            snapshot: snapshot,
-            label: label,
-            parentCheckpointId: headCheckpointId,
-            origin: .manual
+        let checkpoint = try await store.captureRevision(
+            from: filesystem,
+            draft: CheckpointDraft(
+                workspaceID: workspaceId,
+                label: label,
+                preferredParentID: headCheckpointId,
+                origin: .manual,
+                mutationCursor: latestMutationSequence()
+            )
         )
+        checkpoints.append(checkpoint)
+        checkpoints.sort(by: checkpointSort)
+        headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
+        emitWorkspaceEvent(.checkpoint(checkpoint))
+        return checkpoint
     }
 
     /// Restores the workspace to a prior checkpoint and records the rollback as a new checkpoint.
