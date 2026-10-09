@@ -78,71 +78,54 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
     /// See ``FileSystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
         let mounts = mountsSnapshot()
-        if let resolved = resolveMounted(path: path, mounts: mounts) {
-            var info = try await resolved.filesystem.stat(path: resolved.relativePath)
-            info.path = path
-            return info
-        }
-
-        if hasSyntheticDirectory(at: path, mounts: mounts) {
-            return FileInfo(
-                path: path,
-                kind: .directory,
-                size: 0,
-                permissions: .defaultDirectory,
-                modificationDate: nil
+        let resolved = resolveWritable(path: path, mounts: mounts)
+        do {
+            return Self.virtualInfo(
+                try await resolved.filesystem.stat(path: resolved.relativePath),
+                at: path
             )
+        } catch {
+            guard Self.isMissing(error),
+                  path.isRoot || !syntheticChildMountNames(under: path, mounts: mounts).isEmpty else { throw error }
+            return Self.syntheticInfo(at: path)
         }
-
-        return try await base.stat(path: path)
     }
 
     /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         let mounts = mountsSnapshot()
-        if let resolved = resolveMounted(path: path, mounts: mounts) {
-            let entries = try await resolved.filesystem.listDirectory(path: resolved.relativePath)
-            return entries.map { entry in
-                DirectoryEntry(
-                    name: entry.name,
-                    info: FileInfo(
-                        path: path.appending(entry.name),
-                        kind: entry.info.kind,
-                        size: entry.info.size,
-                        permissions: entry.info.permissions,
-                        modificationDate: entry.info.modificationDate
-                    )
-                )
-            }
-        }
-
+        let syntheticNames = syntheticChildMountNames(under: path, mounts: mounts)
+        let resolved = resolveWritable(path: path, mounts: mounts)
         var merged: [String: DirectoryEntry] = [:]
-        let baseHasPath = path.isRoot ? true : await base.exists(path: path)
-        if baseHasPath {
-            if let baseEntries = try? await base.listDirectory(path: path) {
-                for entry in baseEntries {
-                    merged[entry.name] = entry
-                }
-            }
-        }
-
-        for syntheticName in syntheticChildMountNames(under: path, mounts: mounts) {
-            merged[syntheticName] = DirectoryEntry(
-                name: syntheticName,
-                info: FileInfo(
-                    path: path.appending(syntheticName),
-                    kind: .directory,
-                    size: 0,
-                    permissions: .defaultDirectory,
-                    modificationDate: nil
+        do {
+            for entry in try await resolved.filesystem.listDirectory(path: resolved.relativePath) {
+                merged[entry.name] = DirectoryEntry(
+                    name: entry.name,
+                    info: Self.virtualInfo(entry.info, at: path.appending(entry.name))
                 )
-            )
+            }
+        } catch {
+            let nsError = error as NSError
+            guard Self.isMissing(error)
+                    || (nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(ENOTDIR)) else { throw error }
+            guard path.isRoot || !syntheticNames.isEmpty else { throw error }
+            let listingError = error
+            var missing = false
+            do {
+                _ = try await resolved.filesystem.stat(path: resolved.relativePath)
+            } catch {
+                guard Self.isMissing(error) else { throw listingError }
+                missing = true
+            }
+            guard missing else { throw listingError }
         }
 
-        if merged.isEmpty, !hasSyntheticDirectory(at: path, mounts: mounts) {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+        for name in syntheticNames {
+            let child = path.appending(name)
+            // Actual mounts shadow entries. Synthetic ancestors use backend metadata if
+            // present, keeping traversal consistent with stat (including regular files).
+            merged[name] = DirectoryEntry(name: name, info: try await stat(path: child))
         }
-
         return merged.values.sorted { $0.name < $1.name }
     }
 
@@ -297,16 +280,19 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
         return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, String(real.string.dropFirst()))
     }
 
+    // Used only when a symlink target or suffix is missing. Resolve inside the selected
+    // backend before translating back; raw absolute targets are never outer virtual paths.
+    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
+        let real = try await FileSystemPathResolver(base: resolved.filesystem).resolve(
+            resolved.relativePath, features: await resolved.filesystem.capabilities(), followFinal: true
+        )
+        return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, String(real.string.dropFirst()))
+    }
+
     /// See ``FileSystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
-        let mounts = mountsSnapshot()
-        if let resolved = resolveMounted(path: path, mounts: mounts) {
-            return await resolved.filesystem.exists(path: resolved.relativePath)
-        }
-        if hasSyntheticDirectory(at: path, mounts: mounts) {
-            return true
-        }
-        return await base.exists(path: path)
+        (try? await stat(path: path)) != nil
     }
 
     /// See ``FileSystem/glob(pattern:currentDirectory:)``.
@@ -383,9 +369,21 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
         return Array(Set(paths))
     }
 
-    private func hasSyntheticDirectory(at path: WorkspacePath, mounts: [Mount]) -> Bool {
-        path.isRoot || mounts.contains { parentPath(of: $0.mountPoint) == path }
-            || syntheticChildMountNames(under: path, mounts: mounts).isEmpty == false
+    private static func virtualInfo(_ info: FileInfo, at path: WorkspacePath) -> FileInfo {
+        var adjusted = info
+        adjusted.path = path
+        return adjusted
+    }
+
+    private static func syntheticInfo(at path: WorkspacePath) -> FileInfo {
+        FileInfo(path: path, kind: .directory, size: 0, permissions: .defaultDirectory, modificationDate: nil)
+    }
+
+    private static func isMissing(_ error: Error) -> Bool {
+        let error = error as NSError
+        return (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
+            || (error.domain == NSCocoaErrorDomain
+                && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code))
     }
 
     private func syntheticChildMountNames(under path: WorkspacePath, mounts: [Mount]) -> [String] {
@@ -403,10 +401,6 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
             }
         }
         return names.sorted()
-    }
-
-    private func parentPath(of path: WorkspacePath) -> WorkspacePath {
-        path.dirname
     }
 
     private func isPath(_ candidate: WorkspacePath, inside parent: WorkspacePath) -> Bool {

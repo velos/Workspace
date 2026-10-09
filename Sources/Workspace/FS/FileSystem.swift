@@ -84,6 +84,12 @@ public struct FileInfo: Sendable, Codable {
     public var permissions: POSIXPermissions
     /// The last modification timestamp when available.
     public var modificationDate: Date?
+    /// Identity shared by aliases, when the backend supplies it. It must distinguish
+    /// different entries across backend instances and agree for the same underlying entry.
+    public var identity: FileIdentity?
+    /// Number of hard links to this entry, when known. One rules out additional hard links;
+    /// mounts may still expose the same entry at several virtual paths.
+    public var linkCount: UInt64?
 
     /// Creates metadata for a filesystem entry.
     public init(
@@ -91,13 +97,31 @@ public struct FileInfo: Sendable, Codable {
         kind: FileTree.Kind,
         size: UInt64,
         permissions: POSIXPermissions,
-        modificationDate: Date?
+        modificationDate: Date?,
+        identity: FileIdentity? = nil,
+        linkCount: UInt64? = nil
     ) {
         self.path = path
         self.kind = kind
         self.size = size
         self.permissions = permissions
         self.modificationDate = modificationDate
+        self.identity = identity
+        self.linkCount = linkCount
+    }
+}
+
+/// Opaque identity of a filesystem entry, shared by aliases across backend instances.
+/// Device and inode values must distinguish different entries across instances and remain
+/// stable during an entry's lifetime; replacements receive a new identity. Independent
+/// in-memory backends need distinct device tokens; disk backends can use st_dev and st_ino.
+public struct FileIdentity: Hashable, Sendable, Codable {
+    private let device: UInt64
+    private let inode: UInt64
+
+    public init(device: UInt64, inode: UInt64) {
+        self.device = device
+        self.inode = inode
     }
 }
 
@@ -134,6 +158,10 @@ public struct FileSystemFeatures: OptionSet, Sendable {
     public static let permissions = FileSystemFeatures(rawValue: 1 << 2)
     /// ``FileSystem/resolveRealPath(path:)`` resolves symlink chains.
     public static let realPathResolution = FileSystemFeatures(rawValue: 1 << 3)
+    /// Non-appending writes follow the final symlink instead of replacing the link itself.
+    /// Composing backends intersect this feature, so a mixed filesystem uses conservative
+    /// byte accounting where the flag is absent. Appends follow existing final symlinks.
+    public static let replacementFollowsFinalSymlink = FileSystemFeatures(rawValue: 1 << 4)
 }
 
 /// The low-level interface implemented by workspace storage backends.
@@ -144,7 +172,8 @@ public protocol FileSystem: AnyObject, Sendable {
     func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry]
     /// Reads the file contents at `path`.
     func readFile(path: WorkspacePath) async throws -> Data
-    /// Returns whether an entry exists at `path`.
+    /// Returns whether an entry exists at `path`, using lstat semantics: intermediate
+    /// symlinks are followed, but the final symlink itself exists even when its target does not.
     func exists(path: WorkspacePath) async -> Bool
     /// Expands a glob pattern relative to `currentDirectory`.
     func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath]

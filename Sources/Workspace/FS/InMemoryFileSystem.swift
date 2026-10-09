@@ -21,11 +21,14 @@ public actor InMemoryFileSystem: FileSystem {
             case symlink(String)
         }
 
+        let inode: UInt64
+        var linkCount: UInt64 = 1
         var kind: Kind
         var permissions: Int
         var modificationDate: Date
 
-        init(kind: Kind, permissions: Int, modificationDate: Date = Date()) {
+        init(inode: UInt64, kind: Kind, permissions: Int, modificationDate: Date = Date()) {
+            self.inode = inode
             self.kind = kind
             self.permissions = permissions
             self.modificationDate = modificationDate
@@ -55,40 +58,26 @@ public actor InMemoryFileSystem: FileSystem {
                 return 0
             }
         }
-
-        func clone() -> Node {
-            switch kind {
-            case let .file(data):
-                return Node(kind: .file(data), permissions: permissions, modificationDate: modificationDate)
-            case let .symlink(target):
-                return Node(kind: .symlink(target), permissions: permissions, modificationDate: modificationDate)
-            case let .directory(children):
-                var copiedChildren: [String: Node] = [:]
-                copiedChildren.reserveCapacity(children.count)
-                for (name, child) in children {
-                    copiedChildren[name] = child.clone()
-                }
-                return Node(kind: .directory(copiedChildren), permissions: permissions, modificationDate: modificationDate)
-            }
-        }
     }
 
     private var root: Node
+    private let device = UInt64.random(in: 1...UInt64.max)
+    private var nextInode: UInt64 = 1
 
     /// Creates an empty in-memory filesystem rooted at `/`.
     public init() {
-        root = Node(kind: .directory([:]), permissions: 0o755)
+        root = Node(inode: 0, kind: .directory([:]), permissions: 0o755)
     }
 
     /// See ``FileSystem/configure(rootDirectory:)``.
     func configure(rootDirectory: URL) async throws {
         _ = rootDirectory
-        root = Node(kind: .directory([:]), permissions: 0o755)
+        root = makeNode(kind: .directory([:]), permissions: 0o755)
     }
 
     /// Clears the filesystem and recreates an empty root directory.
     public func reset() {
-        root = Node(kind: .directory([:]), permissions: 0o755)
+        root = makeNode(kind: .directory([:]), permissions: 0o755)
     }
 
     /// See ``FileSystem/stat(path:)``.
@@ -127,7 +116,7 @@ public actor InMemoryFileSystem: FileSystem {
 
     /// See ``FileSystem/capabilities()``.
     public func capabilities() async -> FileSystemFeatures {
-        [.symlinks, .hardLinks, .permissions, .realPathResolution]
+        [.symlinks, .hardLinks, .permissions, .realPathResolution, .replacementFollowsFinalSymlink]
     }
 
     /// See ``FileSystem/createFile(path:data:)``. Actor isolation makes the existence check and
@@ -158,6 +147,10 @@ public actor InMemoryFileSystem: FileSystem {
         let (parent, name) = try parentDirectoryAndName(for: writePath)
         var children = try directoryChildren(of: parent)
 
+        if children[name]?.isDirectory == true {
+            throw posixError(EISDIR)
+        }
+
         if append,
            let existing = children[name],
            case let .file(existingData) = existing.kind {
@@ -165,7 +158,8 @@ public actor InMemoryFileSystem: FileSystem {
             existing.modificationDate = Date()
             children[name] = existing
         } else {
-            let node = Node(kind: .file(data), permissions: 0o644)
+            if let existing = children[name] { unlink(existing) }
+            let node = makeNode(kind: .file(data), permissions: 0o644)
             children[name] = node
         }
 
@@ -201,7 +195,7 @@ public actor InMemoryFileSystem: FileSystem {
                     throw posixError(ENOENT)
                 }
 
-                let directory = Node(kind: .directory([:]), permissions: 0o755)
+                let directory = makeNode(kind: .directory([:]), permissions: 0o755)
                 children[component] = directory
                 current.kind = .directory(children)
                 current.modificationDate = Date()
@@ -226,6 +220,7 @@ public actor InMemoryFileSystem: FileSystem {
 
         var parentChildren = try directoryChildren(of: parent)
         parentChildren.removeValue(forKey: name)
+        unlink(entry)
         parent.kind = .directory(parentChildren)
         parent.modificationDate = Date()
     }
@@ -289,7 +284,7 @@ public actor InMemoryFileSystem: FileSystem {
             throw posixError(EEXIST)
         }
 
-        destinationChildren[destinationName] = sourceNode.clone()
+        destinationChildren[destinationName] = clone(sourceNode)
         destinationParent.kind = .directory(destinationChildren)
         destinationParent.modificationDate = Date()
     }
@@ -307,7 +302,7 @@ public actor InMemoryFileSystem: FileSystem {
             throw posixError(EEXIST)
         }
 
-        children[name] = Node(kind: .symlink(target), permissions: 0o777)
+        children[name] = makeNode(kind: .symlink(target), permissions: 0o777)
         parent.kind = .directory(children)
         parent.modificationDate = Date()
     }
@@ -329,6 +324,7 @@ public actor InMemoryFileSystem: FileSystem {
             throw posixError(EEXIST)
         }
 
+        sourceNode.linkCount += 1
         children[name] = sourceNode
         parent.kind = .directory(children)
         parent.modificationDate = Date()
@@ -357,10 +353,10 @@ public actor InMemoryFileSystem: FileSystem {
         try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0)
     }
 
-    /// See ``FileSystem/exists(path:)``.
+    /// Returns entry existence without following the final symlink (lstat semantics).
     public func exists(path: WorkspacePath) async -> Bool {
         do {
-            _ = try node(at: path, followFinalSymlink: true)
+            _ = try node(at: path, followFinalSymlink: false)
             return true
         } catch {
             return false
@@ -373,7 +369,7 @@ public actor InMemoryFileSystem: FileSystem {
         if !WorkspacePath.containsGlob(normalizedPattern.string) {
             let exists: Bool = {
                 do {
-                    _ = try node(at: normalizedPattern, followFinalSymlink: true)
+                    _ = try node(at: normalizedPattern, followFinalSymlink: false)
                     return true
                 } catch {
                     return false
@@ -391,6 +387,29 @@ public actor InMemoryFileSystem: FileSystem {
         }
 
         return matches.sorted()
+    }
+
+    private func makeNode(kind: Node.Kind, permissions: Int, modificationDate: Date = Date()) -> Node {
+        let inode = nextInode
+        nextInode += 1
+        return Node(inode: inode, kind: kind, permissions: permissions, modificationDate: modificationDate)
+    }
+
+    private func clone(_ node: Node) -> Node {
+        let kind: Node.Kind
+        switch node.kind {
+        case let .file(data): kind = .file(data)
+        case let .symlink(target): kind = .symlink(target)
+        case let .directory(children): kind = .directory(children.mapValues { clone($0) })
+        }
+        return makeNode(kind: kind, permissions: node.permissions, modificationDate: node.modificationDate)
+    }
+
+    private func unlink(_ node: Node) {
+        if case let .directory(children) = node.kind {
+            for child in children.values { unlink(child) }
+        }
+        node.linkCount -= 1
     }
 
     private func allVirtualPaths() -> [WorkspacePath] {
@@ -427,7 +446,9 @@ public actor InMemoryFileSystem: FileSystem {
             kind: fileKind(for: node),
             size: node.size,
             permissions: POSIXPermissions(node.permissions),
-            modificationDate: node.modificationDate
+            modificationDate: node.modificationDate,
+            identity: FileIdentity(device: device, inode: node.inode),
+            linkCount: node.isDirectory ? nil : node.linkCount
         )
     }
 
