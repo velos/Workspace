@@ -203,6 +203,15 @@ if !commit.applied {
 }
 ```
 
+Transaction commits follow these rules:
+
+- Three-way merging accepts a change made by only one side, coalesces identical changes, and reports divergent changes to the same node as conflicts.
+- A directory removed or replaced on one side while the other creates or modifies something beneath it is a `.structural` conflict at the outermost removed or replaced directory. Descendant deletions converge with ancestor removal. Directory mode changes and child edits merge.
+- Strict mode rejects any parent change, including root-directory metadata.
+- Moves are delete-plus-create operations. Moving the same source to different destinations keeps both copies.
+- During `commit()`, edits and `discard()` throw `TransactionError.committing`; read-only draft calls remain available. Another commit also throws `.committing`.
+- A rollback failure permanently closes the transaction. Failures that leave the parent unchanged allow retry.
+
 Manual conflicted transactions remain active. The scoped convenience commits on success and discards on failure or conflict:
 
 ```swift

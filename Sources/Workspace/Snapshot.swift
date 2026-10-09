@@ -153,6 +153,26 @@ extension Snapshot {
         return false
     }
 
+    static func isPermissionDenied(_ error: any Error) -> Bool {
+        if let posix = error as? POSIXError, posix.code == .EACCES || posix.code == .EPERM {
+            return true
+        }
+        let error = error as NSError
+        if error.domain == NSPOSIXErrorDomain,
+           error.code == POSIXError.Code.EACCES.rawValue || error.code == POSIXError.Code.EPERM.rawValue {
+            return true
+        }
+        if error.domain == NSCocoaErrorDomain,
+           error.code == CocoaError.fileReadNoPermission.rawValue || error.code == CocoaError.fileWriteNoPermission.rawValue {
+            return true
+        }
+        // corelibs Foundation may store a Swift Error rather than an NSError.
+        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? any Error {
+            return isPermissionDenied(underlying)
+        }
+        return false
+    }
+
     private static func captureEntry(from target: any FileSystem, at path: WorkspacePath) async throws -> Entry {
         guard let info = try await infoIfPresent(at: path, on: target) else {
             return .missing(.init(path: path))
@@ -197,7 +217,7 @@ extension Snapshot {
                 if info.kind == .file {
                     rewriteRequired = try await target.readFile(path: file.path) != file.data
                 } else {
-                    try await target.remove(path: file.path, recursive: true)
+                    try await removeRecursively(at: file.path, on: target)
                     rewriteRequired = true
                 }
             } else {
@@ -216,7 +236,7 @@ extension Snapshot {
                 if info.kind == .symlink, try await target.readSymlink(path: symlink.path) == symlink.target {
                     rewriteRequired = false
                 } else {
-                    try await target.remove(path: symlink.path, recursive: true)
+                    try await removeRecursively(at: symlink.path, on: target)
                 }
             }
 
@@ -224,9 +244,10 @@ extension Snapshot {
                 try await target.createSymlink(path: symlink.path, target: symlink.target)
             }
         case let .directory(directory):
-            try await ensureDirectory(at: directory.path, permissions: directory.permissions, on: target)
-            try await syncChildren(directory.children, under: directory.path, on: target)
-            try await setPermissionsIfNeeded(directory.permissions, at: directory.path, on: target)
+            try await ensureDirectory(at: directory.path, on: target)
+            try await syncDirectoryChildren(
+                directory.children, under: directory.path, finalPermissions: directory.permissions, on: target
+            )
         }
     }
 
@@ -253,7 +274,6 @@ extension Snapshot {
 
     private static func ensureDirectory(
         at path: WorkspacePath,
-        permissions: POSIXPermissions,
         on target: any FileSystem
     ) async throws {
         if let info = try await infoIfPresent(at: path, on: target) {
@@ -268,6 +288,46 @@ extension Snapshot {
         }
     }
 
+    /// Most backends need no mode adjustment. Retry only a real permission denial,
+    /// and preserve the original mode on failure after granting temporary access.
+    private static func syncDirectoryChildren(
+        _ children: [Entry],
+        under path: WorkspacePath,
+        finalPermissions: POSIXPermissions? = nil,
+        on target: any FileSystem
+    ) async throws {
+        do {
+            try await syncChildren(children, under: path, on: target)
+        } catch let deniedError {
+            guard isPermissionDenied(deniedError) else { throw deniedError }
+            let original = try await target.stat(path: path).permissions
+            let working = POSIXPermissions(rawValue: original.rawValue | 0o700)
+            guard working != original else { throw deniedError }
+            do {
+                try await target.setPermissions(path: path, permissions: working)
+            } catch {
+                // The original denial explains the failure better than a refused grant.
+                throw deniedError
+            }
+            do {
+                // Synchronization is idempotent even if the first attempt made progress.
+                try await syncChildren(children, under: path, on: target)
+                try await setPermissionsIfNeeded(finalPermissions ?? original, at: path, on: target)
+            } catch {
+                do {
+                    try await setPermissionsIfNeeded(original, at: path, on: target)
+                } catch let cleanupError {
+                    throw WorkspaceRollbackError(originalError: error, rollbackError: cleanupError)
+                }
+                throw error
+            }
+            return
+        }
+        if let finalPermissions {
+            try await setPermissionsIfNeeded(finalPermissions, at: path, on: target)
+        }
+    }
+
     private static func syncChildren(
         _ expectedChildren: [Entry],
         under parentPath: WorkspacePath,
@@ -277,7 +337,7 @@ extension Snapshot {
         let existingEntries = try await target.listDirectory(path: parentPath)
 
         for entry in existingEntries where !expectedNames.contains(entry.name) {
-            try await target.remove(path: parentPath.appending(entry.name), recursive: true)
+            try await removeRecursively(at: parentPath.appending(entry.name), on: target)
         }
 
         for child in expectedChildren.sorted(by: { $0.path < $1.path }) {
@@ -285,24 +345,26 @@ extension Snapshot {
         }
     }
 
+    private static func removeRecursively(at path: WorkspacePath, on target: any FileSystem) async throws {
+        do {
+            try await target.remove(path: path, recursive: true)
+        } catch {
+            guard isPermissionDenied(error) else { throw error }
+            // The failure may come from a restrictive descendant, rather than
+            // this directory. Each directory grants access only after its own
+            // child synchronization fails, and restores its mode before removal.
+            try await removeEntryIfPresent(at: path, on: target)
+        }
+    }
+
     private static func removeEntryIfPresent(at path: WorkspacePath, on target: any FileSystem) async throws {
         guard let info = try await infoIfPresent(at: path, on: target) else { return }
-
-        if path.isRoot {
-            let existingEntries = try await target.listDirectory(path: path)
-            for entry in existingEntries {
-                try await target.remove(path: path.appending(entry.name), recursive: true)
-            }
-            return
-        }
-
         if info.kind == .directory {
-            let existingEntries = try await target.listDirectory(path: path)
-            for entry in existingEntries {
-                try await target.remove(path: path.appending(entry.name), recursive: true)
-            }
+            try await syncDirectoryChildren([], under: path, on: target)
         }
-        try await target.remove(path: path, recursive: true)
+        if !path.isRoot {
+            try await target.remove(path: path, recursive: true)
+        }
     }
 }
 

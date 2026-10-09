@@ -6,7 +6,7 @@ import Testing
 struct EditAtomicityTests {
     @Test
     func `single write does not read unrelated files`() async throws {
-        let fs = EditTestFileSystem()
+        let fs = HookableFileSystem()
         try await fs.base.writeFile(path: "/unrelated", data: Data("unrelated".utf8), append: false)
         let workspace = Workspace(fileSystem: fs)
         try await workspace.writeText("/changed", "new")
@@ -26,10 +26,10 @@ struct EditAtomicityTests {
 
     @Test
     func `rollback works without optional permissions support`() async throws {
-        let fs = EditTestFileSystem()
+        let fs = HookableFileSystem()
         try await fs.base.writeFile(path: "/a", data: Data("old".utf8), append: false)
         let workspace = Workspace(fileSystem: fs)
-        await #expect(throws: EditTestError.self) {
+        await #expect(throws: TestFileSystemError.self) {
             try await workspace.apply([.writeText("/a", "new"), .writeText("/fail", "fail")])
         }
         #expect(try await workspace.readText("/a") == "old")
@@ -62,14 +62,14 @@ struct EditAtomicityTests {
         let root = try TestSupport.temporaryDirectory()
         defer { TestSupport.remove(root) }
         let local = try LocalFileSystem(root: root)
-        let fs = EditTestFileSystem(base: local)
+        let fs = HookableFileSystem(base: local)
         await fs.onWrite { path in
             if path == "/a" {
                 try Data("external".utf8).write(to: root.appendingPathComponent("external"))
             }
         }
         let workspace = Workspace(fileSystem: fs)
-        await #expect(throws: EditTestError.self) {
+        await #expect(throws: TestFileSystemError.self) {
             try await workspace.apply([.writeText("/a", "new"), .writeText("/fail", "fail")])
         }
         #expect(try await local.readFile(path: "/external") == Data("external".utf8))
@@ -82,7 +82,7 @@ struct EditAtomicityTests {
         defer { TestSupport.remove(root) }
         let storeURL = root.appendingPathComponent("file")
         try Data().write(to: storeURL)
-        let fs = EditTestFileSystem()
+        let fs = HookableFileSystem()
         let workspace = Workspace(fileSystem: fs, persistence: .directory(storeURL))
         await #expect(throws: (any Error).self) { try await workspace.writeText("/a", "new") }
         #expect(await fs.writes.isEmpty)
@@ -91,7 +91,7 @@ struct EditAtomicityTests {
 
     @Test
     func `wrapped access denial during capture is never treated as absence`() async throws {
-        let fs = EditTestFileSystem()
+        let fs = HookableFileSystem()
         try await fs.base.writeFile(path: "/a", data: Data("original".utf8), append: false)
         let denial = NSError(
             domain: NSCocoaErrorDomain,
@@ -107,29 +107,29 @@ struct EditAtomicityTests {
 
     @Test
     func `post mutation capture failure rolls back`() async throws {
-        let fs = EditTestFileSystem()
+        let fs = HookableFileSystem()
         try await fs.base.writeFile(path: "/a", data: Data("old".utf8), append: false)
         await fs.onWrite { path in if path == "/a" { await fs.failNextRead() } }
         let workspace = Workspace(fileSystem: fs)
-        await #expect(throws: EditTestError.self) { try await workspace.writeText("/a", "new") }
+        await #expect(throws: TestFileSystemError.self) { try await workspace.writeText("/a", "new") }
         #expect(try await workspace.readText("/a") == "old")
         #expect(try await workspace.history().isEmpty)
     }
 
     @Test
     func `concurrent successful edit survives atomic rollback with consistent history and events`() async throws {
-        let fs = EditTestFileSystem()
+        let fs = HookableFileSystem()
         try await fs.base.writeFile(path: "/a", data: Data("original".utf8), append: false)
         let workspace = Workspace(fileSystem: fs)
         let events = await workspace.events()
-        let entered = EditSignal()
-        let resume = EditSignal()
+        let entered = TestSignal()
+        let resume = TestSignal()
         await fs.onWrite { _ in
             await entered.signal()
             await resume.wait()
         }
         let failing = Task {
-            await #expect(throws: EditTestError.self) {
+            await #expect(throws: TestFileSystemError.self) {
                 try await workspace.apply([.writeText("/a", "temporary"), .writeText("/fail", "fail")])
             }
         }
@@ -228,7 +228,7 @@ struct EditAtomicityTests {
 
     @Test(arguments: [EditOperation.transaction, .checkpoint, .archive])
     func `parent restoration serializes against concurrent apply`(operation: EditOperation) async throws {
-        let fs = EditTestFileSystem()
+        let fs = HookableFileSystem()
         let workspace = Workspace(fileSystem: fs)
         try await workspace.writeText("/a", "target")
         let checkpoint = try await workspace.createCheckpoint()
@@ -237,8 +237,8 @@ struct EditAtomicityTests {
         let transaction = try await workspace.beginTransaction()
         try await transaction.writeText("/a", "target")
         let events = await workspace.events(.init(includeCheckpoints: false))
-        let entered = EditSignal()
-        let resume = EditSignal()
+        let entered = TestSignal()
+        let resume = TestSignal()
         await fs.onWrite { _ in
             await entered.signal()
             await resume.wait()
@@ -322,15 +322,15 @@ struct EditAtomicityTests {
 
     @Test
     func `rollback failure carries both errors`() async throws {
-        let fs = EditTestFileSystem()
+        let fs = HookableFileSystem()
         await fs.failRemovals()
         let workspace = Workspace(fileSystem: fs)
         do {
             try await workspace.apply([.writeText("/a", "new"), .writeText("/fail", "fail")])
             Issue.record("expected rollback failure")
         } catch let error as WorkspaceRollbackError {
-            #expect(error.originalError is EditTestError)
-            #expect(error.rollbackError is EditTestError)
+            #expect(error.originalError is TestFileSystemError)
+            #expect(error.rollbackError is TestFileSystemError)
             #expect(error.description == "injected; restoring the previous state also failed: injected")
         }
     }
@@ -338,69 +338,6 @@ struct EditAtomicityTests {
 
 enum EditOperation: CaseIterable, Sendable {
     case edit, archive, checkpoint, transaction
-}
-
-private enum EditTestError: Error { case injected }
-
-private actor EditTestFileSystem: FileSystem {
-    let base: any FileSystem
-    var reads: [WorkspacePath] = []
-    var writes: [WorkspacePath] = []
-    private var writeHook: (@Sendable (WorkspacePath) async throws -> Void)?
-    private var readFailure = false
-    private var statError: NSError?
-    func failStat(_ error: NSError) { statError = error }
-    private var removeFailure = false
-    func failRemovals() { removeFailure = true }
-
-    init(base: any FileSystem = InMemoryFileSystem()) { self.base = base }
-    func onWrite(_ hook: @escaping @Sendable (WorkspacePath) async throws -> Void) { writeHook = hook }
-    func failNextRead() { readFailure = true }
-    func stat(path: WorkspacePath) async throws -> FileInfo {
-        if let statError { throw statError }
-        return try await base.stat(path: path)
-    }
-    func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] { try await base.listDirectory(path: path) }
-    func exists(path: WorkspacePath) async -> Bool { await base.exists(path: path) }
-    func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
-        try await base.glob(pattern: pattern, currentDirectory: currentDirectory)
-    }
-    func readFile(path: WorkspacePath) async throws -> Data {
-        reads.append(path)
-        if readFailure { readFailure = false; throw EditTestError.injected }
-        return try await base.readFile(path: path)
-    }
-    func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
-        writes.append(path)
-        let hook = writeHook
-        writeHook = nil
-        try await hook?(path)
-        if path == "/fail" { throw EditTestError.injected }
-        try await base.writeFile(path: path, data: data, append: append)
-    }
-    func createDirectory(path: WorkspacePath, recursive: Bool) async throws { try await base.createDirectory(path: path, recursive: recursive) }
-    func remove(path: WorkspacePath, recursive: Bool) async throws {
-        if removeFailure { throw EditTestError.injected }
-        try await base.remove(path: path, recursive: recursive)
-    }
-    func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws { try await base.move(from: sourcePath, to: destinationPath) }
-    func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws {
-        try await base.copy(from: sourcePath, to: destinationPath, recursive: recursive)
-    }
-}
-
-private actor EditSignal {
-    private var signaled = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-    func wait() async {
-        if signaled { return }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-    func signal() {
-        signaled = true
-        for waiter in waiters { waiter.resume() }
-        waiters.removeAll()
-    }
 }
 
 func nextEditEvent(

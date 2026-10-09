@@ -29,46 +29,66 @@ extension Workspace {
         }
     }
 
-    static func buildEntryTree(
-        from nodes: [WorkspacePath: MergeNode],
-        rootPermissions: POSIXPermissions
-    ) -> Snapshot.Entry {
-        var childNames: [WorkspacePath: [String]] = [:]
-        for path in nodes.keys {
-            childNames[path.parent, default: []].append(path.name)
+    /// Report only the outermost removed/replaced directory for each surviving
+    /// descendant change. Descendant deletions converge with ancestor removal.
+    static func structuralMergeConflicts(
+        base: [WorkspacePath: MergeNode],
+        parent: [WorkspacePath: MergeNode],
+        draft: [WorkspacePath: MergeNode]
+    ) -> Set<WorkspacePath> {
+        var conflicts: Set<WorkspacePath> = []
+        let paths = Set(base.keys).union(parent.keys).union(draft.keys)
+        for path in paths where parent[path] != base[path] || draft[path] != base[path] {
+            var ancestor = path
+            var outermost: WorkspacePath?
+            while !ancestor.isRoot {
+                ancestor = ancestor.parent
+                let parentReplaced = base[ancestor]?.kind == .directory
+                    && parent[ancestor]?.kind != .directory && draft[ancestor]?.kind == .directory
+                let draftReplaced = base[ancestor]?.kind == .directory
+                    && draft[ancestor]?.kind != .directory && parent[ancestor]?.kind == .directory
+                if (parentReplaced && draft[path] != nil && draft[path] != base[path])
+                    || (draftReplaced && parent[path] != nil && parent[path] != base[path]) {
+                    outermost = ancestor
+                }
+            }
+            if let outermost { conflicts.insert(outermost) }
+        }
+        return conflicts
+    }
+
+    static func buildEntryTree(from nodes: [WorkspacePath: MergeNode]) throws -> Snapshot.Entry {
+        guard let root = nodes[.root], root.kind == .directory else {
+            throw WorkspaceError.mutationFailed("merged tree must have a directory root")
+        }
+        var childNames: [WorkspacePath: [(String, MergeNode)]] = [:]
+        for (path, node) in nodes where !path.isRoot {
+            // Checking every immediate parent proves the full ancestry inductively,
+            // since WorkspacePath parents strictly shorten toward the validated root.
+            guard nodes[path.parent]?.kind == .directory else {
+                throw WorkspaceError.mutationFailed("merged node \(path) has no directory parent")
+            }
+            childNames[path.parent, default: []].append((path.name, node))
         }
 
-        func subtree(at path: WorkspacePath, node: MergeNode?) -> Snapshot.Entry {
-            switch node?.kind ?? .directory {
+        func subtree(at path: WorkspacePath, node: MergeNode) -> Snapshot.Entry {
+            switch node.kind {
             case .file:
-                return .file(
-                    .init(
-                        path: path,
-                        data: node?.fileData ?? Data(),
-                        permissions: node?.permissions ?? .defaultFile
-                    )
-                )
+                return .file(.init(path: path, data: node.fileData ?? Data(), permissions: node.permissions))
             case .symlink:
-                return .symlink(
-                    .init(
-                        path: path,
-                        target: node?.symlinkTarget ?? "",
-                        permissions: node?.permissions ?? POSIXPermissions(0o777)
-                    )
-                )
+                return .symlink(.init(path: path, target: node.symlinkTarget ?? "", permissions: node.permissions))
             case .directory:
                 return .directory(
                     .init(
                         path: path,
-                        permissions: node?.permissions ?? .defaultDirectory,
-                        children: (childNames[path] ?? []).sorted().map { name in
-                            let child = path.appending(name)
-                            return subtree(at: child, node: nodes[child])
+                        permissions: node.permissions,
+                        children: (childNames[path] ?? []).sorted { $0.0 < $1.0 }.map { name, child in
+                            subtree(at: path.appending(name), node: child)
                         }
                     )
                 )
             }
         }
-        return subtree(at: .root, node: MergeNode(kind: .directory, permissions: rootPermissions))
+        return subtree(at: .root, node: root)
     }
 }
