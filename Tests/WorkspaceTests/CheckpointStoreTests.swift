@@ -15,6 +15,8 @@ struct CheckpointStoreTests {
         let retracted = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/b"))
         try await store.removeMutation(sequence: retracted.sequence, workspaceId: id)
         if diskBacked { store = FileCheckpointStore(rootDirectory: root) }
+        let afterRetraction = try await store.captureRevision(from: InMemoryFileSystem(), draft: Self.sampleDraft(workspaceID: id))
+        #expect(afterRetraction.mutationCursor == 2)
         let next = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/c"))
         let assigned: [Int] = [first.sequence, retracted.sequence, next.sequence]
         #expect(assigned == [1, 2, 3])
@@ -22,10 +24,42 @@ struct CheckpointStoreTests {
         try await store.removeMutation(sequence: first.sequence, workspaceId: id)
         try await store.removeMutation(sequence: next.sequence, workspaceId: id)
         if diskBacked { store = FileCheckpointStore(rootDirectory: root) }
+        let emptyCheckpoint = try await store.saveRevision(Self.sampleSnapshot(), draft: Self.sampleDraft(workspaceID: id))
+        #expect(emptyCheckpoint.mutationCursor == 3)
+        let emptyCapture = try await store.captureRevision(from: InMemoryFileSystem(), draft: Self.sampleDraft(workspaceID: id))
+        #expect(emptyCapture.mutationCursor == 3)
         let afterEmpty = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/d"))
         #expect(afterEmpty.sequence == 4)
         let other = try await store.appendMutation(Self.sampleMutation(workspaceID: UUID(), path: "/a"))
         #expect(other.sequence == 1)
+    }
+
+    @Test(arguments: [false, true])
+    func `legacy sequence sidecars and reserved torn appends preserve the cursor`(legacySidecar: Bool) async throws {
+        let root = try TestSupport.temporaryDirectory("SequenceSidecar")
+        defer { TestSupport.remove(root) }
+        let id = UUID()
+        let store = FileCheckpointStore(rootDirectory: root)
+        try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/a"))
+        let directory = root.appendingPathComponent(id.uuidString)
+        let sidecar = directory.appendingPathComponent("mutations.sequence.json")
+        // Simulate a reserved sequence whose append failed mid-UTF8; old stores wrote an Int.
+        let state = legacySidecar ? "7" : #"{"highWaterMark":7,"retractionEpoch":3}"#
+        try Data(state.utf8).write(to: sidecar)
+        let log = directory.appendingPathComponent("mutations.jsonl")
+        let handle = try FileHandle(forWritingTo: log)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data([0x7B, 0x22, 0xE2, 0x82]))
+        try handle.close()
+        let checkpoint = try await store.captureRevision(from: InMemoryFileSystem(), draft: Self.sampleDraft(workspaceID: id))
+        #expect(checkpoint.mutationCursor == 7)
+        #expect(try Data(contentsOf: log).last == UInt8(ascii: "\n"))
+        try await store.removeMutation(sequence: 1, workspaceId: id)
+        let page = try await store.listMutations(workspaceId: id, afterSequence: 0)
+        #expect(page.records.isEmpty)
+        #expect(page.retractionEpoch == (legacySidecar ? 1 : 4))
+        let next = try await FileCheckpointStore(rootDirectory: root).appendMutation(Self.sampleMutation(workspaceID: id, path: "/next"))
+        #expect(next.sequence == 8)
     }
 
     @Test
@@ -131,6 +165,42 @@ struct CheckpointStoreTests {
     }
 
     @Test
+    func `incremental mutation reads cross byte chunks and tolerate only a torn tail`() async throws {
+        let root = try TestSupport.temporaryDirectory("StoreIncremental")
+        defer { TestSupport.remove(root) }
+        let workspaceID = UUID()
+        let store = FileCheckpointStore(rootDirectory: root)
+        for index in 1...5 {
+            // A record longer than the backward-read chunk, with multibyte characters spanning
+            // chunk boundaries. No filesystem entry is created for this recorded path.
+            let path = index == 3 ? "/" + String(repeating: "🎉", count: 20000) : "/\(index)"
+            _ = try await store.appendMutation(Self.sampleMutation(workspaceID: workspaceID, path: WorkspacePath(normalizing: path)))
+        }
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 1).records.map(\.sequence) == [2, 3, 4, 5])
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 3).records.map(\.sequence) == [4, 5])
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 5).records.isEmpty)
+
+        let log = root.appendingPathComponent(workspaceID.uuidString).appendingPathComponent("mutations.jsonl")
+        let handle = try FileHandle(forWritingTo: log)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data([0x7B, 0x22, 0xE2, 0x82]))
+        try handle.close()
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 1).records.map(\.sequence) == [2, 3, 4, 5])
+        let next = try await store.appendMutation(Self.sampleMutation(workspaceID: workspaceID, path: "/6"))
+        #expect(next.sequence == 6)
+        try await store.pruneMutations(workspaceId: workspaceID, throughSequence: 5)
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 5).records.map(\.sequence) == [6])
+
+        let corrupt = try FileHandle(forWritingTo: log)
+        try corrupt.seekToEnd()
+        try corrupt.write(contentsOf: Data([0x7B, 0x22, 0xE2, 0x82, 0x0A]))
+        try corrupt.close()
+        await #expect(throws: DecodingError.self) {
+            _ = try await store.listMutations(workspaceId: workspaceID, afterSequence: 6)
+        }
+    }
+
+    @Test
     func `unsupported store versions are rejected`() async throws {
         let root = try TestSupport.temporaryDirectory("StoreVersion")
         defer { TestSupport.remove(root) }
@@ -163,8 +233,7 @@ struct CheckpointStoreTests {
             workspaceID: workspaceID,
             label: "test",
             preferredParentID: nil,
-            origin: .manual,
-            mutationCursor: 0
+            origin: .manual
         )
     }
 

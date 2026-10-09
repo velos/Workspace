@@ -59,7 +59,10 @@ extension Workspace {
 
     func loadStoreState() async throws {
         checkpoints = try await store.listCheckpoints(workspaceId: workspaceId)
-        mutations = try await store.listMutations(workspaceId: workspaceId)
+        let page = try await store.listMutations(workspaceId: workspaceId, afterSequence: 0)
+        mutations = page.records
+        historyRefreshSequence = mutations.last?.sequence ?? 0
+        historyRetractionEpoch = page.retractionEpoch
         headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
         didLoadStoreState = true
     }
@@ -97,8 +100,7 @@ extension Workspace {
                 workspaceID: workspaceId,
                 label: label,
                 preferredParentID: parentCheckpointId,
-                origin: origin,
-                mutationCursor: latestMutationSequence()
+                origin: origin
             )
         )
         checkpoints.removeAll { $0.id == checkpoint.id }
@@ -115,8 +117,10 @@ extension Workspace {
         let persisted = try await store.appendMutation(
             Mutation(sequence: 0, workspaceID: workspaceId, operation: operation, changes: changes)
         )
-        mutations.append(persisted)
-        mutations.sort { $0.sequence < $1.sequence }
+        cachePersistedMutations([persisted])
+        if persisted.sequence == historyRefreshSequence + 1 {
+            historyRefreshSequence = persisted.sequence
+        }
         return persisted
     }
 
@@ -144,10 +148,6 @@ extension Workspace {
         }
     }
 
-    func latestMutationSequence() -> Int {
-        mutations.last?.sequence ?? 0
-    }
-
     func encodedJSONString<T: Encodable>(for value: T, prettyPrinted: Bool) throws -> String {
         let encoder = JSONEncoder()
         if prettyPrinted { encoder.outputFormatting = [.prettyPrinted, .sortedKeys] }
@@ -165,6 +165,9 @@ extension Workspace {
         let store = store
         let workspaceID = workspaceId
         guard let stream = try? await store.changes(workspaceId: workspaceID) else { return }
+        // Existing checkpoints are the subscription baseline. Query-cache refreshes after
+        // this point must not acknowledge event delivery.
+        deliveredCheckpointEventIDs.formUnion(checkpoints.map(\.id))
         checkpointObservationTask = Task { [weak self] in
             for await _ in stream where !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(20))
@@ -181,16 +184,18 @@ extension Workspace {
         guard let stored = try? await store.listCheckpoints(workspaceId: workspaceId) else { return }
 
         let newCheckpoints = stored.filter { candidate in
-            !checkpoints.contains(where: { $0.id == candidate.id })
+            !deliveredCheckpointEventIDs.contains(candidate.id)
         }
         checkpoints = stored.sorted(by: checkpointSort)
         headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
-        if let refreshed = try? await store.listMutations(workspaceId: workspaceId) {
-            mutations = refreshed.sorted { $0.sequence < $1.sequence }
-        }
+        try? await refreshPersistedHistory()
         for checkpoint in newCheckpoints.sorted(by: checkpointSort) {
-            emitWorkspaceEvent(.checkpoint(checkpoint))
+            // Re-check after suspension: a local commit or another refresh may have delivered it.
+            if !deliveredCheckpointEventIDs.contains(checkpoint.id) {
+                emitWorkspaceEvent(.checkpoint(checkpoint))
+            }
         }
+        deliveredCheckpointEventIDs.formIntersection(checkpoints.map(\.id))
     }
 
     func ensureFilesystemObservation() async {

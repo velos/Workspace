@@ -29,7 +29,7 @@ protocol CheckpointStore: AnyObject, Sendable {
     ) async throws -> Data?
     @discardableResult
     func appendMutation(_ mutation: Mutation) async throws -> Mutation
-    func listMutations(workspaceId: UUID) async throws -> [Mutation]
+    func listMutations(workspaceId: UUID, afterSequence: Int) async throws -> MutationPage
     /// Retracts one failed operation's record without lowering the workspace's
     /// sequence high-water mark. Later appends must never reuse its sequence.
     func removeMutation(sequence: Int, workspaceId: UUID) async throws
@@ -44,12 +44,25 @@ protocol CheckpointStore: AnyObject, Sendable {
     ) async throws -> StoreCompactionResult
 }
 
+/// Records and invalidation metadata from the same locked read.
+struct MutationPage: Sendable {
+    var records: [Mutation]
+    var retractionEpoch: Int
+}
+
+extension CheckpointStore {
+    func listMutations(workspaceId: UUID) async throws -> [Mutation] {
+        try await listMutations(workspaceId: workspaceId, afterSequence: 0).records
+    }
+}
+
 /// An in-memory checkpoint store for tests and ephemeral workspaces.
 actor InMemoryCheckpointStore: CheckpointStore {
     private var checkpointsByWorkspace: [UUID: [Checkpoint]] = [:]
     private var snapshotsByWorkspace: [UUID: [UUID: Snapshot]] = [:]
     private var mutationsByWorkspace: [UUID: [Mutation]] = [:]
     private var mutationHighWaterMarks: [UUID: Int] = [:]
+    private var mutationRetractionEpochs: [UUID: Int] = [:]
 
     init() {}
 
@@ -61,10 +74,20 @@ actor InMemoryCheckpointStore: CheckpointStore {
     }
 
     func captureRevision(from filesystem: any FileSystem, draft: CheckpointDraft) async throws -> Checkpoint {
-        try await saveRevision(Snapshot.capture(from: filesystem), draft: draft)
+        let mutationCursor = persistedMutationCursor(workspaceId: draft.workspaceID)
+        let snapshot = try await Snapshot.capture(from: filesystem)
+        return try persistRevision(snapshot, draft: draft, mutationCursor: mutationCursor)
     }
 
     func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint {
+        try persistRevision(snapshot, draft: draft, mutationCursor: persistedMutationCursor(workspaceId: draft.workspaceID))
+    }
+
+    private func persistedMutationCursor(workspaceId: UUID) -> Int {
+        mutationHighWaterMarks[workspaceId] ?? 0
+    }
+
+    private func persistRevision(_ snapshot: Snapshot, draft: CheckpointDraft, mutationCursor: Int) throws -> Checkpoint {
         var list = checkpointsByWorkspace[draft.workspaceID] ?? []
         let parent = resolvedParent(for: draft, checkpoints: list)
         let parentSnapshot = parent.flatMap { snapshotsByWorkspace[draft.workspaceID]?[$0.snapshotId] }
@@ -74,6 +97,7 @@ actor InMemoryCheckpointStore: CheckpointStore {
         let checkpoint = Checkpoint.make(
             snapshot: snapshot,
             draft: draft,
+            mutationCursor: mutationCursor,
             parent: parent,
             parentSnapshot: parentSnapshot
         )
@@ -111,14 +135,17 @@ actor InMemoryCheckpointStore: CheckpointStore {
         offset: UInt64,
         length: Int?
     ) async throws -> Data? {
+        if let length, length < 0 {
+            throw WorkspaceError.unsupported("read length must not be negative")
+        }
         guard let snapshot = snapshotsByWorkspace[workspaceId]?[id],
               let entry = Workspace.snapshotEntry(at: path, in: snapshot.entry),
               case let .file(file) = entry
         else { return nil }
         guard offset < UInt64(file.data.count) else { return Data() }
         let start = file.data.index(file.data.startIndex, offsetBy: Int(offset))
-        let end = length.map { file.data.index(start, offsetBy: $0, limitedBy: file.data.endIndex) ?? file.data.endIndex }
-            ?? file.data.endIndex
+        let count = min(length ?? file.data.count, file.data.count - Int(offset))
+        let end = file.data.index(start, offsetBy: count)
         return Data(file.data[start..<end])
     }
 
@@ -136,10 +163,14 @@ actor InMemoryCheckpointStore: CheckpointStore {
 
     func removeMutation(sequence: Int, workspaceId: UUID) async throws {
         mutationsByWorkspace[workspaceId]?.removeAll { $0.sequence == sequence }
+        mutationRetractionEpochs[workspaceId, default: 0] += 1
     }
 
-    func listMutations(workspaceId: UUID) async throws -> [Mutation] {
-        (mutationsByWorkspace[workspaceId] ?? []).sorted { $0.sequence < $1.sequence }
+    func listMutations(workspaceId: UUID, afterSequence: Int) async throws -> MutationPage {
+        MutationPage(
+            records: (mutationsByWorkspace[workspaceId] ?? []).filter { $0.sequence > afterSequence }.sorted { $0.sequence < $1.sequence },
+            retractionEpoch: mutationRetractionEpochs[workspaceId] ?? 0
+        )
     }
 
     func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws {
@@ -151,6 +182,7 @@ actor InMemoryCheckpointStore: CheckpointStore {
         if kept.isEmpty {
             kept = [last]
         }
+        if kept.count != records.count { mutationRetractionEpochs[workspaceId, default: 0] += 1 }
         mutationsByWorkspace[workspaceId] = kept
     }
 
@@ -242,6 +274,8 @@ actor InMemoryCheckpointStore: CheckpointStore {
 /// instances in the same process and across cooperating processes do not lose appends. A separate
 /// lifecycle lock serializes checkpoint commits, revision reads, and compaction; rebased metadata
 /// is written before unreachable artifacts are removed, keeping interrupted compaction recoverable.
+/// In-process async gates serialize reentrant callers before OS locking; contended OS locks wait
+/// off the cooperative executor so a suspended capture can resume and release its lock.
 /// Coordinating writers on network filesystems that do not honor `flock` may still require
 /// application-level serialization.
 actor FileCheckpointStore: CheckpointStore {
@@ -251,11 +285,21 @@ actor FileCheckpointStore: CheckpointStore {
     private let decoder: JSONDecoder
     private let compactEncoder: JSONEncoder
 
+    private let checkpointCapture: Workspace.CheckpointCapturePolicy
+    // Actor reentrancy must suspend contenders before they can conflict with this store's own fd.
+    private var heldLocks: Set<String> = []
+    private var lockWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
     private var listCheckpointsCache: [UUID: (cacheKey: String, checkpoints: [Checkpoint])] = [:]
 
-    init(rootDirectory: URL, fileManager: FileManager = .default) {
+    init(
+        rootDirectory: URL,
+        fileManager: FileManager = .default,
+        checkpointCapture: Workspace.CheckpointCapturePolicy = .trustMetadata
+    ) {
         self.rootDirectory = rootDirectory.standardizedFileURL
         self.fileManager = fileManager
+        self.checkpointCapture = checkpointCapture
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -265,17 +309,19 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func prepare(workspaceId: UUID) async throws {
-        try ensureWorkspaceDirectories(for: workspaceId)
+        try await ensureWorkspaceDirectories(for: workspaceId)
     }
 
     func changes(workspaceId: UUID) async throws -> AsyncStream<Void> {
-        try ensureWorkspaceDirectories(for: workspaceId)
+        try await ensureWorkspaceDirectories(for: workspaceId)
         return try DirectoryChangeStream.observe(checkpointsDirectoryURL(workspaceId: workspaceId))
     }
 
     func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint {
-        try ensureWorkspaceDirectories(for: draft.workspaceID)
-        return try Self.withExclusiveLock(at: lifecycleLockURL(workspaceId: draft.workspaceID)) {
+        try await ensureWorkspaceDirectories(for: draft.workspaceID)
+        return try await withExclusiveLock(at: lifecycleLockURL(workspaceId: draft.workspaceID)) {
+            // The snapshot was captured by the caller before acquiring the lifecycle lock.
+            let mutationCursor = try await persistedMutationCursor(workspaceId: draft.workspaceID)
             let checkpoints = try loadAllCheckpointsUnlocked(workspaceId: draft.workspaceID)
             let parent = resolvedParent(for: draft, checkpoints: checkpoints)
             let parentSnapshot = try parent.map {
@@ -287,6 +333,7 @@ actor FileCheckpointStore: CheckpointStore {
             let checkpoint = Checkpoint.make(
                 snapshot: snapshot,
                 draft: draft,
+                mutationCursor: mutationCursor,
                 parent: parent,
                 parentSnapshot: parentSnapshot
             )
@@ -298,9 +345,9 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func loadCheckpoint(id: UUID, workspaceId: UUID) async throws -> Checkpoint? {
-        try validateWorkspaceFormatIfPresent(workspaceId)
+        try await validateWorkspaceFormatIfPresent(workspaceId)
         guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else { return nil }
-        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+        return try await withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
             let url = checkpointURL(id: id, workspaceId: workspaceId)
             guard fileManager.fileExists(atPath: url.path) else { return nil }
             let checkpoint = try read(Checkpoint.self, from: url)
@@ -312,13 +359,13 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func listCheckpoints(workspaceId: UUID) async throws -> [Checkpoint] {
-        try validateWorkspaceFormatIfPresent(workspaceId)
+        try await validateWorkspaceFormatIfPresent(workspaceId)
         let directoryURL = checkpointsDirectoryURL(workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: directoryURL.path) else {
             listCheckpointsCache[workspaceId] = nil
             return []
         }
-        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+        return try await withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
             if let key = try checkpointsDirectoryCacheKey(at: directoryURL),
                let entry = listCheckpointsCache[workspaceId], entry.cacheKey == key {
                 return entry.checkpoints
@@ -355,11 +402,14 @@ actor FileCheckpointStore: CheckpointStore {
         var id: UUID
         var rootPath: WorkspacePath
         var root: Node
+        // Older manifests and materialized snapshots have no trustworthy capture timestamp.
+        var captureStartedAt: Date? = nil
     }
 
     func captureRevision(from filesystem: any FileSystem, draft: CheckpointDraft) async throws -> Checkpoint {
-        try ensureWorkspaceDirectories(for: draft.workspaceID)
-        return try await withExclusiveLifecycleLock(at: lifecycleLockURL(workspaceId: draft.workspaceID)) {
+        try await ensureWorkspaceDirectories(for: draft.workspaceID)
+        return try await withExclusiveLock(at: lifecycleLockURL(workspaceId: draft.workspaceID)) {
+            let mutationCursor = try await self.persistedMutationCursor(workspaceId: draft.workspaceID)
             let checkpoints = try self.loadAllCheckpointsUnlocked(workspaceId: draft.workspaceID)
             let parent = self.resolvedParent(for: draft, checkpoints: checkpoints)
             let parentManifest: SnapshotManifest?
@@ -374,14 +424,18 @@ actor FileCheckpointStore: CheckpointStore {
             } else {
                 parentManifest = nil
             }
+            let captureStartedAt = Date()
             let snapshotID = UUID()
             let root = try await self.captureManifestNode(
                 from: filesystem,
                 at: .root,
                 reusing: parentManifest?.root,
+                previousCaptureStartedAt: parentManifest?.captureStartedAt,
                 workspaceId: draft.workspaceID
             )
-            let manifest = SnapshotManifest(version: 2, id: snapshotID, rootPath: .root, root: root)
+            let manifest = SnapshotManifest(
+                version: 2, id: snapshotID, rootPath: .root, root: root, captureStartedAt: captureStartedAt
+            )
             let beforeIndex = try parentManifest.map {
                 RevisionIndex(
                     id: $0.id,
@@ -410,6 +464,7 @@ actor FileCheckpointStore: CheckpointStore {
             let checkpoint = Checkpoint.make(
                 snapshotID: snapshotID,
                 draft: draft,
+                mutationCursor: mutationCursor,
                 parent: parent,
                 summary: changes.summary
             )
@@ -448,6 +503,7 @@ actor FileCheckpointStore: CheckpointStore {
         from filesystem: any FileSystem,
         at path: WorkspacePath,
         reusing previous: SnapshotManifest.Node?,
+        previousCaptureStartedAt: Date?,
         workspaceId: UUID
     ) async throws -> SnapshotManifest.Node {
         guard await filesystem.exists(path: path) else {
@@ -456,7 +512,13 @@ actor FileCheckpointStore: CheckpointStore {
         let info = try await filesystem.stat(path: path)
         switch info.kind {
         case .file:
-            if previous?.kind == .file,
+            // Conservatively cover second-resolution and two-second-resolution timestamps.
+            // Equality alone is unsafe when an entry was captured in its timestamp's tick.
+            if checkpointCapture == .trustMetadata,
+               let previousCaptureStartedAt,
+               let modificationDate = info.modificationDate,
+               modificationDate.addingTimeInterval(2) < previousCaptureStartedAt,
+               previous?.kind == .file,
                previous?.contentSize == info.size,
                previous?.modificationDate != nil,
                previous?.modificationDate == info.modificationDate,
@@ -500,6 +562,7 @@ actor FileCheckpointStore: CheckpointStore {
                         from: filesystem,
                         at: path.appending(entry.name),
                         reusing: previousChildren[entry.name],
+                        previousCaptureStartedAt: previousCaptureStartedAt,
                         workspaceId: workspaceId
                     )
                 )
@@ -549,17 +612,17 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func loadSnapshot(id: UUID, workspaceId: UUID) async throws -> Snapshot? {
-        try validateWorkspaceFormatIfPresent(workspaceId)
+        try await validateWorkspaceFormatIfPresent(workspaceId)
         guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else { return nil }
-        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+        return try await withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
             try loadSnapshotUnlocked(id: id, workspaceId: workspaceId)
         }
     }
 
     func loadRevisionIndex(id: UUID, workspaceId: UUID) async throws -> RevisionIndex? {
-        try validateWorkspaceFormatIfPresent(workspaceId)
+        try await validateWorkspaceFormatIfPresent(workspaceId)
         guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else { return nil }
-        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+        return try await withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
             let url = snapshotURL(id: id, workspaceId: workspaceId)
             guard fileManager.fileExists(atPath: url.path) else { return nil }
             let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
@@ -581,12 +644,12 @@ actor FileCheckpointStore: CheckpointStore {
         offset: UInt64,
         length: Int?
     ) async throws -> Data? {
-        try validateWorkspaceFormatIfPresent(workspaceId)
+        try await validateWorkspaceFormatIfPresent(workspaceId)
         if let length, length < 0 {
             throw WorkspaceError.unsupported("read length must not be negative")
         }
         guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else { return nil }
-        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+        return try await withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
             let url = snapshotURL(id: id, workspaceId: workspaceId)
             guard fileManager.fileExists(atPath: url.path) else { return nil }
             let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
@@ -606,7 +669,8 @@ actor FileCheckpointStore: CheckpointStore {
             let size = try handle.seekToEnd()
             guard offset < size else { return Data() }
             try handle.seek(toOffset: offset)
-            return try handle.read(upToCount: length ?? Int(size - offset)) ?? Data()
+            let count = min(UInt64(length ?? Int.max), size - offset)
+            return try handle.read(upToCount: Int(count)) ?? Data()
         }
     }
 
@@ -734,26 +798,19 @@ actor FileCheckpointStore: CheckpointStore {
 
     @discardableResult
     func appendMutation(_ mutation: Mutation) async throws -> Mutation {
-        try ensureWorkspaceDirectories(for: mutation.workspaceID)
+        try await ensureWorkspaceDirectories(for: mutation.workspaceID)
         let jsonl = mutationsJsonlURL(workspaceId: mutation.workspaceID)
         let lockURL = mutationsLockURL(workspaceId: mutation.workspaceID)
-        return try Self.withExclusiveLock(at: lockURL) {
-            let lastSequence: Int
-            if fileManager.fileExists(atPath: jsonl.path) {
-                try repairTornTail(at: jsonl)
-                lastSequence = try lastPersistedSequence(at: jsonl)
-            } else {
-                lastSequence = 0
-            }
-            var record = mutation
-            let highWaterMark = try max(lastSequence, mutationHighWaterMark(workspaceId: mutation.workspaceID))
-            guard highWaterMark < Int.max else {
+        return try await withExclusiveLock(at: lockURL) {
+            var state = try mutationSequenceState(workspaceId: mutation.workspaceID)
+            guard state.highWaterMark < Int.max else {
                 throw WorkspaceError.storageCorrupted("mutation sequence exhausted")
             }
-            record.sequence = highWaterMark + 1
-            // Reserve before publishing the record. A failed append may leave a
-            // gap, but neither a failure nor a retraction can reuse an observed ID.
-            try write(record.sequence, to: mutationSequenceURL(workspaceId: mutation.workspaceID))
+            var record = mutation
+            state.highWaterMark += 1
+            record.sequence = state.highWaterMark
+            // Reserve before publishing. Failed appends and retractions cannot reuse an ID.
+            try write(state, to: mutationSequenceURL(workspaceId: mutation.workspaceID))
 
             if fileManager.fileExists(atPath: jsonl.path) {
                 try appendJSONLLine(encode: record, to: jsonl)
@@ -765,39 +822,43 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func removeMutation(sequence: Int, workspaceId: UUID) async throws {
-        try Self.withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
+        try await ensureWorkspaceDirectories(for: workspaceId)
+        try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
             let url = mutationsJsonlURL(workspaceId: workspaceId)
-            let records = try loadMutationsFromJSONL(at: url)
-            let highWaterMark = try max(
-                records.map(\.sequence).max() ?? 0,
-                mutationHighWaterMark(workspaceId: workspaceId)
-            )
-            try write(highWaterMark, to: mutationSequenceURL(workspaceId: workspaceId))
+            var state = try mutationSequenceState(workspaceId: workspaceId)
+            let records = fileManager.fileExists(atPath: url.path) ? try loadMutationsFromJSONL(at: url) : []
+            try state.bumpRetractionEpoch()
+            // Publish invalidation before rewriting. A failed rewrite only causes a harmless reload.
+            try write(state, to: mutationSequenceURL(workspaceId: workspaceId))
             try writeAllMutationsAsJSONL(records.filter { $0.sequence != sequence }, to: url)
         }
     }
 
-    func listMutations(workspaceId: UUID) async throws -> [Mutation] {
-        try validateWorkspaceFormatIfPresent(workspaceId)
-        let jsonl = mutationsJsonlURL(workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: jsonl.path) else {
-            return []
+    func listMutations(workspaceId: UUID, afterSequence: Int) async throws -> MutationPage {
+        try await validateWorkspaceFormatIfPresent(workspaceId)
+        guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else {
+            return MutationPage(records: [], retractionEpoch: 0)
         }
-        let lockURL = mutationsLockURL(workspaceId: workspaceId)
-        return try Self.withExclusiveLock(at: lockURL) {
-            try loadMutationsFromJSONL(at: jsonl)
-                .sorted { $0.sequence < $1.sequence }
+        return try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
+            let jsonl = mutationsJsonlURL(workspaceId: workspaceId)
+            let state = try readMutationSequenceState(workspaceId: workspaceId)
+            let records = fileManager.fileExists(atPath: jsonl.path)
+                ? try loadMutationsFromJSONL(at: jsonl, afterSequence: afterSequence).sorted { $0.sequence < $1.sequence }
+                : []
+            return MutationPage(records: records, retractionEpoch: state.retractionEpoch)
         }
     }
 
     func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws {
-        try validateWorkspaceFormatIfPresent(workspaceId)
+        try await validateWorkspaceFormatIfPresent(workspaceId)
         let jsonl = mutationsJsonlURL(workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: jsonl.path) else {
             return
         }
         let lockURL = mutationsLockURL(workspaceId: workspaceId)
-        try Self.withExclusiveLock(at: lockURL) {
+        try await withExclusiveLock(at: lockURL) {
+            var state = try mutationSequenceState(workspaceId: workspaceId)
+            guard fileManager.fileExists(atPath: jsonl.path) else { return }
             let records = try loadMutationsFromJSONL(at: jsonl)
                 .sorted { $0.sequence < $1.sequence }
             guard let last = records.last else {
@@ -810,16 +871,18 @@ actor FileCheckpointStore: CheckpointStore {
             guard kept.count != records.count else {
                 return
             }
+            try state.bumpRetractionEpoch()
+            try write(state, to: mutationSequenceURL(workspaceId: workspaceId))
             try writeAllMutationsAsJSONL(kept, to: jsonl)
         }
     }
 
     func storageStatistics(workspaceId: UUID) async throws -> Workspace.StorageStatistics {
-        try validateWorkspaceFormatIfPresent(workspaceId)
+        try await validateWorkspaceFormatIfPresent(workspaceId)
         guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else {
             return .empty
         }
-        return try Self.withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+        return try await withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
             try physicalStatisticsUnlocked(workspaceId: workspaceId)
         }
     }
@@ -829,7 +892,7 @@ actor FileCheckpointStore: CheckpointStore {
         retaining retention: Workspace.Retention,
         dryRun: Bool
     ) async throws -> StoreCompactionResult {
-        try validateWorkspaceFormatIfPresent(workspaceId)
+        try await validateWorkspaceFormatIfPresent(workspaceId)
         guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else {
             let plan = try CheckpointRetentionPlanner.plan(checkpoints: [], retaining: retention)
             return StoreCompactionResult(
@@ -843,7 +906,7 @@ actor FileCheckpointStore: CheckpointStore {
                 checkpoints: []
             )
         }
-        return try Self.withExclusiveLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
+        return try await withExclusiveLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
             try compactUnlocked(workspaceId: workspaceId, retaining: retention, dryRun: dryRun)
         }
     }
@@ -1041,23 +1104,25 @@ actor FileCheckpointStore: CheckpointStore {
         if fileManager.fileExists(atPath: url.path) { try fileManager.removeItem(at: url) }
     }
 
-    private func loadMutationsFromJSONL(at url: URL) throws -> [Mutation] {
+    private func loadMutationsFromJSONL(at url: URL, afterSequence: Int = 0) throws -> [Mutation] {
+        if afterSequence > 0 {
+            return try loadMutationSuffix(at: url, afterSequence: afterSequence)
+        }
         let data = try Data(contentsOf: url)
         if data.isEmpty { return [] }
         let endsWithNewline = data.last == UInt8(ascii: "\n")
-        let text = String(data: data, encoding: .utf8) ?? ""
-        let lines = text.split(whereSeparator: \.isNewline)
+        let lines = data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false)
         var out: [Mutation] = []
         out.reserveCapacity(lines.count)
         for (index, line) in lines.enumerated() {
             if line.isEmpty { continue }
             do {
-                out.append(try decoder.decode(Mutation.self, from: Data(String(line).utf8)))
+                out.append(try decoder.decode(Mutation.self, from: Data(line)))
             } catch {
                 // A crashed append leaves a strict prefix of `<json>\n`: an undecodable final
                 // line with no trailing newline. Tolerate exactly that torn tail; anything else
                 // is real corruption and must surface.
-                if index == lines.count - 1, !endsWithNewline {
+                if index == lines.count - 1, !endsWithNewline, Self.isIncompleteMutationRecord(Data(line)) {
                     continue
                 }
                 throw error
@@ -1066,10 +1131,100 @@ actor FileCheckpointStore: CheckpointStore {
         return out
     }
 
+    /// A closed object with invalid UTF-8 or an invalid Mutation schema is corruption, even
+    /// without its final LF. Track string escapes so a brace inside a truncated string does
+    /// not look like the end of the record.
+    private static func isIncompleteMutationRecord(_ data: Data) -> Bool {
+        let whitespace: Set<UInt8> = [0x20, 0x09, 0x0A, 0x0D]
+        guard data.first(where: { !whitespace.contains($0) }) == UInt8(ascii: "{") else { return false }
+        var delimiters: [UInt8] = []
+        var inString = false
+        var escaped = false
+        var closed = false
+        for byte in data {
+            if closed {
+                if whitespace.contains(byte) { continue }
+                return false
+            }
+            if inString {
+                if escaped { escaped = false }
+                else if byte == UInt8(ascii: "\\") { escaped = true }
+                else if byte == UInt8(ascii: "\"") { inString = false }
+                continue
+            }
+            switch byte {
+            case UInt8(ascii: "\""):
+                inString = true
+            case UInt8(ascii: "{"), UInt8(ascii: "["):
+                delimiters.append(byte)
+            case UInt8(ascii: "}"), UInt8(ascii: "]"):
+                let opening = byte == UInt8(ascii: "}") ? UInt8(ascii: "{") : UInt8(ascii: "[")
+                guard delimiters.popLast() == opening else { return false }
+                closed = delimiters.isEmpty
+            default:
+                break
+            }
+        }
+        return !delimiters.isEmpty
+    }
+
+    /// Scan back only as far as the requested sequence. Appends and pruning preserve sequence
+    /// order, so repeated history queries decode new records rather than the entire log.
+    private func loadMutationSuffix(at url: URL, afterSequence: Int) throws -> [Mutation] {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var cursor = try handle.seekToEnd()
+        guard cursor > 0 else { return [] }
+        try handle.seek(toOffset: cursor - 1)
+        let endsWithNewline = try handle.read(upToCount: 1) == Data([UInt8(ascii: "\n")])
+        var pending = Data()
+        var isFinalRecord = true
+        var records: [Mutation] = []
+
+        func consume(_ line: Data) throws -> Bool {
+            defer { isFinalRecord = false }
+            guard !line.isEmpty else { return true }
+            let record: Mutation
+            do {
+                record = try decoder.decode(Mutation.self, from: line)
+            } catch {
+                if isFinalRecord, !endsWithNewline, Self.isIncompleteMutationRecord(line) { return true }
+                throw error
+            }
+            guard record.sequence > afterSequence else { return false }
+            records.append(record)
+            return true
+        }
+
+        while cursor > 0 {
+            let start = cursor > 65536 ? cursor - 65536 : 0
+            try handle.seek(toOffset: start)
+            var chunk = try handle.read(upToCount: Int(cursor - start)) ?? Data()
+            chunk.append(pending)
+            let lines = chunk.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false)
+            for line in lines.dropFirst().reversed() {
+                if try !consume(Data(line)) { return records.reversed() }
+            }
+            pending = Data(lines.first ?? Data.SubSequence())
+            cursor = start
+        }
+        _ = try consume(pending)
+        return records.reversed()
+    }
+
+    /// Call while holding the lifecycle lock. The cursor is authoritative even when the
+    /// Workspace that requested the checkpoint has not refreshed its mutation cache.
+    private func persistedMutationCursor(workspaceId: UUID) async throws -> Int {
+        try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
+            try mutationSequenceState(workspaceId: workspaceId).highWaterMark
+        }
+    }
+
     /// Truncates a partial trailing line left behind by a crashed append so subsequent appends
     /// do not glue new records onto the torn fragment. A torn append never contains a newline
     /// (it is a strict prefix of `<json>\n`), so everything after the final newline — or the
-    /// whole file when none exists — is the torn region. Must be called under the mutations lock.
+    /// whole file when none exists — is the final record. A complete record missing only its LF
+    /// is preserved by adding that LF. Must be called under the mutations lock.
     private func repairTornTail(at url: URL) throws {
         let handle = try FileHandle(forUpdating: url)
         defer { try? handle.close() }
@@ -1079,7 +1234,18 @@ actor FileCheckpointStore: CheckpointStore {
         let lastByte = try handle.read(upToCount: 1)
         guard lastByte != Data("\n".utf8) else { return }
         let newlineOffset = try Self.lastNewlineOffset(in: handle, before: size - 1)
-        try handle.truncate(atOffset: newlineOffset.map { $0 + 1 } ?? 0)
+        let start = newlineOffset.map { $0 + 1 } ?? 0
+        try handle.seek(toOffset: start)
+        let tail = try handle.read(upToCount: Int(size - start)) ?? Data()
+        do {
+            _ = try decoder.decode(Mutation.self, from: tail)
+        } catch {
+            guard Self.isIncompleteMutationRecord(tail) else { throw error }
+            try handle.truncate(atOffset: start)
+            return
+        }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("\n".utf8))
     }
 
     /// Returns the sequence of the final record without loading the whole log. Appends are
@@ -1166,9 +1332,9 @@ actor FileCheckpointStore: CheckpointStore {
         return "\(mtime?.timeIntervalSince1970 ?? 0)-\(count)"
     }
 
-    private func ensureWorkspaceDirectories(for workspaceId: UUID) throws {
+    private func ensureWorkspaceDirectories(for workspaceId: UUID) async throws {
         try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
-        try Self.withExclusiveLock(at: formatLockURL(workspaceId: workspaceId)) {
+        try await withExclusiveLock(at: formatLockURL(workspaceId: workspaceId)) {
             try ensureWorkspaceDirectoriesLocked(for: workspaceId)
         }
     }
@@ -1193,10 +1359,10 @@ actor FileCheckpointStore: CheckpointStore {
         try fileManager.createDirectory(at: blobsDirectoryURL(workspaceId: workspaceId), withIntermediateDirectories: true)
     }
 
-    private func validateWorkspaceFormatIfPresent(_ workspaceId: UUID) throws {
+    private func validateWorkspaceFormatIfPresent(_ workspaceId: UUID) async throws {
         let workspaceURL = workspaceDirectoryURL(workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: workspaceURL.path) else { return }
-        try Self.withExclusiveLock(at: formatLockURL(workspaceId: workspaceId)) {
+        try await withExclusiveLock(at: formatLockURL(workspaceId: workspaceId)) {
             try validateWorkspaceFormatLocked(workspaceId)
         }
     }
@@ -1245,13 +1411,45 @@ actor FileCheckpointStore: CheckpointStore {
         workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.sequence.json")
     }
 
-    /// Must be read and updated under the mutations lock. Absent for older stores.
-    private func mutationHighWaterMark(workspaceId: UUID) throws -> Int {
+    private struct MutationSequenceState: Codable {
+        var highWaterMark: Int = 0
+        var retractionEpoch: Int = 0
+
+        mutating func bumpRetractionEpoch() throws {
+            guard retractionEpoch < Int.max else {
+                throw WorkspaceError.storageCorrupted("mutation retraction epoch exhausted")
+            }
+            retractionEpoch += 1
+        }
+    }
+
+    /// Reads legacy bare-Int sidecars as epoch zero. Must hold the mutations lock.
+    private func readMutationSequenceState(workspaceId: UUID) throws -> MutationSequenceState {
         let url = mutationSequenceURL(workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: url.path) else { return 0 }
-        let value = try read(Int.self, from: url)
-        guard value >= 0 else { throw WorkspaceError.storageCorrupted("negative mutation sequence") }
-        return value
+        guard fileManager.fileExists(atPath: url.path) else { return MutationSequenceState() }
+        let data = try Data(contentsOf: url)
+        let state: MutationSequenceState
+        if let legacy = try? decoder.decode(Int.self, from: data) {
+            state = MutationSequenceState(highWaterMark: legacy)
+        } else {
+            state = try decoder.decode(MutationSequenceState.self, from: data)
+        }
+        guard state.highWaterMark >= 0, state.retractionEpoch >= 0 else {
+            throw WorkspaceError.storageCorrupted("negative mutation sequence or retraction epoch")
+        }
+        return state
+    }
+
+    /// One authoritative cursor for reservation, retraction, pruning, and checkpoint capture.
+    /// Must hold the mutations lock; repair the tail before comparing the log with the sidecar.
+    private func mutationSequenceState(workspaceId: UUID) throws -> MutationSequenceState {
+        var state = try readMutationSequenceState(workspaceId: workspaceId)
+        let log = mutationsJsonlURL(workspaceId: workspaceId)
+        if fileManager.fileExists(atPath: log.path) {
+            try repairTornTail(at: log)
+            state.highWaterMark = max(state.highWaterMark, try lastPersistedSequence(at: log))
+        }
+        return state
     }
 
     private func mutationsJsonlURL(workspaceId: UUID) -> URL {
@@ -1295,60 +1493,70 @@ actor FileCheckpointStore: CheckpointStore {
         var version: Int
     }
 
-#if canImport(Darwin) || canImport(Glibc)
-    private func withExclusiveLifecycleLock<R>(
-        at url: URL,
-        _ body: () async throws -> R
-    ) async throws -> R {
+    private func acquireGate(for path: String) async {
+        if heldLocks.insert(path).inserted { return }
+        await withCheckedContinuation { lockWaiters[path, default: []].append($0) }
+    }
+
+    private func releaseGate(for path: String) {
+        guard var waiters = lockWaiters[path], !waiters.isEmpty else {
+            heldLocks.remove(path)
+            return
+        }
+        let next = waiters.removeFirst()
+        lockWaiters[path] = waiters.isEmpty ? nil : waiters
+        next.resume()
+    }
+
+    private enum LockMode: Sendable { case shared, exclusive }
+
+    private func withExclusiveLock<R>(at url: URL, _ body: () async throws -> R) async throws -> R {
+        try await withLock(at: url, mode: .exclusive, body)
+    }
+
+    private func withSharedLock<R>(at url: URL, _ body: () async throws -> R) async throws -> R {
+        try await withLock(at: url, mode: .shared, body)
+    }
+
+    private func withLock<R>(at url: URL, mode: LockMode, _ body: () async throws -> R) async throws -> R {
         let path = url.path
+        await acquireGate(for: path)
+        defer { releaseGate(for: path) }
+#if canImport(Darwin) || canImport(Glibc)
         let fd = open(path, O_RDWR | O_CREAT, 0o644)
         guard fd >= 0 else { throw LockFileError(message: "could not open lock file at \(path)") }
-        defer { close(fd) }
-        while flock(fd, LOCK_EX) != 0 {
-            if errno != EINTR { throw LockFileError(message: "could not acquire exclusive lock at \(path)") }
+        defer {
+            _ = flock(fd, LOCK_UN)
+            close(fd)
         }
-        defer { flock(fd, LOCK_UN) }
+        let operation = mode == .exclusive ? LOCK_EX : LOCK_SH
+        while flock(fd, operation | LOCK_NB) != 0 {
+            let error = errno
+            if error == EINTR { continue }
+            guard error == EWOULDBLOCK else {
+                throw LockFileError(message: "could not acquire lock at \(path)")
+            }
+            try await Self.waitForOSLock(fd, operation: operation, path: path)
+            break
+        }
+#endif
         return try await body()
     }
 
-    private static func withExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
-        try withLock(at: url, operation: LOCK_EX, body)
-    }
-
-    private static func withSharedLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
-        try withLock(at: url, operation: LOCK_SH, body)
-    }
-
-    private static func withLock<R>(at url: URL, operation: Int32, _ body: () throws -> R) throws -> R {
-        let path = url.path
-        let fd = open(path, O_RDWR | O_CREAT, 0o644)
-        guard fd >= 0 else {
-            throw LockFileError(message: "could not open lock file at \(path)")
-        }
-        defer { close(fd) }
-        while flock(fd, operation) != 0 {
-            if errno != EINTR {
-                throw LockFileError(message: "could not acquire exclusive lock at \(path)")
+#if canImport(Darwin) || canImport(Glibc)
+    // flock may wait for another store or process. Never park a cooperative executor thread.
+    private nonisolated static func waitForOSLock(_ fd: Int32, operation: Int32, path: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            DispatchQueue.global().async {
+                while flock(fd, operation) != 0 {
+                    if errno != EINTR {
+                        continuation.resume(throwing: LockFileError(message: "could not acquire lock at \(path)"))
+                        return
+                    }
+                }
+                continuation.resume()
             }
         }
-        defer { _ = flock(fd, LOCK_UN) }
-        return try body()
-    }
-#else
-    private func withExclusiveLifecycleLock<R>(
-        at url: URL,
-        _ body: () async throws -> R
-    ) async throws -> R {
-        _ = url
-        return try await body()
-    }
-
-    private static func withExclusiveLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
-        try body()
-    }
-
-    private static func withSharedLock<R>(at url: URL, _ body: () throws -> R) throws -> R {
-        try body()
     }
 #endif
 }

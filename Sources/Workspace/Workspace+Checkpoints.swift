@@ -14,10 +14,10 @@ extension Workspace {
                 workspaceID: workspaceId,
                 label: label,
                 preferredParentID: headCheckpointId,
-                origin: .manual,
-                mutationCursor: latestMutationSequence()
+                origin: .manual
             )
         )
+        checkpoints.removeAll { $0.id == checkpoint.id }
         checkpoints.append(checkpoint)
         checkpoints.sort(by: checkpointSort)
         headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)

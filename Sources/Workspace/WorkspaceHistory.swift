@@ -32,8 +32,39 @@ public struct Mutation: Sendable, Codable, Equatable {
 
 extension Workspace {
     /// Returns recorded mutations in ascending sequence order.
+    ///
+    /// History is read from the persistence store, so it includes records appended by other
+    /// workspace instances sharing the store and throws if the stored log can't be read. The call
+    /// waits for this workspace's in-flight mutating operations so it never reports a change whose
+    /// record hasn't been written yet, or one that is about to be retracted.
     public func history() async throws -> [Mutation] {
+        await acquireOperation()
+        defer { releaseOperation() }
         try await ensureLoaded()
+        try await refreshPersistedHistory()
         return mutations
+    }
+
+    func refreshPersistedHistory() async throws {
+        // A complete suffix read may cross permanent gaps from retractions or reservations.
+        // An epoch change invalidates the prefix too, including when the log is now empty.
+        var page = try await store.listMutations(workspaceId: workspaceId, afterSequence: historyRefreshSequence)
+        if page.retractionEpoch != historyRetractionEpoch {
+            page = try await store.listMutations(workspaceId: workspaceId, afterSequence: 0)
+            mutations = page.records
+            historyRefreshSequence = page.records.last?.sequence ?? 0
+            historyRetractionEpoch = page.retractionEpoch
+        } else {
+            cachePersistedMutations(page.records)
+            historyRefreshSequence = max(historyRefreshSequence, page.records.last?.sequence ?? 0)
+        }
+    }
+
+    func cachePersistedMutations(_ records: [Mutation]) {
+        var cachedSequences = Set(mutations.map(\.sequence))
+        for record in records where cachedSequences.insert(record.sequence).inserted {
+            mutations.append(record)
+        }
+        mutations.sort { $0.sequence < $1.sequence }
     }
 }

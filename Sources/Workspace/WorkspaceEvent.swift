@@ -53,6 +53,9 @@ extension Workspace {
     }
 
     func emitWorkspaceEvent(_ event: WorkspaceEvent) {
+        if case let .checkpoint(checkpoint) = event {
+            guard deliveredCheckpointEventIDs.insert(checkpoint.id).inserted else { return }
+        }
         for watcher in eventWatchers.values where Self.matches(event, filter: watcher.filter) {
             watcher.continuation.yield(event)
         }

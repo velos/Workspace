@@ -170,12 +170,19 @@ Compaction rebases retained checkpoints to their nearest retained ancestor and r
 
 Directory-backed stores serialize checkpoint commits, revision reads, and compaction with a persistent lifecycle lock. Mutation history is independent and is not pruned by checkpoint retention.
 
-Store format version 1 is retained so existing stores remain readable. Once a store contains `mutations.sequence.json`, do not use older library versions that ignore this file to write to that store, including through concurrent instances or after a downgrade: those writers can reuse retracted mutation sequence numbers. All writers must preserve the sequence high-water mark.
+Store format version 1 is retained so existing stores remain readable. Once a store contains `mutations.sequence.json`, do not use older library versions that ignore this file to write to that store, including through concurrent instances or after a downgrade: those writers can reuse retracted mutation sequence numbers. All writers must preserve the sequence high-water mark and retraction epoch. The sidecar now stores both fields; legacy bare-integer sidecars remain readable. Retractions and failed append reservations can leave sequence gaps. History refreshes invalidate cached records when another instance retracts or prunes mutations.
 
 Directory-backed checkpoint capture also reuses existing CAS blobs when a file's size and available
-modification timestamp are unchanged. It still walks directory metadata for correctness, but only
-reads and hashes file contents that appear changed. Filesystems that do not provide modification
-timestamps safely fall back to reading those files.
+modification timestamp are unchanged and the timestamp is more than two seconds older than the
+previous capture's start. Entries within that timestamp-granularity window are rehashed. It still
+walks directory metadata for correctness. Filesystems without modification timestamps, and older
+manifests without a capture timestamp, safely fall back to reading those files.
+
+For tools that preserve older timestamps while changing content, pass
+`checkpointCapture: .verifyContents` to `Workspace` to read and hash every file at each checkpoint.
+The default `.trustMetadata` policy compares the local wall clock with filesystem modification
+timestamps. Clock skew can make a recent change appear safely old; use `.verifyContents` for
+network filesystems whose clock may differ. This policy affects only `.directory` persistence.
 
 ## Transactions
 

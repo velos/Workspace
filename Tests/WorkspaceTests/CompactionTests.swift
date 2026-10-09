@@ -262,8 +262,7 @@ struct CompactionTests {
             workspaceID: workspaceID,
             label: nil,
             preferredParentID: parentID,
-            origin: .manual,
-            mutationCursor: 0
+            origin: .manual
         )
     }
 }

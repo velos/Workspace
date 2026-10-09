@@ -57,7 +57,12 @@ extension Workspace {
 
     struct ResolvedRevision: Sendable {
         var index: RevisionIndex
-        var load: ChangeSet.RevisionLoader
+        var readRange: @Sendable (WorkspacePath, UInt64, Int?) async throws -> Data
+
+        var load: ChangeSet.RevisionLoader {
+            let readRange = readRange
+            return { path in try await readRange(path, 0, nil) }
+        }
     }
 
     func resolvedRevision(_ revision: Revision, currentSnapshot: Snapshot? = nil) async throws -> ResolvedRevision {
@@ -71,11 +76,14 @@ extension Workspace {
             }
             return ResolvedRevision(
                 index: RevisionIndex(snapshot: snapshot),
-                load: { path in
+                readRange: { path, offset, length in
                     guard let entry = Self.snapshotEntry(at: path, in: snapshot.entry),
                           case let .file(file) = entry
                     else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)) }
-                    return file.data
+                    guard offset < UInt64(file.data.count) else { return Data() }
+                    let start = Int(offset)
+                    let count = min(length ?? file.data.count, file.data.count - start)
+                    return Data(file.data.dropFirst(start).prefix(count))
                 }
             )
         case let .checkpoint(id):
@@ -93,13 +101,13 @@ extension Workspace {
             let snapshotID = checkpoint.snapshotId
             return ResolvedRevision(
                 index: index,
-                load: { path in
+                readRange: { path, offset, length in
                     guard let data = try await store.readSnapshotFile(
                         id: snapshotID,
                         workspaceId: workspaceID,
                         path: path,
-                        offset: 0,
-                        length: nil
+                        offset: offset,
+                        length: length
                     ) else {
                         throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
                     }
@@ -123,12 +131,7 @@ extension Workspace {
             }
             switch entry {
             case .file:
-                let data = try await resolved.load(current)
-                guard offset < UInt64(data.count) else { return Data() }
-                let start = data.index(data.startIndex, offsetBy: Int(offset))
-                let end = length.map { data.index(start, offsetBy: $0, limitedBy: data.endIndex) ?? data.endIndex }
-                    ?? data.endIndex
-                return Data(data[start..<end])
+                return try await resolved.readRange(current, offset, length)
             case let .symbolicLink(_, target, _):
                 current = WorkspacePath(normalizing: target, relativeTo: current.parent)
             case .directory:

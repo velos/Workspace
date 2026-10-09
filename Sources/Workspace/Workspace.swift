@@ -8,6 +8,15 @@ public actor Workspace {
         case directory(URL)
     }
 
+    /// Controls file-content verification during checkpoint capture with `.directory` persistence.
+    /// This policy has no effect on `.memory` persistence.
+    public enum CheckpointCapturePolicy: Sendable, Equatable {
+        /// Reuse matching size and mtime only when the mtime is safely before the prior capture.
+        case trustMetadata
+        /// Read and hash every file, including changes that preserve older timestamps.
+        case verifyContents
+    }
+
     /// Controls only the detail stored in mutation history. Returned edit results,
     /// events, explicit previews, and diffs are independent of this policy and use
     /// `DiffOptions.default` unless the API accepts explicit diff options.
@@ -45,18 +54,22 @@ public actor Workspace {
     var didPrepareStore = false
     var checkpoints: [Checkpoint] = []
     var mutations: [Mutation] = []
+    var historyRefreshSequence = 0
+    var historyRetractionEpoch = 0
+    var deliveredCheckpointEventIDs: Set<UUID> = []
     var headCheckpointId: UUID?
     var eventWatchers: [UUID: EventWatcher] = [:]
     var checkpointObservationTask: Task<Void, Never>?
     var filesystemObservationTask: Task<Void, Never>?
     var observedFilesystemSnapshot: Snapshot?
 
-    /// Creates a workspace over a filesystem.
+    /// Creates a workspace over a filesystem. `checkpointCapture` affects only `.directory` persistence.
     public init(
         workspaceID: UUID = UUID(),
         fileSystem: any FileSystem = InMemoryFileSystem(),
         persistence: Persistence = .memory,
-        recording: RecordingPolicy = .default
+        recording: RecordingPolicy = .default,
+        checkpointCapture: CheckpointCapturePolicy = .trustMetadata
     ) {
         self.workspaceId = workspaceID
         self.filesystem = fileSystem
@@ -65,7 +78,7 @@ public actor Workspace {
         case .memory:
             InMemoryCheckpointStore()
         case let .directory(url):
-            FileCheckpointStore(rootDirectory: url)
+            FileCheckpointStore(rootDirectory: url, checkpointCapture: checkpointCapture)
         }
     }
 
@@ -86,11 +99,14 @@ public actor Workspace {
         offset: UInt64,
         length: Int? = nil
     ) async throws -> Data {
+        if let length, length < 0 {
+            throw WorkspaceError.unsupported("read length must not be negative")
+        }
         switch revision {
         case .current:
-            try await filesystem.readFile(path: path, offset: offset, length: length)
+            return try await filesystem.readFile(path: path, offset: offset, length: length)
         case .checkpoint:
-            try await revisionData(at: path, revision: revision, offset: offset, length: length)
+            return try await revisionData(at: path, revision: revision, offset: offset, length: length)
         }
     }
 

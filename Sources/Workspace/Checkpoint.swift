@@ -81,6 +81,7 @@ public struct Checkpoint: Sendable, Codable, Equatable {
     static func make(
         snapshot: Snapshot,
         draft: CheckpointDraft,
+        mutationCursor: Int,
         parent: Checkpoint?,
         parentSnapshot: Snapshot?
     ) -> Checkpoint {
@@ -88,7 +89,7 @@ public struct Checkpoint: Sendable, Codable, Equatable {
             snapshot: snapshot,
             parent: parent,
             parentSnapshot: parentSnapshot,
-            mutationCursor: draft.mutationCursor
+            mutationCursor: mutationCursor
         )
         return Checkpoint(
             workspaceId: draft.workspaceID,
@@ -97,7 +98,7 @@ public struct Checkpoint: Sendable, Codable, Equatable {
             origin: draft.origin,
             firstMutationSequence: metadata.firstMutationSequence,
             lastMutationSequence: metadata.lastMutationSequence,
-            mutationCursor: draft.mutationCursor,
+            mutationCursor: mutationCursor,
             snapshotId: snapshot.id,
             summary: metadata.summary
         )
@@ -106,6 +107,7 @@ public struct Checkpoint: Sendable, Codable, Equatable {
     static func make(
         snapshotID: UUID,
         draft: CheckpointDraft,
+        mutationCursor: Int,
         parent: Checkpoint?,
         summary: ChangeSet.Summary
     ) -> Checkpoint {
@@ -115,9 +117,9 @@ public struct Checkpoint: Sendable, Codable, Equatable {
             label: draft.label,
             parentCheckpointId: parent?.id,
             origin: draft.origin,
-            firstMutationSequence: draft.mutationCursor > previousCursor ? previousCursor + 1 : nil,
-            lastMutationSequence: draft.mutationCursor > previousCursor ? draft.mutationCursor : nil,
-            mutationCursor: draft.mutationCursor,
+            firstMutationSequence: mutationCursor > previousCursor ? previousCursor + 1 : nil,
+            lastMutationSequence: mutationCursor > previousCursor ? mutationCursor : nil,
+            mutationCursor: mutationCursor,
             snapshotId: snapshotID,
             summary: summary
         )
@@ -162,5 +164,4 @@ struct CheckpointDraft: Sendable {
     var label: String?
     var preferredParentID: UUID?
     var origin: Checkpoint.Origin
-    var mutationCursor: Int
 }

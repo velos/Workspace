@@ -185,6 +185,7 @@ struct EditAtomicityTests {
         try await transaction.writeText("/a", "transaction")
         let before = try await workspace.history()
         let log = storage.appendingPathComponent(workspace.workspaceID.uuidString).appendingPathComponent("mutations.jsonl")
+        let originalLog = try Data(contentsOf: log)
         try FileManager.default.removeItem(at: log)
         try FileManager.default.createDirectory(at: log, withIntermediateDirectories: false)
         await #expect(throws: (any Error).self) {
@@ -196,6 +197,10 @@ struct EditAtomicityTests {
             }
         }
         #expect(try await workspace.readText("/a") == "original")
+        // history() now reads persistence on every call. Restore the readable baseline
+        // before checking that the failed operation did not alter cached history.
+        try FileManager.default.removeItem(at: log)
+        try originalLog.write(to: log)
         #expect(try await workspace.history() == before)
     }
 
