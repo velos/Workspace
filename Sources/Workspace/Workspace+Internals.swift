@@ -1,6 +1,37 @@
 import Foundation
 
 extension Workspace {
+    func acquireOperation() async {
+        if operationInProgress {
+            await withCheckedContinuation { operationWaiters.append($0) }
+        } else {
+            operationInProgress = true
+        }
+    }
+
+    func releaseOperation() {
+        if operationWaiters.isEmpty {
+            operationInProgress = false
+        } else {
+            operationWaiters.removeFirst().resume()
+        }
+    }
+
+    func restoreAfterFailure(_ before: [Snapshot], originalError: any Error) async throws -> Never {
+        var rollbackError: (any Error)?
+        for snapshot in before {
+            do {
+                try await Snapshot.restore(snapshot, to: filesystem)
+            } catch {
+                if rollbackError == nil { rollbackError = error }
+            }
+        }
+        if let rollbackError {
+            throw WorkspaceRollbackError(originalError: originalError, rollbackError: rollbackError)
+        }
+        throw originalError
+    }
+
     func ensureLoaded() async throws {
         if didLoadStoreState { return }
         if let loadTask {
@@ -17,6 +48,13 @@ extension Workspace {
             loadTask = nil
             throw error
         }
+    }
+
+    func prepareForMutation() async throws {
+        try await ensureLoaded()
+        guard !didPrepareStore else { return }
+        try await store.prepare(workspaceId: workspaceId)
+        didPrepareStore = true
     }
 
     func loadStoreState() async throws {
@@ -71,13 +109,39 @@ extension Workspace {
         return checkpoint
     }
 
-    func appendMutation(operation: Mutation.Operation, changes: ChangeSet) async throws {
-        guard recording != .off else { return }
+    @discardableResult
+    func appendMutation(operation: Mutation.Operation, changes: ChangeSet) async throws -> Mutation? {
+        guard recording != .off else { return nil }
         let persisted = try await store.appendMutation(
             Mutation(sequence: 0, workspaceID: workspaceId, operation: operation, changes: changes)
         )
         mutations.append(persisted)
         mutations.sort { $0.sequence < $1.sequence }
+        return persisted
+    }
+
+    // If checkpoint persistence fails after the history append, retract exactly
+    // our record. Other instances' mutations must not be removed by compensation.
+    func persistMutationCheckpoint(
+        snapshot: Snapshot, label: String?, origin: Checkpoint.Origin,
+        operation: Mutation.Operation, changes: ChangeSet
+    ) async throws -> Checkpoint {
+        let mutation = changes.isEmpty ? nil : try await appendMutation(operation: operation, changes: changes)
+        do {
+            return try await persistCheckpoint(
+                snapshot: snapshot, label: label, parentCheckpointId: headCheckpointId, origin: origin
+            )
+        } catch {
+            if let mutation {
+                do {
+                    try await store.removeMutation(sequence: mutation.sequence, workspaceId: workspaceId)
+                    mutations.removeAll { $0.sequence == mutation.sequence }
+                } catch let cleanupError {
+                    throw WorkspaceRollbackError(originalError: error, rollbackError: cleanupError)
+                }
+            }
+            throw error
+        }
     }
 
     func latestMutationSequence() -> Int {
@@ -110,6 +174,8 @@ extension Workspace {
     }
 
     func refreshCheckpointEvents() async {
+        await acquireOperation()
+        defer { releaseOperation() }
         guard eventWatchers.values.contains(where: { $0.filter.includeCheckpoints }) else { return }
         guard (try? await ensureLoaded()) != nil else { return }
         guard let stored = try? await store.listCheckpoints(workspaceId: workspaceId) else { return }
@@ -128,6 +194,8 @@ extension Workspace {
     }
 
     func ensureFilesystemObservation() async {
+        await acquireOperation()
+        defer { releaseOperation() }
         guard filesystemObservationTask == nil,
               let source = filesystem as? any FileSystemChangeSource
         else { return }
@@ -145,10 +213,14 @@ extension Workspace {
 
     func noteWorkspaceSnapshot(_ snapshot: Snapshot) {
         guard filesystemObservationTask != nil else { return }
-        observedFilesystemSnapshot = snapshot
+        guard var observed = observedFilesystemSnapshot else { return }
+        observed.entry = Snapshot.replacing(observed.entry, with: snapshot.entry)
+        observedFilesystemSnapshot = observed
     }
 
     func refreshFilesystemEvents() async {
+        await acquireOperation()
+        defer { releaseOperation() }
         guard let before = observedFilesystemSnapshot,
               let after = try? await Snapshot.capture(from: filesystem)
         else { return }

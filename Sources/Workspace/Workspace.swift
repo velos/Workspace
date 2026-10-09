@@ -8,7 +8,9 @@ public actor Workspace {
         case directory(URL)
     }
 
-    /// Controls mutation-history detail without affecting explicit previews or diffs.
+    /// Controls only the detail stored in mutation history. Returned edit results,
+    /// events, explicit previews, and diffs are independent of this policy and use
+    /// `DiffOptions.default` unless the API accepts explicit diff options.
     public enum RecordingPolicy: Sendable, Equatable {
         case full(maxTextBytes: Int?)
         case changesOnly
@@ -33,8 +35,14 @@ public actor Workspace {
     public nonisolated let recording: RecordingPolicy
     let store: any CheckpointStore
 
+    // Actor isolation alone does not span suspension points. Ownership is handed
+    // directly to the next waiter, preventing newcomers from overtaking the queue.
+    var operationInProgress = false
+    var operationWaiters: [CheckedContinuation<Void, Never>] = []
+
     var loadTask: Task<Void, Error>?
     var didLoadStoreState = false
+    var didPrepareStore = false
     var checkpoints: [Checkpoint] = []
     var mutations: [Mutation] = []
     var headCheckpointId: UUID?

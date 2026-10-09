@@ -12,6 +12,7 @@ import Glibc
 /// any placeholder sequence; ``appendMutation(_:)`` returns the record with the next persisted
 /// monotonic number for that workspace, serialized under the mutations lock.
 protocol CheckpointStore: AnyObject, Sendable {
+    func prepare(workspaceId: UUID) async throws
     func changes(workspaceId: UUID) async throws -> AsyncStream<Void>
     func captureRevision(from filesystem: any FileSystem, draft: CheckpointDraft) async throws -> Checkpoint
     func saveRevision(_ snapshot: Snapshot, draft: CheckpointDraft) async throws -> Checkpoint
@@ -29,6 +30,9 @@ protocol CheckpointStore: AnyObject, Sendable {
     @discardableResult
     func appendMutation(_ mutation: Mutation) async throws -> Mutation
     func listMutations(workspaceId: UUID) async throws -> [Mutation]
+    /// Retracts one failed operation's record without lowering the workspace's
+    /// sequence high-water mark. Later appends must never reuse its sequence.
+    func removeMutation(sequence: Int, workspaceId: UUID) async throws
     /// Removes mutation records with `sequence <= throughSequence`. The record carrying the
     /// highest sequence is always retained so later appends stay monotonic.
     func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws
@@ -45,8 +49,11 @@ actor InMemoryCheckpointStore: CheckpointStore {
     private var checkpointsByWorkspace: [UUID: [Checkpoint]] = [:]
     private var snapshotsByWorkspace: [UUID: [UUID: Snapshot]] = [:]
     private var mutationsByWorkspace: [UUID: [Mutation]] = [:]
+    private var mutationHighWaterMarks: [UUID: Int] = [:]
 
     init() {}
+
+    func prepare(workspaceId: UUID) async throws {}
 
     func changes(workspaceId: UUID) async throws -> AsyncStream<Void> {
         _ = workspaceId
@@ -118,12 +125,17 @@ actor InMemoryCheckpointStore: CheckpointStore {
     @discardableResult
     func appendMutation(_ mutation: Mutation) async throws -> Mutation {
         var list = mutationsByWorkspace[mutation.workspaceID, default: []]
-        let next = (list.map(\.sequence).max() ?? 0) + 1
+        let next = (mutationHighWaterMarks[mutation.workspaceID] ?? 0) + 1
         var record = mutation
         record.sequence = next
+        mutationHighWaterMarks[mutation.workspaceID] = next
         list.append(record)
         mutationsByWorkspace[mutation.workspaceID] = list
         return record
+    }
+
+    func removeMutation(sequence: Int, workspaceId: UUID) async throws {
+        mutationsByWorkspace[workspaceId]?.removeAll { $0.sequence == sequence }
     }
 
     func listMutations(workspaceId: UUID) async throws -> [Mutation] {
@@ -250,6 +262,10 @@ actor FileCheckpointStore: CheckpointStore {
         self.encoder = encoder
         self.decoder = JSONDecoder()
         self.compactEncoder = JSONEncoder()
+    }
+
+    func prepare(workspaceId: UUID) async throws {
+        try ensureWorkspaceDirectories(for: workspaceId)
     }
 
     func changes(workspaceId: UUID) async throws -> AsyncStream<Void> {
@@ -730,7 +746,14 @@ actor FileCheckpointStore: CheckpointStore {
                 lastSequence = 0
             }
             var record = mutation
-            record.sequence = lastSequence + 1
+            let highWaterMark = try max(lastSequence, mutationHighWaterMark(workspaceId: mutation.workspaceID))
+            guard highWaterMark < Int.max else {
+                throw WorkspaceError.storageCorrupted("mutation sequence exhausted")
+            }
+            record.sequence = highWaterMark + 1
+            // Reserve before publishing the record. A failed append may leave a
+            // gap, but neither a failure nor a retraction can reuse an observed ID.
+            try write(record.sequence, to: mutationSequenceURL(workspaceId: mutation.workspaceID))
 
             if fileManager.fileExists(atPath: jsonl.path) {
                 try appendJSONLLine(encode: record, to: jsonl)
@@ -738,6 +761,19 @@ actor FileCheckpointStore: CheckpointStore {
                 try writeAllMutationsAsJSONL([record], to: jsonl)
             }
             return record
+        }
+    }
+
+    func removeMutation(sequence: Int, workspaceId: UUID) async throws {
+        try Self.withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
+            let url = mutationsJsonlURL(workspaceId: workspaceId)
+            let records = try loadMutationsFromJSONL(at: url)
+            let highWaterMark = try max(
+                records.map(\.sequence).max() ?? 0,
+                mutationHighWaterMark(workspaceId: workspaceId)
+            )
+            try write(highWaterMark, to: mutationSequenceURL(workspaceId: workspaceId))
+            try writeAllMutationsAsJSONL(records.filter { $0.sequence != sequence }, to: url)
         }
     }
 
@@ -1205,6 +1241,19 @@ actor FileCheckpointStore: CheckpointStore {
         blobsDirectoryURL(workspaceId: workspaceId).appendingPathComponent(hash, isDirectory: false)
     }
 
+    private func mutationSequenceURL(workspaceId: UUID) -> URL {
+        workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.sequence.json")
+    }
+
+    /// Must be read and updated under the mutations lock. Absent for older stores.
+    private func mutationHighWaterMark(workspaceId: UUID) throws -> Int {
+        let url = mutationSequenceURL(workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: url.path) else { return 0 }
+        let value = try read(Int.self, from: url)
+        guard value >= 0 else { throw WorkspaceError.storageCorrupted("negative mutation sequence") }
+        return value
+    }
+
     private func mutationsJsonlURL(workspaceId: UUID) -> URL {
         workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.jsonl", isDirectory: false)
     }
@@ -1240,6 +1289,8 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     private struct StoreFormat: Codable {
+        // Retained to read existing stores. Writers must preserve the sequence
+        // high-water mark; older writers are incompatible (see README).
         static let currentVersion = 1
         var version: Int
     }

@@ -5,6 +5,16 @@ import Testing
 @Suite("Snapshot engine")
 struct SnapshotTests {
     @Test
+    func `folding a replacement preserves unrelated missing entries`() {
+        let missing = Snapshot.Entry.missing(.init(path: "/unrelated"))
+        let file = Snapshot.Entry.file(.init(path: "/changed", data: Data(), permissions: .defaultFile))
+        let tree = Snapshot.Entry.directory(.init(path: .root, permissions: .defaultDirectory, children: [file, missing]))
+        let replacement = Snapshot.Entry.missing(.init(path: "/changed"))
+        let folded = Snapshot.replacing(tree, with: replacement)
+        #expect(folded == .directory(.init(path: .root, permissions: .defaultDirectory, children: [missing])))
+    }
+
+    @Test
     func `capture and restore roundtrips tree contents symlinks and permissions`() async throws {
         let source = InMemoryFileSystem()
         try await source.createDirectory(path: "/docs/nested", recursive: true)

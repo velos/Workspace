@@ -220,7 +220,7 @@ extension Workspace {
         public func preview() async throws -> ChangeSet {
             try requireActive()
             let current = try await draft.revisionSnapshot(.current)
-            return ChangeSet.compare(before: base, after: current, maxTextBytes: 1_000_000)
+            return ChangeSet.compare(before: base, after: current, maxTextBytes: DiffOptions.default.maxTextBytes)
         }
 
         /// Attempts to commit this transaction. Conflicted transactions remain active.
@@ -258,6 +258,9 @@ extension Workspace {
 
     /// Starts an isolated transaction from the workspace's complete current state.
     public func beginTransaction(label: String? = nil) async throws -> Transaction {
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
         try await ensureLoaded()
         try await reconcileCheckpointsWithStore()
         let base = try await Snapshot.capture(from: filesystem)
@@ -304,10 +307,13 @@ extension Workspace {
         label: String?,
         strategy: Transaction.CommitStrategy
     ) async throws -> Transaction.Commit {
-        try await ensureLoaded()
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
+        try await prepareForMutation()
         try await reconcileCheckpointsWithStore()
         let current = try await Snapshot.capture(from: filesystem)
-        let preview = ChangeSet.compare(before: base, after: draft, maxTextBytes: 1_000_000)
+        let preview = ChangeSet.compare(before: base, after: draft, maxTextBytes: DiffOptions.default.maxTextBytes)
 
         var baseNodes: [WorkspacePath: MergeNode] = [:]
         var currentNodes: [WorkspacePath: MergeNode] = [:]
@@ -375,27 +381,35 @@ extension Workspace {
             rootPath: .root,
             entry: Self.buildEntryTree(from: merged, rootPermissions: rootPermissions)
         )
-        let applied = ChangeSet.compare(before: current, after: mergedSnapshot, maxTextBytes: 1_000_000)
+        let applied = ChangeSet.compare(before: current, after: mergedSnapshot, maxTextBytes: DiffOptions.default.maxTextBytes)
         guard !applied.isEmpty else {
             return Transaction.Commit(preview: preview, appliedChanges: applied, checkpoint: nil, conflicts: [])
         }
 
-        do {
-            try await Snapshot.restore(mergedSnapshot, to: filesystem)
-        } catch {
-            try? await Snapshot.restore(current, to: filesystem)
-            throw error
+        var before: [Snapshot] = []
+        var after: [Snapshot] = []
+        for path in applied.touchedPaths {
+            if before.contains(where: { Snapshot.contains($0.rootPath, path) }) { continue }
+            let oldEntry = Self.snapshotEntry(at: path, in: current.entry) ?? .missing(.init(path: path))
+            let newEntry = Self.snapshotEntry(at: path, in: mergedSnapshot.entry) ?? .missing(.init(path: path))
+            before.append(Snapshot(rootPath: path, entry: oldEntry))
+            after.append(Snapshot(rootPath: path, entry: newEntry))
         }
-        try await appendMutation(operation: .transaction, changes: applied)
-        noteWorkspaceSnapshot(mergedSnapshot)
-        let checkpoint = try await persistCheckpoint(
-            snapshot: mergedSnapshot,
-            label: label,
-            parentCheckpointId: headCheckpointId,
-            origin: .transaction(base: baseCheckpointID)
-        )
-        emitWorkspaceEvent(.changes(applied))
-        return Transaction.Commit(preview: preview, appliedChanges: applied, checkpoint: checkpoint, conflicts: [])
+        do {
+            for snapshot in after { try await Snapshot.restore(snapshot, to: filesystem) }
+            let checkpoint = try await persistMutationCheckpoint(
+                snapshot: mergedSnapshot,
+                label: label,
+                origin: .transaction(base: baseCheckpointID),
+                operation: .transaction,
+                changes: recordingChanges(applied, from: current, to: mergedSnapshot)
+            )
+            for snapshot in after { noteWorkspaceSnapshot(snapshot) }
+            emitWorkspaceEvent(.changes(applied))
+            return Transaction.Commit(preview: preview, appliedChanges: applied, checkpoint: checkpoint, conflicts: [])
+        } catch {
+            try await restoreAfterFailure(before, originalError: error)
+        }
     }
 
     private static func conflictDiffForTransaction(from base: MergeNode?, to side: MergeNode?) -> TextDiff? {

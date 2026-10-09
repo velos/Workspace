@@ -3,7 +3,10 @@ import Foundation
 extension Workspace {
     /// Creates a checkpoint for the workspace's current filesystem state.
     public func createCheckpoint(label: String? = nil) async throws -> Checkpoint {
-        try await ensureLoaded()
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
+        try await prepareForMutation()
         try await reconcileCheckpointsWithStore()
         let checkpoint = try await store.captureRevision(
             from: filesystem,
@@ -27,7 +30,10 @@ extension Workspace {
     /// The filesystem changes performed by the rollback are also recorded as a `rollback`
     /// mutation, so the mutation log stays a complete account of tree changes.
     func rollback(to checkpointId: UUID, label: String? = nil) async throws -> Checkpoint {
-        try await ensureLoaded()
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
+        try await prepareForMutation()
         try await reconcileCheckpointsWithStore()
         let checkpoint = try checkpointOrThrow(id: checkpointId)
         let targetSnapshot = try await loadSnapshotOrThrow(
@@ -35,22 +41,23 @@ extension Workspace {
             workspaceId: checkpoint.workspaceId
         )
         let previousSnapshot = try await Snapshot.capture(from: filesystem)
-        try await Snapshot.restore(targetSnapshot, to: filesystem)
-        let restoredSnapshot = try await Snapshot.capture(from: filesystem)
-        noteWorkspaceSnapshot(restoredSnapshot)
-        let changes = changeSet(from: previousSnapshot, to: restoredSnapshot)
-
-        if !changes.isEmpty {
-            try await appendMutation(operation: .rollback, changes: changes)
-            emitWorkspaceEvent(.changes(changes))
+        do {
+            try await Snapshot.restore(targetSnapshot, to: filesystem)
+            let restoredSnapshot = try await Snapshot.capture(from: filesystem)
+            let changes = changeSet(from: previousSnapshot, to: restoredSnapshot)
+            let result = try await persistMutationCheckpoint(
+                snapshot: restoredSnapshot,
+                label: label,
+                origin: .rollback(from: checkpoint.id),
+                operation: .rollback,
+                changes: recordingChanges(changes, from: previousSnapshot, to: restoredSnapshot)
+            )
+            noteWorkspaceSnapshot(restoredSnapshot)
+            if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
+            return result
+        } catch {
+            try await restoreAfterFailure([previousSnapshot], originalError: error)
         }
-
-        return try await persistCheckpoint(
-            snapshot: restoredSnapshot,
-            label: label,
-            parentCheckpointId: headCheckpointId,
-            origin: .rollback(from: checkpoint.id)
-        )
     }
 
     /// Returns one checkpoint owned by this workspace when present.

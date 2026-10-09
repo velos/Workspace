@@ -125,12 +125,38 @@ extension Snapshot {
         try await restoreEntry(snapshot.entry, to: target)
     }
 
+    static func infoIfPresent(at path: WorkspacePath, on target: any FileSystem) async throws -> FileInfo? {
+        do {
+            return try await target.stat(path: path)
+        } catch {
+            guard isMissingEntry(error) else { throw error }
+            return nil
+        }
+    }
+
+    static func isMissingEntry(_ error: any Error) -> Bool {
+        if let posix = error as? POSIXError {
+            return posix.code == .ENOENT || posix.code == .ENOTDIR
+        }
+        let error = error as NSError
+        if error.domain == NSPOSIXErrorDomain {
+            return error.code == POSIXError.Code.ENOENT.rawValue || error.code == POSIXError.Code.ENOTDIR.rawValue
+        }
+        if error.domain == NSCocoaErrorDomain,
+           error.code == CocoaError.fileNoSuchFile.rawValue || error.code == CocoaError.fileReadNoSuchFile.rawValue {
+            return true
+        }
+        // swift-corelibs-foundation stores the underlying error as a Swift `Error`, not an `NSError`.
+        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? any Error {
+            return isMissingEntry(underlying)
+        }
+        return false
+    }
+
     private static func captureEntry(from target: any FileSystem, at path: WorkspacePath) async throws -> Entry {
-        guard await target.exists(path: path) else {
+        guard let info = try await infoIfPresent(at: path, on: target) else {
             return .missing(.init(path: path))
         }
-
-        let info = try await target.stat(path: path)
         switch info.kind {
         case .directory:
             let entries = try await target.listDirectory(path: path)
@@ -167,8 +193,7 @@ extension Snapshot {
             try await ensureParentDirectory(for: file.path, on: target)
 
             let rewriteRequired: Bool
-            if await target.exists(path: file.path) {
-                let info = try await target.stat(path: file.path)
+            if let info = try await infoIfPresent(at: file.path, on: target) {
                 if info.kind == .file {
                     rewriteRequired = try await target.readFile(path: file.path) != file.data
                 } else {
@@ -182,13 +207,12 @@ extension Snapshot {
             if rewriteRequired {
                 try await target.writeFile(path: file.path, data: file.data, append: false)
             }
-            try await target.setPermissions(path: file.path, permissions: file.permissions)
+            try await setPermissionsIfNeeded(file.permissions, at: file.path, on: target)
         case let .symlink(symlink):
             try await ensureParentDirectory(for: symlink.path, on: target)
 
             var rewriteRequired = true
-            if await target.exists(path: symlink.path) {
-                let info = try await target.stat(path: symlink.path)
+            if let info = try await infoIfPresent(at: symlink.path, on: target) {
                 if info.kind == .symlink, try await target.readSymlink(path: symlink.path) == symlink.target {
                     rewriteRequired = false
                 } else {
@@ -199,11 +223,19 @@ extension Snapshot {
             if rewriteRequired {
                 try await target.createSymlink(path: symlink.path, target: symlink.target)
             }
-            try await target.setPermissions(path: symlink.path, permissions: symlink.permissions)
         case let .directory(directory):
             try await ensureDirectory(at: directory.path, permissions: directory.permissions, on: target)
             try await syncChildren(directory.children, under: directory.path, on: target)
-            try await target.setPermissions(path: directory.path, permissions: directory.permissions)
+            try await setPermissionsIfNeeded(directory.permissions, at: directory.path, on: target)
+        }
+    }
+
+    private static func setPermissionsIfNeeded(
+        _ permissions: POSIXPermissions, at path: WorkspacePath, on target: any FileSystem
+    ) async throws {
+        let info = try await target.stat(path: path)
+        if info.kind != .symlink, info.permissions != permissions {
+            try await target.setPermissions(path: path, permissions: permissions)
         }
     }
 
@@ -212,7 +244,11 @@ extension Snapshot {
         guard !parent.isRoot else {
             return
         }
-        try await ensureDirectory(at: parent, permissions: .defaultDirectory, on: target)
+        // A scoped restore owns the entry, not its existing parent. In
+        // particular, do not replace a symlink used as a parent directory.
+        if try await infoIfPresent(at: parent, on: target) == nil {
+            try await target.createDirectory(path: parent, recursive: true)
+        }
     }
 
     private static func ensureDirectory(
@@ -220,8 +256,7 @@ extension Snapshot {
         permissions: POSIXPermissions,
         on target: any FileSystem
     ) async throws {
-        if await target.exists(path: path) {
-            let info = try await target.stat(path: path)
+        if let info = try await infoIfPresent(at: path, on: target) {
             if info.kind == .directory {
                 return
             }
@@ -231,7 +266,6 @@ extension Snapshot {
         if !path.isRoot {
             try await target.createDirectory(path: path, recursive: true)
         }
-        try await target.setPermissions(path: path, permissions: permissions)
     }
 
     private static func syncChildren(
@@ -240,7 +274,7 @@ extension Snapshot {
         on target: any FileSystem
     ) async throws {
         let expectedNames = Set(expectedChildren.map { $0.path.basename })
-        let existingEntries = (try? await target.listDirectory(path: parentPath)) ?? []
+        let existingEntries = try await target.listDirectory(path: parentPath)
 
         for entry in existingEntries where !expectedNames.contains(entry.name) {
             try await target.remove(path: parentPath.appending(entry.name), recursive: true)
@@ -252,9 +286,7 @@ extension Snapshot {
     }
 
     private static func removeEntryIfPresent(at path: WorkspacePath, on target: any FileSystem) async throws {
-        guard await target.exists(path: path) else {
-            return
-        }
+        guard let info = try await infoIfPresent(at: path, on: target) else { return }
 
         if path.isRoot {
             let existingEntries = try await target.listDirectory(path: path)
@@ -264,7 +296,6 @@ extension Snapshot {
             return
         }
 
-        let info = try await target.stat(path: path)
         if info.kind == .directory {
             let existingEntries = try await target.listDirectory(path: path)
             for entry in existingEntries {
@@ -285,5 +316,53 @@ private extension Array {
             values.append(try await transform(element))
         }
         return values
+    }
+}
+
+// A journal holds disjoint subtrees, preserving the state before the first edit
+// affecting each path. Expanding a root folds previously captured children back
+// into the newly captured ancestor, rather than recording intermediate edits.
+struct SnapshotJournal {
+    private(set) var snapshots: [Snapshot] = []
+
+    mutating func capture(_ paths: [WorkspacePath], from filesystem: any FileSystem) async throws {
+        for path in paths.sorted() {
+            if snapshots.contains(where: { Snapshot.contains($0.rootPath, path) }) { continue }
+            var snapshot = try await Snapshot.capture(from: filesystem, at: path)
+            for old in snapshots where Snapshot.contains(path, old.rootPath) {
+                snapshot.entry = Snapshot.replacing(snapshot.entry, with: old.entry)
+            }
+            snapshots.removeAll { Snapshot.contains(path, $0.rootPath) }
+            snapshots.append(snapshot)
+        }
+    }
+
+    func captureAfter(from filesystem: any FileSystem) async throws -> [Snapshot] {
+        var result: [Snapshot] = []
+        for snapshot in snapshots {
+            result.append(try await Snapshot.capture(from: filesystem, at: snapshot.rootPath))
+        }
+        return result
+    }
+}
+
+extension Snapshot {
+    static func contains(_ root: WorkspacePath, _ path: WorkspacePath) -> Bool {
+        root.isRoot || root == path || path.string.hasPrefix(root.string + "/")
+    }
+
+    static func replacing(_ tree: Entry, with replacement: Entry) -> Entry {
+        if tree.path == replacement.path { return replacement }
+        guard case var .directory(directory) = tree, contains(tree.path, replacement.path) else { return tree }
+        if let index = directory.children.firstIndex(where: { contains($0.path, replacement.path) }) {
+            directory.children[index] = replacing(directory.children[index], with: replacement)
+        } else if replacement.path.dirname == tree.path {
+            directory.children.append(replacement)
+        }
+        if case .missing = replacement {
+            directory.children.removeAll { $0.path == replacement.path }
+        }
+        directory.children.sort { $0.path < $1.path }
+        return .directory(directory)
     }
 }

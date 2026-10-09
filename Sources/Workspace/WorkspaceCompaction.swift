@@ -67,6 +67,9 @@ extension Workspace {
     ///
     /// A dry run performs the same validation and returns projected statistics without changing storage.
     public func compact(retaining retention: Retention, dryRun: Bool = false) async throws -> CompactionReport {
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
         try await ensureLoaded()
         let result = try await store.compact(workspaceId: workspaceId, retaining: retention, dryRun: dryRun)
         if !dryRun {

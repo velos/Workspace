@@ -75,6 +75,7 @@ print(result.changes.statistics.additions)
 ```
 
 `apply` is atomic by default. `.stopOnError` and `.continueAfterError` expose partial failures explicitly.
+Atomic recovery does not track hard-link aliases outside captured roots or roll back permission changes to symlink entries.
 
 Direct conveniences—`writeText`, `writeData`, `appendText`, `createDirectory`, `remove`, `copy`, `move`, link creation, and permission changes—use the same edit pipeline.
 
@@ -168,6 +169,8 @@ let report = try await workspace.compact(retaining: .latest(50))
 Compaction rebases retained checkpoints to their nearest retained ancestor and recomputes their summaries. Retained rollback and transaction checkpoints also retain an existing checkpoint they reference as provenance. `.all` keeps every checkpoint while sweeping orphaned manifests and blobs.
 
 Directory-backed stores serialize checkpoint commits, revision reads, and compaction with a persistent lifecycle lock. Mutation history is independent and is not pruned by checkpoint retention.
+
+Store format version 1 is retained so existing stores remain readable. Once a store contains `mutations.sequence.json`, do not use older library versions that ignore this file to write to that store, including through concurrent instances or after a downgrade: those writers can reuse retracted mutation sequence numbers. All writers must preserve the sequence high-water mark.
 
 Directory-backed checkpoint capture also reuses existing CAS blobs when a file's size and available
 modification timestamp are unchanged. It still walks directory metadata for correctness, but only

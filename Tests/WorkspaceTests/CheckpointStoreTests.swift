@@ -4,6 +4,30 @@ import Testing
 
 @Suite("Checkpoint store")
 struct CheckpointStoreTests {
+    @Test(arguments: [false, true])
+    func `retraction never reuses an observed sequence`(diskBacked: Bool) async throws {
+        let root = try TestSupport.temporaryDirectory("SequenceRetraction")
+        defer { TestSupport.remove(root) }
+        let id = UUID()
+        var store: any CheckpointStore = diskBacked
+            ? FileCheckpointStore(rootDirectory: root) : InMemoryCheckpointStore()
+        let first = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/a"))
+        let retracted = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/b"))
+        try await store.removeMutation(sequence: retracted.sequence, workspaceId: id)
+        if diskBacked { store = FileCheckpointStore(rootDirectory: root) }
+        let next = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/c"))
+        let assigned: [Int] = [first.sequence, retracted.sequence, next.sequence]
+        #expect(assigned == [1, 2, 3])
+        #expect(try await store.listMutations(workspaceId: id).map(\.sequence) == [1, 3])
+        try await store.removeMutation(sequence: first.sequence, workspaceId: id)
+        try await store.removeMutation(sequence: next.sequence, workspaceId: id)
+        if diskBacked { store = FileCheckpointStore(rootDirectory: root) }
+        let afterEmpty = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/d"))
+        #expect(afterEmpty.sequence == 4)
+        let other = try await store.appendMutation(Self.sampleMutation(workspaceID: UUID(), path: "/a"))
+        #expect(other.sequence == 1)
+    }
+
     @Test
     func `in-memory store isolates workspaces and assigns mutation sequences`() async throws {
         let store = InMemoryCheckpointStore()

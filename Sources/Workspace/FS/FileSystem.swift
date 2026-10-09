@@ -59,6 +59,19 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
     }
 }
 
+/// An operation failed and recovery also failed, either while restoring the
+/// previous filesystem state or while retracting its mutation-history record.
+public struct WorkspaceRollbackError: Error, CustomStringConvertible, Sendable {
+    /// The operation or persistence error that triggered recovery.
+    public let originalError: any Error
+    /// The error encountered while restoring files or retracting history.
+    public let rollbackError: any Error
+
+    public var description: String {
+        "\(originalError); restoring the previous state also failed: \(rollbackError)"
+    }
+}
+
 /// Metadata describing a filesystem entry.
 public struct FileInfo: Sendable, Codable {
     /// The normalized path for the entry.
