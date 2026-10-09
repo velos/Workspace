@@ -5,7 +5,7 @@ import Foundation
 ///
 /// This adapter is intended for iOS and macOS workflows where filesystem access must be granted through
 /// a bookmark or document picker URL.
-public final class SecurityScopedFileSystem: FileSystem, @unchecked Sendable {
+public final class SecurityScopedFileSystem: FileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     /// The permitted mutability for the scoped filesystem.
     public enum AccessMode: Sendable {
         /// Only read operations are allowed.
@@ -165,6 +165,10 @@ public final class SecurityScopedFileSystem: FileSystem, @unchecked Sendable {
     /// See ``FileSystem/capabilities()``.
     public func capabilities() async -> FileSystemFeatures {
         await backing.capabilities()
+    }
+
+    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        try await backing.resolvePotentialPath(path: path)
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.

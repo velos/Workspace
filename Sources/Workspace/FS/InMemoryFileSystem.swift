@@ -13,7 +13,7 @@ import Glibc
 ///
 /// Actor isolation serializes access to the tree so the filesystem can be shared safely across
 /// concurrent tasks.
-public actor InMemoryFileSystem: FileSystem {
+public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
     private final class Node {
         enum Kind {
             case file(Data)
@@ -134,15 +134,7 @@ public actor InMemoryFileSystem: FileSystem {
             throw posixError(EISDIR)
         }
 
-        var writePath = path
-        var depth = 0
-        while depth < 64, let symlinkTarget = try symlinkTargetIfPresent(at: writePath) {
-            writePath = WorkspacePath(normalizing: symlinkTarget, relativeTo: writePath.dirname)
-            depth += 1
-        }
-        if depth >= 64 {
-            throw posixError(ELOOP)
-        }
+        let writePath = try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0, allowMissing: true)
 
         let (parent, name) = try parentDirectoryAndName(for: writePath)
         var children = try directoryChildren(of: parent)
@@ -480,18 +472,6 @@ public actor InMemoryFileSystem: FileSystem {
         return (parent, name, entry)
     }
 
-    private func symlinkTargetIfPresent(at path: WorkspacePath) throws -> String? {
-        guard let (_, _, entry) = try parentDirectoryEntryIfPresent(for: path) else {
-            return nil
-        }
-
-        if case let .symlink(target) = entry.kind {
-            return target
-        }
-
-        return nil
-    }
-
     private func node(at path: WorkspacePath, followFinalSymlink: Bool, symlinkDepth: Int = 0) throws -> Node {
         if symlinkDepth > 64 {
             throw posixError(ELOOP)
@@ -531,7 +511,13 @@ public actor InMemoryFileSystem: FileSystem {
         return current
     }
 
-    private func resolvePath(path: WorkspacePath, followFinalSymlink: Bool, symlinkDepth: Int) throws -> WorkspacePath {
+    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0, allowMissing: true)
+    }
+
+    private func resolvePath(
+        path: WorkspacePath, followFinalSymlink: Bool, symlinkDepth: Int, allowMissing: Bool = false
+    ) throws -> WorkspacePath {
         if symlinkDepth > 64 {
             throw posixError(ELOOP)
         }
@@ -550,6 +536,9 @@ public actor InMemoryFileSystem: FileSystem {
             }
 
             guard let child = children[component] else {
+                if allowMissing {
+                    return resolvedPath.appending(components.dropFirst(index).joined(separator: "/"))
+                }
                 throw posixError(ENOENT)
             }
 
@@ -559,7 +548,10 @@ public actor InMemoryFileSystem: FileSystem {
                 let targetPath = WorkspacePath(normalizing: target, relativeTo: resolvedPath)
                 let remaining = components.suffix(from: index + 1).joined(separator: "/")
                 let combined = remaining.isEmpty ? targetPath : targetPath.appending(remaining)
-                return try resolvePath(path: combined, followFinalSymlink: followFinalSymlink, symlinkDepth: symlinkDepth + 1)
+                return try resolvePath(
+                    path: combined, followFinalSymlink: followFinalSymlink,
+                    symlinkDepth: symlinkDepth + 1, allowMissing: allowMissing
+                )
             }
 
             current = child

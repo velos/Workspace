@@ -185,7 +185,7 @@ struct FileSystemRegressionTests {
     }
 
     @Test
-    func `unknown identities conservatively protect preexisting disk aliases`() async throws {
+    func `preexisting disk hard links charge every path and replacement breaks sharing`() async throws {
         let root = try TestSupport.temporaryDirectory("LimitedDiskAliases")
         defer { TestSupport.remove(root) }
         let disk = try LocalFileSystem(root: root)
@@ -198,6 +198,8 @@ struct FileSystemRegressionTests {
         #expect(try await disk.readFile(path: "/file") == Data("ab".utf8))
         try await limited.writeFile(path: "/alias", data: Data("abc".utf8), append: false)
         #expect(try await disk.stat(path: "/file").size == 2)
+        #expect(try await disk.readFile(path: "/alias") == Data("abc".utf8))
+        #expect(try await disk.stat(path: "/alias").identity != disk.stat(path: "/file").identity)
     }
 
     @Test
@@ -298,13 +300,14 @@ struct FileSystemRegressionTests {
         defer { TestSupport.remove(root) }
         let disk = try LocalFileSystem(root: root)
         try await disk.writeFile(path: "/file", data: Data("ab".utf8), append: false)
-        try await disk.createSymlink(path: "/link", target: "/file")
+        try await disk.createSymlink(path: "/link", target: "file")
         let diskLimited = LimitedFileSystem(base: disk, limits: .init(maxTotalBytes: 3))
-        await #expect(throws: FileSystemLimitError.totalBytes(attempted: 5, limit: 3)) {
-            try await diskLimited.writeFile(path: "/link", data: Data("xyz".utf8), append: false)
+        try await diskLimited.writeFile(path: "/link", data: Data("xyz".utf8), append: false)
+        await #expect(throws: FileSystemLimitError.totalBytes(attempted: 4, limit: 3)) {
+            try await diskLimited.writeFile(path: "/link", data: Data("wxyz".utf8), append: false)
         }
         #expect(try await disk.stat(path: "/link").kind == .symlink)
-        #expect(try await disk.readFile(path: "/file") == Data("ab".utf8))
+        #expect(try await disk.readFile(path: "/file") == Data("xyz".utf8))
     }
 
     @Test

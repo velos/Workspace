@@ -1,7 +1,7 @@
 import Foundation
 
 /// A disk-backed filesystem rooted in a standard app sandbox location.
-public final class SandboxFileSystem: FileSystem, Sendable {
+public final class SandboxFileSystem: FileSystem, PotentialPathResolvingFileSystem, Sendable {
     /// Supported strategies for choosing the sandbox root.
     public enum Root: Sendable {
         /// The user's documents directory.
@@ -61,6 +61,10 @@ public final class SandboxFileSystem: FileSystem, Sendable {
     /// See ``FileSystem/capabilities()``.
     public func capabilities() async -> FileSystemFeatures {
         await backing.capabilities()
+    }
+
+    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        try await backing.resolvePotentialPath(path: path)
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.

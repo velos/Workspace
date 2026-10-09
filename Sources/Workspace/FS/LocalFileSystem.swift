@@ -18,7 +18,7 @@ private typealias LocalStat = Glibc.stat
 /// This is a safety layer, not a sandbox: a host process can relocate an already-open directory
 /// outside the root, change hard-linked data, or mutate entries during recursive operations.
 /// Watch subscriptions still use the configured URL and are not descriptor-pinned.
-public final class LocalFileSystem: FileSystem, @unchecked Sendable {
+public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     /// Returns zero on success or a captured POSIX errno on failure. Injection is per-instance
     /// so unsupported filesystem behavior can be tested without mounts or global syscall hooks.
     typealias ExclusiveRename = @Sendable (Int32, String, Int32, String) -> Int32
@@ -169,6 +169,7 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
 
     private func resolve(
         _ path: WorkspacePath, followFinal: Bool, createParents: Bool = false,
+        allowMissingAncestors: Bool = false,
         configuration: ConfigurationSnapshot? = nil
     ) throws -> Entry {
         let config = try configuration ?? requireConfiguration()
@@ -178,6 +179,7 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
         var pending = path.components
         var current = config.root
         var names: [String] = []
+        var missingAncestor = false
         var hops = 0
         while !pending.isEmpty {
             let name = pending.removeFirst()
@@ -190,9 +192,16 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
                 }
                 names.removeLast()
                 current = config.root
+                missingAncestor = false
                 for ancestor in names {
                     let entry = Entry(parent: current, name: ancestor, path: .root)
-                    current = try openEntry(entry, flags: Self.searchDirectoryFlags)
+                    do {
+                        current = try openEntry(entry, flags: Self.searchDirectoryFlags)
+                    } catch let error as NSError where allowMissingAncestors
+                        && error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+                        missingAncestor = true
+                        break
+                    }
                 }
                 continue
             }
@@ -203,12 +212,24 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
             if final && !followFinal {
                 return entry
             }
+            // Only potential-path resolution permits missing ancestors. The descriptor is
+            // no longer an operation target; this mode consumes only the resulting path.
+            if missingAncestor {
+                if final { return entry }
+                names.append(name)
+                continue
+            }
             var info: LocalStat
             do {
                 info = try metadata(entry)
             } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
                 if final {
                     return entry
+                }
+                if allowMissingAncestors {
+                    names.append(name)
+                    missingAncestor = true
+                    continue
                 }
                 guard createParents else {
                     throw error
@@ -260,7 +281,9 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
         return FileInfo(
             path: path, kind: type == S_IFLNK ? .symlink : (type == S_IFDIR ? .directory : .file),
             size: UInt64(max(0, info.st_size)), permissions: POSIXPermissions(Int(info.st_mode & 0o7777)),
-            modificationDate: Date(timeIntervalSince1970: Double(modified.tv_sec) + Double(modified.tv_nsec) / 1e9))
+            modificationDate: Date(timeIntervalSince1970: Double(modified.tv_sec) + Double(modified.tv_nsec) / 1e9),
+            identity: FileIdentity(device: UInt64(truncatingIfNeeded: info.st_dev), inode: UInt64(info.st_ino)),
+            linkCount: type == S_IFDIR ? nil : UInt64(info.st_nlink))
     }
 
     /// See ``FileSystem/stat(path:)``.
@@ -415,8 +438,9 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/writeFile(path:data:append:)``.
     ///
-    /// Replacement is atomic and breaks hard-link sharing; append preserves the opened inode.
-    /// Symlink targets are resolved explicitly before either operation.
+    /// Replacement writes follow in-root final symlinks and atomically replace the target,
+    /// breaking its hard-link sharing. Links that escape the root are rejected.
+    /// Appends preserve the opened inode.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
         let entry = try resolve(path, followFinal: true, createParents: true)
         if append {
@@ -650,6 +674,10 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
         return entry.path
     }
 
+    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        try resolve(path, followFinal: true, allowMissingAncestors: true).path
+    }
+
     /// See ``FileSystem/exists(path:)``.
     ///
     /// Uses lstat semantics, so a final dangling symlink still exists.
@@ -659,7 +687,7 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
 
     /// See ``FileSystem/capabilities()``.
     public func capabilities() async -> FileSystemFeatures {
-        [.symlinks, .hardLinks, .permissions, .realPathResolution]
+        [.symlinks, .hardLinks, .permissions, .realPathResolution, .replacementFollowsFinalSymlink]
     }
 
     /// See ``FileSystem/glob(pattern:currentDirectory:)``.

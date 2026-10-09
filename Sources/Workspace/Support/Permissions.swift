@@ -466,13 +466,9 @@ public final class AuthorizedFileSystem: FileSystem, Sendable {
         }
         var resolved = request
         switch request.operation {
-        case .stat, .remove, .readSymlink:
+        case .stat, .remove, .readSymlink, .exists:
             if let path = request.path {
                 resolved.path = try await resolvedPath(path, followFinal: false)
-            }
-        case .exists:
-            if let path = request.path {
-                resolved.path = try await resolvedPath(path, followFinal: true)
             }
         case .move, .copy:
             if let path = request.sourcePath {
@@ -490,7 +486,7 @@ public final class AuthorizedFileSystem: FileSystem, Sendable {
             }
         case .glob:
             // Glob enumerates entries without dereferencing matched final links.
-            // Only its non-pattern prefix needs resolution.
+            // Only its non-pattern prefix needs resolution; an exact path uses lstat semantics.
             if let path = request.path {
                 var prefix = WorkspacePath.root
                 var suffix: [String] = []
@@ -501,7 +497,7 @@ public final class AuthorizedFileSystem: FileSystem, Sendable {
                         prefix = prefix.appending(component)
                     }
                 }
-                var target = try await resolvedPath(prefix, followFinal: true)
+                var target = try await resolvedPath(prefix, followFinal: !suffix.isEmpty)
                 for component in suffix {
                     target = target.appending(component)
                 }

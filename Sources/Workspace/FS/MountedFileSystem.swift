@@ -10,7 +10,7 @@ import Glibc
 ///
 /// Each mount is exposed at a virtual path, allowing callers to present a single workspace assembled
 /// from multiple independent roots.
-public final class MountedFileSystem: FileSystem, @unchecked Sendable {
+public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     /// A mounted filesystem and the virtual path where it appears.
     public struct Mount: Sendable {
         /// The normalized virtual mount point.

@@ -214,6 +214,12 @@ public protocol FileSystemChangeSource: FileSystem {
     func changes() async throws -> AsyncStream<Void>
 }
 
+/// Resolves links in the backend's namespace without requiring the target to exist.
+/// Missing parent suffixes are retained for quota preflight without creating them.
+protocol PotentialPathResolvingFileSystem: FileSystem {
+    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath
+}
+
 extension FileSystem {
     /// The default implementation throws ``WorkspaceError/unsupported(_:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {

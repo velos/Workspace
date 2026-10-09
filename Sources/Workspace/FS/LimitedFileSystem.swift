@@ -46,7 +46,7 @@ public enum FileSystemLimitError: Error, Sendable, Equatable, CustomStringConver
 /// Custom backends must follow standard mutation semantics: replacement changes one entry;
 /// append updates aliases; parents may be created. A composition cycle (for example a Mounted
 /// base that mounts this same LimitedFileSystem) deadlocks while the gate is held.
-public actor LimitedFileSystem: FileSystem {
+public actor LimitedFileSystem: FileSystem, PotentialPathResolvingFileSystem {
     private let base: any FileSystem
     private let pathResolver: FileSystemPathResolver
     public let limits: FileSystemLimits
@@ -74,6 +74,9 @@ public actor LimitedFileSystem: FileSystem {
     public func readSymlink(path: WorkspacePath) async throws -> String { try await base.readSymlink(path: path) }
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await base.resolveRealPath(path: path)
+    }
+    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        try await pathResolver.resolve(path, features: await base.capabilities(), followFinal: true)
     }
     public func exists(path: WorkspacePath) async -> Bool { await base.exists(path: path) }
     public func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
@@ -333,17 +336,13 @@ public actor LimitedFileSystem: FileSystem {
     }
 }
 
-// Resolves in the backend's own namespace. A Mounted backend owns the interpretation of
-// absolute symlink targets; only it can translate a dangling target back to a virtual path.
-// Only a directly held MountedFileSystem is special-cased. When another decorator wraps
-// MountedFileSystem, dangling links inside a mount fall back to virtual-namespace resolution.
+// Prefer backend-owned resolution so physical parents and absolute targets retain their
+// backend meaning, including through decorators. Older backends use the heuristic below.
 struct FileSystemPathResolver: Sendable {
     private let base: any FileSystem
-    private let mounted: MountedFileSystem?
 
     init(base: any FileSystem) {
         self.base = base
-        mounted = base as? MountedFileSystem
     }
 
     func resolve(
@@ -354,6 +353,9 @@ struct FileSystemPathResolver: Sendable {
         if !followFinal, !path.isRoot {
             return try await resolve(path.dirname, in: tree, features: features, followFinal: true, depth: depth)
                 .appending(path.basename)
+        }
+        if let resolving = base as? any PotentialPathResolvingFileSystem {
+            return try await resolving.resolvePotentialPath(path: path)
         }
         if features.contains(.realPathResolution) {
             var ancestor = path
@@ -368,9 +370,11 @@ struct FileSystemPathResolver: Sendable {
                     // uses lstat paths. Ask the backend to resolve those intermediate links.
                     let info = try? await base.stat(path: ancestor)
                     if info?.kind == .symlink {
-                        if let mounted { return try await mounted.resolvePotentialPath(path: path) }
                         let target = try await base.readSymlink(path: ancestor)
-                        let targetPath = try WorkspacePath(validating: target, relativeTo: ancestor.dirname)
+                        let parent = try await resolve(
+                            ancestor.dirname, in: tree, features: features, followFinal: true, depth: depth + 1
+                        )
+                        let targetPath = try WorkspacePath(validating: target, relativeTo: parent)
                         let combined = missing.isEmpty ? targetPath : targetPath.appending(missing.reversed().joined(separator: "/"))
                         return try await resolve(combined, in: tree, features: features, followFinal: true, depth: depth + 1)
                     }
@@ -379,7 +383,6 @@ struct FileSystemPathResolver: Sendable {
                 }
             }
         }
-        if let mounted { return try await mounted.resolvePotentialPath(path: path) }
         var current = WorkspacePath.root
         for (index, component) in path.components.enumerated() {
             current = current.appending(component)

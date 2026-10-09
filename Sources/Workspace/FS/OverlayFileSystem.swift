@@ -14,6 +14,9 @@ import Glibc
 /// copied up by a mutation. Deletions are recorded as whiteouts that hide the lower entry, and
 /// directory listings merge both layers with upper entries shadowing lower ones.
 ///
+/// File identities are forwarded from whichever layer holds the entry. Copy-up gives a file a new
+/// identity, so limits charge appends to a hard-linked lower file conservatively.
+///
 /// `reload()` (or `configure(rootDirectory:)`) discards the upper layer and whiteouts, so the
 /// overlay reflects the source directory's current state again.
 public actor OverlayFileSystem: FileSystem {
@@ -183,7 +186,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
-        guard let target = try? await resolveMergedPath(path) else {
+        guard let target = try? await resolveMergedPath(path, followFinal: false) else {
             return false
         }
         return await mergedEntry(target) != nil
