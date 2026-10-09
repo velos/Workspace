@@ -36,6 +36,8 @@ public struct TextDiffOmission: Sendable, Codable, Equatable {
     public enum Reason: String, Sendable, Codable {
         case binary
         case sizeLimitExceeded
+        /// The tool adapter omitted text to fit its encoded output budget.
+        case outputBudgetExceeded
     }
 
     public var path: WorkspacePath

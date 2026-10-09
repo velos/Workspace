@@ -72,6 +72,20 @@ public actor WorkspaceToolAdapter {
     public nonisolated static let defaultSearchMaxBytes = 65_536
     public nonisolated static let minimumSearchMaxBytes = SearchRequest.Limits.minimumOutputBytes
     public nonisolated static let maximumSearchMaxBytes = 262_144
+    /// Glob, diff, and apply budgets include JSON escaping and result metadata.
+    public nonisolated static let defaultResultMaxBytes = 65_536
+    public nonisolated static let minimumResultMaxBytes = 1_024
+    public nonisolated static let maximumResultMaxBytes = 262_144
+    public nonisolated static let defaultFileDetailMaxBytes = 8_192
+    public nonisolated static let maximumFileDetailMaxBytes = 65_536
+    public nonisolated static let defaultGlobMaxMatches = 1_000
+    public nonisolated static let maximumGlobMaxMatches = 10_000
+    private nonisolated static var resultBudgetSchema: JSONValue {
+        .integerSchema("Maximum encoded result bytes; default \(defaultResultMaxBytes), minimum \(minimumResultMaxBytes). Larger values clamp to \(maximumResultMaxBytes).", minimum: minimumResultMaxBytes, maximum: maximumResultMaxBytes)
+    }
+    private nonisolated static var fileBudgetSchema: JSONValue {
+        .integerSchema("Maximum encoded diff bytes per file in this result, including optional patch; default \(defaultFileDetailMaxBytes). Larger values clamp to \(maximumFileDetailMaxBytes).", minimum: 0, maximum: maximumFileDetailMaxBytes)
+    }
     private nonisolated static let defaultDiffMaxBytes = DiffOptions.default.maxTextBytes ?? Int.max
 
     public nonisolated static let definitions: [WorkspaceToolDefinition] = [
@@ -90,11 +104,14 @@ public actor WorkspaceToolAdapter {
         ),
         .init(
             name: "workspace_glob",
-            description: "List workspace paths matching a glob in deterministic order.",
+            description: "List matching workspace paths in deterministic order within max_matches and max_bytes. If nextMatchOffset is present, call again with match_offset set to it. Narrow pattern or current_directory to reduce matches.",
             inputSchema: .schema(
                 properties: [
                     "pattern": .stringSchema("Glob pattern."),
                     "current_directory": .stringSchema("Directory used to resolve the pattern."),
+                    "match_offset": .integerSchema("Matches to skip; default 0. Continue at nextMatchOffset.", minimum: 0),
+                    "max_matches": .integerSchema("Maximum matches per page; default \(defaultGlobMaxMatches). Larger values clamp to \(maximumGlobMaxMatches).", minimum: 1, maximum: maximumGlobMaxMatches),
+                    "max_bytes": resultBudgetSchema,
                     "checkpoint_id": .stringSchema("Optional checkpoint UUID."),
                 ],
                 required: ["pattern"]
@@ -120,9 +137,11 @@ public actor WorkspaceToolAdapter {
         ),
         .init(
             name: "workspace_apply",
-            description: "Atomically apply recorded text, directory, removal, copy, or move edits.",
+            description: "Atomically apply all edits and return bounded ChangeSet detail. Inspect truncated, omittedFiles, and omittedTextDiffs; statistics cover the full effect. Use workspace_read to inspect omitted files, or create a checkpoint before applying and diff from it. Do not repeat edits to retrieve detail.",
             inputSchema: .schema(
                 properties: [
+                    "max_bytes": resultBudgetSchema,
+                    "max_file_bytes": fileBudgetSchema,
                     "edits": .arraySchema(
                         items: .schema(
                             properties: [
@@ -141,13 +160,17 @@ public actor WorkspaceToolAdapter {
         ),
         .init(
             name: "workspace_diff",
-            description: "Compare checkpoints or current state and return a ChangeSet plus optional unified patch.",
+            description: "Compare revisions and return bounded ChangeSet detail plus optional unified patch. If nextChangeOffset is present, call again with change_offset set to it using the same revisions and paths. Narrow paths or increase max_file_bytes to inspect omitted text; use workspace_read for full file contents. Inspect truncated and omittedFiles. Statistics cover all selected changes with available text diffs.",
             inputSchema: .schema(
                 properties: [
+                    "max_bytes": resultBudgetSchema,
+                    "max_file_bytes": fileBudgetSchema,
+                    "change_offset": .integerSchema("Changes to skip; default 0. Continue at nextChangeOffset.", minimum: 0),
+                    "paths": .arraySchema(items: .stringSchema("Exact workspace path to include; omit to compare all paths.")),
                     "from_checkpoint_id": .stringSchema("Source checkpoint UUID; omit for current state."),
                     "to_checkpoint_id": .stringSchema("Destination checkpoint UUID; omit for current state."),
                     "unified_patch": .booleanSchema("Include git-style textual patch output."),
-                    "max_text_bytes": .integerSchema("Maximum bytes per file for text diffing; default and cap \(defaultDiffMaxBytes).", minimum: 0, maximum: defaultDiffMaxBytes),
+                    "max_text_bytes": .integerSchema("Skip text diffing for files larger than this many source bytes; default and cap \(defaultDiffMaxBytes).", minimum: 0, maximum: defaultDiffMaxBytes),
                 ]
             )
         ),
@@ -171,16 +194,15 @@ public actor WorkspaceToolAdapter {
                                                      minimum: Self.minimumReadMaxBytes, maximum: Self.maximumReadMaxBytes, name: "max_bytes")
                 let offset = request.offset ?? 0
                 let revision = try request.revision()
-                let (readPath, totalBytes) = try await workspace.revisionFileSize(at: request.path, revision: revision)
+                let file = try await workspace.resolvedReadableFile(at: request.path, revision: revision)
+                let totalBytes = file.size
                 let length = offset < totalBytes ? Int(min(UInt64(maxBytes), totalBytes - offset)) : 0
-                let read = try await workspace.readData(from: readPath, at: revision, offset: offset, length: length)
+                let read = try await file.readRange(offset, length)
                 let data = Data(read.prefix(length))
                 var leadingContext = Data()
                 if offset > 0, let first = data.first, (0x80...0xBF).contains(first) {
                     let count = Int(min(offset, 3))
-                    leadingContext = try await workspace.readData(
-                        from: readPath, at: revision, offset: offset - UInt64(count), length: count
-                    )
+                    leadingContext = try await file.readRange(offset - UInt64(count), count)
                 }
                 let (content, end) = try toolTextPage(data, path: request.path,
                     hasMore: offset < totalBytes && UInt64(data.count) < totalBytes - offset,
@@ -194,30 +216,40 @@ public actor WorkspaceToolAdapter {
                     nextOffset: nextOffset, totalBytes: totalBytes, truncated: nextOffset < totalBytes))
             case "workspace_glob":
                 let request = try decoder.decode(GlobArguments.self, from: arguments)
-                return try encoder.encode(
-                    try await workspace.glob(
-                        request.pattern,
-                        currentDirectory: request.currentDirectory ?? .root,
-                        at: request.revision()
-                    )
-                )
+                let budget = try toolResultBudget(request.maxBytes)
+                let offset = try boundedToolInteger(request.matchOffset, default: 0, minimum: 0, maximum: Int.max, name: "match_offset")
+                let count = try boundedToolInteger(request.maxMatches, default: Self.defaultGlobMaxMatches, minimum: 1,
+                                                  maximum: Self.maximumGlobMaxMatches, name: "max_matches")
+                let matches = try await workspace.glob(request.pattern, currentDirectory: request.currentDirectory ?? .root,
+                                                       at: request.revision()).sorted()
+                return try boundedGlobOutput(matches, offset: offset, maxMatches: count, maxBytes: budget, encoder: encoder)
             case "workspace_search":
                 let request = try decoder.decode(SearchArguments.self, from: arguments)
                 return try encoder.encode(try await workspace.search(request.request()))
             case "workspace_apply":
                 let request = try decoder.decode(ApplyArguments.self, from: arguments)
-                return try encoder.encode(try await workspace.apply(try request.edits.map { try $0.edit }))
+                let budget = try toolResultBudget(request.maxBytes)
+                let fileBudget = try toolFileBudget(request.maxFileBytes)
+                let result = try await workspace.apply(try request.edits.map { try $0.edit })
+                return boundedApplyOutput(result.changes, maxBytes: budget, maxFileBytes: fileBudget, encoder: encoder)
             case "workspace_diff":
                 let request = try decoder.decode(DiffArguments.self, from: arguments)
-                let changes = try await workspace.diff(
+                let budget = try toolResultBudget(request.maxBytes)
+                let fileBudget = try toolFileBudget(request.maxFileBytes)
+                let offset = try boundedToolInteger(request.changeOffset, default: 0, minimum: 0, maximum: Int.max, name: "change_offset")
+                var changes = try await workspace.diff(
                     from: try request.revision(request.fromCheckpointID),
                     to: try request.revision(request.toCheckpointID),
                     options: .init(maxTextBytes: try boundedToolInteger(request.maxTextBytes, default: Self.defaultDiffMaxBytes,
                         minimum: 0, maximum: Self.defaultDiffMaxBytes, name: "max_text_bytes"))
                 )
-                return try encoder.encode(
-                    DiffOutput(changes: changes, unifiedPatch: request.unifiedPatch == true ? changes.unifiedPatch() : nil)
-                )
+                if let paths = request.paths {
+                    let selected = Set(paths)
+                    changes = ChangeSet(changes: changes.changes.filter { selected.contains($0.path) },
+                                        textDiffOmissions: changes.textDiffOmissions.filter { selected.contains($0.path) })
+                }
+                return try boundedChangesOutput(changes, offset: offset, maxBytes: budget, maxFileBytes: fileBudget,
+                                                patch: request.unifiedPatch == true, applying: false, encoder: encoder)
             case "workspace_checkpoint":
                 let request = try decoder.decode(CheckpointArguments.self, from: arguments)
                 return try encoder.encode(try await workspace.createCheckpoint(label: request.label))
@@ -258,7 +290,13 @@ private struct GlobArguments: Decodable {
     var pattern: String
     var currentDirectory: WorkspacePath?
     var checkpointID: String?
+    var matchOffset: Int?
+    var maxMatches: Int?
+    var maxBytes: Int?
     enum CodingKeys: String, CodingKey {
+        case matchOffset = "match_offset"
+        case maxMatches = "max_matches"
+        case maxBytes = "max_bytes"
         case pattern
         case currentDirectory = "current_directory"
         case checkpointID = "checkpoint_id"
@@ -315,7 +353,16 @@ private struct SearchArguments: Decodable {
     }
 }
 
-private struct ApplyArguments: Decodable { var edits: [ToolEdit] }
+private struct ApplyArguments: Decodable {
+    var edits: [ToolEdit]
+    var maxBytes: Int?
+    var maxFileBytes: Int?
+    enum CodingKeys: String, CodingKey {
+        case edits
+        case maxBytes = "max_bytes"
+        case maxFileBytes = "max_file_bytes"
+    }
+}
 
 private struct ToolEdit: Decodable {
     var kind: String
@@ -344,7 +391,15 @@ private struct DiffArguments: Decodable {
     var toCheckpointID: String?
     var unifiedPatch: Bool?
     var maxTextBytes: Int?
+    var maxBytes: Int?
+    var maxFileBytes: Int?
+    var changeOffset: Int?
+    var paths: [WorkspacePath]?
     enum CodingKeys: String, CodingKey {
+        case paths
+        case maxBytes = "max_bytes"
+        case maxFileBytes = "max_file_bytes"
+        case changeOffset = "change_offset"
         case fromCheckpointID = "from_checkpoint_id"
         case toCheckpointID = "to_checkpoint_id"
         case unifiedPatch = "unified_patch"
@@ -353,7 +408,6 @@ private struct DiffArguments: Decodable {
     func revision(_ value: String?) throws -> Revision { try toolRevision(value) }
 }
 
-private struct DiffOutput: Encodable { var changes: ChangeSet; var unifiedPatch: String? }
 private struct CheckpointArguments: Decodable { var label: String? }
 
 private func toolRevision(_ value: String?) throws -> Revision {
@@ -447,4 +501,15 @@ private func toolTextPage(
         }
     }
     throw WorkspaceError.invalidEncoding(path)
+}
+
+private func toolResultBudget(_ value: Int?) throws -> Int {
+    try boundedToolInteger(value, default: WorkspaceToolAdapter.defaultResultMaxBytes,
+                           minimum: WorkspaceToolAdapter.minimumResultMaxBytes,
+                           maximum: WorkspaceToolAdapter.maximumResultMaxBytes, name: "max_bytes")
+}
+
+private func toolFileBudget(_ value: Int?) throws -> Int {
+    try boundedToolInteger(value, default: WorkspaceToolAdapter.defaultFileDetailMaxBytes, minimum: 0,
+                           maximum: WorkspaceToolAdapter.maximumFileDetailMaxBytes, name: "max_file_bytes")
 }

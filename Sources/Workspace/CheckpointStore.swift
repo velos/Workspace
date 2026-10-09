@@ -60,6 +60,8 @@ extension CheckpointStore {
 actor InMemoryCheckpointStore: CheckpointStore {
     private var checkpointsByWorkspace: [UUID: [Checkpoint]] = [:]
     private var snapshotsByWorkspace: [UUID: [UUID: Snapshot]] = [:]
+    private(set) var revisionIndexBuildCount = 0
+    private var revisionIndexesByWorkspace: [UUID: [UUID: RevisionIndex]] = [:]
     private var mutationsByWorkspace: [UUID: [Mutation]] = [:]
     private var mutationHighWaterMarks: [UUID: Int] = [:]
     private var mutationRetractionEpochs: [UUID: Int] = [:]
@@ -102,6 +104,7 @@ actor InMemoryCheckpointStore: CheckpointStore {
             parentSnapshot: parentSnapshot
         )
         snapshotsByWorkspace[draft.workspaceID, default: [:]][snapshot.id] = snapshot
+        revisionIndexesByWorkspace[draft.workspaceID]?[snapshot.id] = nil
         list.append(checkpoint)
         checkpointsByWorkspace[draft.workspaceID] = list.sorted(by: Checkpoint.orderedBefore)
         return checkpoint
@@ -125,7 +128,12 @@ actor InMemoryCheckpointStore: CheckpointStore {
     }
 
     func loadRevisionIndex(id: UUID, workspaceId: UUID) async throws -> RevisionIndex? {
-        snapshotsByWorkspace[workspaceId]?[id].map(RevisionIndex.init)
+        if let cached = revisionIndexesByWorkspace[workspaceId]?[id] { return cached }
+        guard let snapshot = snapshotsByWorkspace[workspaceId]?[id] else { return nil }
+        let index = RevisionIndex(snapshot: snapshot)
+        revisionIndexBuildCount += 1
+        revisionIndexesByWorkspace[workspaceId, default: [:]][id] = index
+        return index
     }
 
     func readSnapshotFile(
@@ -220,6 +228,9 @@ actor InMemoryCheckpointStore: CheckpointStore {
         if !dryRun {
             checkpointsByWorkspace[workspaceId] = retained
             snapshotsByWorkspace[workspaceId] = retainedSnapshots
+            revisionIndexesByWorkspace[workspaceId] = revisionIndexesByWorkspace[workspaceId]?.filter {
+                retainedSnapshotIDs.contains($0.key)
+            }
         }
         return StoreCompactionResult(report: report, checkpoints: retained)
     }
@@ -506,10 +517,11 @@ actor FileCheckpointStore: CheckpointStore {
         previousCaptureStartedAt: Date?,
         workspaceId: UUID
     ) async throws -> SnapshotManifest.Node {
-        guard await filesystem.exists(path: path) else {
+        // exists follows the final symlink on some backends, losing dangling
+        // links and cycles. Capture the entry itself, just as Snapshot.capture does.
+        guard let info = try await Snapshot.infoIfPresent(at: path, on: filesystem) else {
             return SnapshotManifest.Node(kind: .missing, path: path)
         }
-        let info = try await filesystem.stat(path: path)
         switch info.kind {
         case .file:
             // Conservatively cover second-resolution and two-second-resolution timestamps.

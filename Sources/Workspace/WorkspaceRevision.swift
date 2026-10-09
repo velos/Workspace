@@ -123,31 +123,17 @@ extension Workspace {
         offset: UInt64 = 0,
         length: Int? = nil
     ) async throws -> Data {
-        let resolved = try await resolvedRevision(revision)
-        var current = path
-        for _ in 0..<64 {
-            guard let entry = resolved.index.entry(at: current) else {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
-            }
-            switch entry {
-            case .file:
-                return try await resolved.readRange(current, offset, length)
-            case let .symbolicLink(_, target, _):
-                current = WorkspacePath(normalizing: target, relativeTo: current.parent)
-            case .directory:
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
-            case .missing:
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
-            }
-        }
-        throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP))
+        let file = try await resolvedReadableFile(at: path, revision: revision)
+        return try await file.readRange(offset, length)
     }
 
-    /// Returns a read path and its size without loading file contents. Current paths
-    /// use filesystem resolution; stat and readData must use that same resolved path.
-    /// Checkpoint symlinks retain revisionData's normalization and POSIX errors.
-    func revisionFileSize(at path: WorkspacePath, revision: Revision) async throws -> (resolvedPath: WorkspacePath, size: UInt64) {
-        let index: RevisionIndex
+    struct ResolvedReadableFile: Sendable {
+        var size: UInt64
+        var readRange: @Sendable (UInt64, Int?) async throws -> Data
+    }
+
+    /// Resolve once for metadata and all reads needed to decode one UTF-8 page.
+    func resolvedReadableFile(at path: WorkspacePath, revision: Revision) async throws -> ResolvedReadableFile {
         switch revision {
         case .current:
             let resolvedPath = try await filesystem.resolveRealPath(path: path)
@@ -155,29 +141,17 @@ extension Workspace {
             guard metadata.kind == .file else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
             }
-            return (resolvedPath, metadata.size)
+            let filesystem = filesystem
+            return ResolvedReadableFile(size: metadata.size, readRange: { offset, length in
+                try await filesystem.readFile(path: resolvedPath, offset: offset, length: length)
+            })
         case .checkpoint:
-            index = try await resolvedRevision(revision).index
+            let resolved = try await resolvedRevision(revision)
+            let file = try resolved.index.readableFile(at: path)
+            return ResolvedReadableFile(size: file.size, readRange: { offset, length in
+                try await resolved.readRange(file.path, offset, length)
+            })
         }
-        var current = path
-        for _ in 0..<64 {
-            guard let entry = index.entry(at: current) else {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
-            }
-            if case .missing = entry {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
-            }
-            let metadata = Self.info(for: entry)
-            if case let .symbolicLink(_, target, _) = entry {
-                current = WorkspacePath(normalizing: target, relativeTo: current.parent)
-                continue
-            }
-            guard metadata.kind == .file else {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
-            }
-            return (current, metadata.size)
-        }
-        throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP))
     }
 
     public func info(_ path: WorkspacePath, at revision: Revision = .current) async throws -> FileInfo {

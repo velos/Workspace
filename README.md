@@ -131,7 +131,14 @@ let changes = try await workspace.diff(
 )
 ```
 
-Checkpoint reads use manifest metadata and load only selected blobs. `TextDiff` includes total line counts, addition/deletion statistics, hunks, and UTF-16 intra-line ranges.
+Checkpoint reads use cached in-memory indexes or persisted manifest metadata, resolve directory
+symlinks inside the workspace namespace (at most 64 hops), and read selected byte ranges without
+materializing whole blobs. `TextDiff` includes total line counts, addition/deletion statistics,
+hunks, and UTF-16 intra-line ranges. Empty and identical inputs and unchanged prefixes/suffixes
+avoid the general diff search. A Myers search preserves sparse edits; if its work or edit-distance
+limit is reached, the unmatched interior uses a coarse replacement hunk. Its statistics describe
+the emitted additions/deletions and may exceed a minimal edit script. The line search and each
+intra-line pair have independent limits of 1,000 edits or 1,000,000 visited search steps.
 
 Use `Workspace.Archive` only when a fully materialized, portable subtree is actually required:
 
@@ -306,6 +313,42 @@ let resultJSON = try await adapter.call(
 All mutating adapter calls use the Workspace edit/checkpoint APIs, so they retain the same history,
 event, transaction, authorization, and limit behavior as direct callers. The diff result carries the
 structured `ChangeSet` and can optionally include unified-patch text for prompt or CLI interop.
+
+Tool arguments use snake_case and results use camelCase. Output budgets for glob, diff, and apply
+count **encoded JSON bytes**, including escaping and metadata: `max_bytes` defaults to 65,536,
+has a minimum of 1,024, and clamps to 262,144. Diff and apply also accept `max_file_bytes` for each
+file's encoded text diff plus optional patch; it defaults to 8,192, clamps to 65,536, and accepts 0
+to omit all text detail. Returned patch sections are complete; text that cannot fit is omitted
+with `textDiffOmissions.reason = "outputBudgetExceeded"`.
+
+| Tool | Additional arguments | Result |
+| --- | --- | --- |
+| `workspace_glob` | `match_offset` (default 0), `max_matches` (default 1,000, cap 10,000), `max_bytes` | `{matches, totalMatches, matchOffset, nextMatchOffset?, omittedMatches, truncated}` |
+| `workspace_diff` | `change_offset` (default 0), `paths` (optional exact paths), `max_bytes`, `max_file_bytes` | `{changes, statistics, totalChanges, changeOffset, nextChangeOffset?, omittedFiles, omittedTextDiffs, truncated, unifiedPatch?}` |
+| `workspace_apply` | `max_bytes`, `max_file_bytes` | `{changes, failures, statistics, totalChanges, changeOffset: 0, omittedFiles, omittedTextDiffs, truncated}` |
+
+Continue glob/diff at the returned offset, keeping the same pattern/paths and revisions. Pin both
+diff revisions to checkpoints for stable paging while the workspace changes. Narrow glob patterns
+or diff `paths`, or raise `max_file_bytes`, to retrieve detail; use `workspace_read` for full text.
+`max_text_bytes` skips text diffing for files larger than its source-byte limit (default and cap
+1,000,000 bytes per input file); `max_file_bytes` bounds encoded diff bytes per file in the result.
+The nested `changes` contains only returned detail; top-level `statistics` describes all selected
+changes using available computed text diffs. `omittedFiles` counts change entries at/after the
+requested offset that are absent from this response, including entries on subsequent pages.
+`omittedTextDiffs` counts returned entries whose computed diff was removed by the output budget.
+Glob skips a single path too large for a page and increments `omittedMatches`; diff similarly
+counts oversized path metadata in `omittedFiles`. Offsets still advance past those entries.
+
+Apply always completes the full atomic edit operation before bounding its response. Do not repeat
+an apply call to retrieve omitted detail. Use `workspace_read` to inspect omitted files, or create
+a checkpoint before applying and diff from it. If response encoding fails after commit, apply
+returns a minimal success envelope with empty `changes`, full statistics, and `truncated: true`.
+
+Beta compatibility: glob tool results now use an object instead of a bare array. Apply and diff
+retain their existing keys and add budget/paging metadata; large results can contain less detail.
+Direct Workspace method signatures are unchanged. Public adapter budget constants and
+`TextDiffOmission.Reason.outputBudgetExceeded` are additive; exhaustive switches on the reason
+must handle the new case.
 
 ## Testing
 

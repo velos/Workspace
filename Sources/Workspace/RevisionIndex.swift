@@ -77,6 +77,36 @@ struct RevisionIndex: Sendable, Equatable {
         Self.entry(at: path, in: entry)
     }
 
+    /// Resolve each component in the revision namespace, including directory symlinks.
+    func readableFile(at path: WorkspacePath) throws -> (path: WorkspacePath, size: UInt64) {
+        var pending = path.components
+        var current = WorkspacePath.root
+        var hops = 0
+        while !pending.isEmpty {
+            let component = pending.removeFirst()
+            current = current.appending(component)
+            guard let entry = entry(at: current) else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+            }
+            switch entry {
+            case let .symbolicLink(_, target, _):
+                guard hops < 64 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP)) }
+                hops += 1
+                let targetPath = try WorkspacePath(target, relativeTo: current.parent)
+                pending = targetPath.components + pending
+                current = .root
+            case let .file(_, size, _, _):
+                guard pending.isEmpty else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR)) }
+                return (current, size)
+            case .directory:
+                continue
+            case .missing:
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+            }
+        }
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
+    }
+
     private static func entry(at path: WorkspacePath, in entry: Entry) -> Entry? {
         if entry.path == path { return entry }
         guard case let .directory(_, _, children) = entry else { return nil }
