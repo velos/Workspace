@@ -96,7 +96,8 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
-        guard let info = await mergedEntry(path) else {
+        let resolved = try await resolveMergedPath(path, followFinal: false)
+        guard let info = await mergedEntry(resolved) else {
             throw posixError(ENOENT)
         }
         var adjusted = info
@@ -106,6 +107,8 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
+        let originalPath = path
+        let path = try await resolveMergedPath(path)
         let upperInfo = await upperEntry(path)
         let lowerInfo = await lowerVisibleEntry(path)
         guard upperInfo != nil || lowerInfo != nil else {
@@ -132,12 +135,16 @@ public actor OverlayFileSystem: FileSystem {
                 byName[entry.name] = entry
             }
         }
-        return byName.values.sorted { $0.name < $1.name }
+        return byName.values.map { entry in
+            var info = entry.info
+            info.path = originalPath.appending(entry.name)
+            return DirectoryEntry(name: entry.name, info: info)
+        }.sorted { $0.name < $1.name }
     }
 
     /// See ``FileSystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
-        let target = try await resolveMergedFinalSymlink(path)
+        let target = try await resolveMergedPath(path)
         if await upperEntry(target) != nil {
             return try await upper.readFile(path: target)
         }
@@ -152,6 +159,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/readSymlink(path:)``.
     public func readSymlink(path: WorkspacePath) async throws -> String {
+        let path = try await resolveMergedPath(path, followFinal: false)
         if await upperEntry(path) != nil {
             return try await upper.readSymlink(path: path)
         }
@@ -166,7 +174,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
-        let target = try await resolveMergedFinalSymlink(path)
+        let target = try await resolveMergedPath(path)
         guard await mergedEntry(target) != nil else {
             throw posixError(ENOENT)
         }
@@ -175,7 +183,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
-        guard let target = try? await resolveMergedFinalSymlink(path) else {
+        guard let target = try? await resolveMergedPath(path) else {
             return false
         }
         return await mergedEntry(target) != nil
@@ -208,7 +216,7 @@ public actor OverlayFileSystem: FileSystem {
         guard !path.isRoot else {
             throw posixError(EISDIR)
         }
-        let target = try await resolveMergedFinalSymlink(path)
+        let target = try await resolveMergedPath(path)
         if await upperEntry(target) != nil {
             try await upper.writeFile(path: target, data: data, append: append)
             return
@@ -234,6 +242,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/createFile(path:data:)``.
     public func createFile(path: WorkspacePath, data: Data) async throws {
+        let path = try await resolveMergedPath(path, followFinal: false)
         guard await mergedEntry(path) == nil else {
             throw posixError(EEXIST)
         }
@@ -243,6 +252,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
+        let path = try await resolveMergedPath(path, allowMissingAncestors: recursive)
         if path.isRoot {
             return
         }
@@ -273,6 +283,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
+        let path = try await resolveMergedPath(path, followFinal: false)
         guard !path.isRoot else {
             throw posixError(EPERM)
         }
@@ -301,6 +312,8 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
+        let sourcePath = try await resolveMergedPath(sourcePath, followFinal: false)
+        let destinationPath = try await resolveMergedPath(destinationPath, followFinal: false)
         if sourcePath == destinationPath {
             return
         }
@@ -327,6 +340,8 @@ public actor OverlayFileSystem: FileSystem {
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
+        let sourcePath = try await resolveMergedPath(sourcePath, followFinal: false)
+        let destinationPath = try await resolveMergedPath(destinationPath, followFinal: false)
         guard let sourceInfo = await mergedEntry(sourcePath) else {
             throw posixError(ENOENT)
         }
@@ -344,6 +359,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
+        let path = try await resolveMergedPath(path, followFinal: false)
         _ = try WorkspacePath(validating: target, relativeTo: path.dirname)
         guard await mergedEntry(path) == nil else {
             throw posixError(EEXIST)
@@ -354,6 +370,8 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
+        let path = try await resolveMergedPath(path, followFinal: false)
+        let target = try await resolveMergedPath(target)
         guard let targetInfo = await mergedEntry(target) else {
             throw posixError(ENOENT)
         }
@@ -373,6 +391,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
+        let path = try await resolveMergedPath(path)
         if await upperEntry(path) == nil {
             guard let info = await lowerVisibleEntry(path) else {
                 throw posixError(ENOENT)
@@ -414,27 +433,57 @@ public actor OverlayFileSystem: FileSystem {
         return await lowerVisibleEntry(path)
     }
 
-    /// Follows a chain of symlinks at the final path component through the merged view, so a
-    /// link in one layer can point at an entry in the other.
-    private func resolveMergedFinalSymlink(_ path: WorkspacePath) async throws -> WorkspacePath {
-        var current = path
-        var depth = 0
-        while depth <= 64 {
-            guard let info = await mergedEntry(current), info.kind == .symlink else {
-                return current
+    /// Resolve each component in the merged namespace before consulting a backing filesystem.
+    /// A lower-layer ancestor link must never let that backend bypass cuts or upper entries.
+    private func resolveMergedPath(
+        _ path: WorkspacePath, followFinal: Bool = true, allowMissingAncestors: Bool = false
+    ) async throws -> WorkspacePath {
+        var current = WorkspacePath.root
+        var pending = path.components
+        var hops = 0
+        while !pending.isEmpty {
+            let component = pending.removeFirst()
+            if component == "." {
+                continue
             }
-            let target: String
-            if await upperEntry(current) != nil {
-                target = try await upper.readSymlink(path: current)
-            } else if let lower {
-                target = try await lower.readSymlink(path: current)
-            } else {
-                return current
+            if component == ".." {
+                current = current.dirname
+                continue
             }
-            current = WorkspacePath(normalizing: target, relativeTo: current.dirname)
-            depth += 1
+            let next = current.appending(component)
+            let final = pending.isEmpty
+            guard let info = await mergedEntry(next) else {
+                if final || allowMissingAncestors {
+                    current = next
+                    continue
+                }
+                throw posixError(ENOENT)
+            }
+            if info.kind == .symlink && (!final || followFinal) {
+                hops += 1
+                guard hops <= 40 else {
+                    throw posixError(ELOOP)
+                }
+                let target: String
+                if await upperEntry(next) != nil {
+                    target = try await upper.readSymlink(path: next)
+                } else if let lower {
+                    target = try await lower.readSymlink(path: next)
+                } else {
+                    throw posixError(ENOENT)
+                }
+                if target.hasPrefix("/") {
+                    current = .root
+                }
+                pending = target.split(separator: "/").map(String.init) + pending
+                continue
+            }
+            if !final && info.kind != .directory {
+                throw posixError(ENOTDIR)
+            }
+            current = next
         }
-        throw posixError(ELOOP)
+        return current
     }
 
     /// Materializes every merged-visible ancestor directory of `path` into the upper layer,

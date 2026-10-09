@@ -113,6 +113,8 @@ public protocol PermissionAuthorizing: Sendable {
 }
 
 /// An actor-backed authorization policy with built-in support for session-scoped approvals.
+/// When used by `AuthorizedFileSystem`, a symlinked path that resolves to a different target
+/// produces a second authorization request for that target, with its own cache and audit entry.
 public actor PermissionAuthorizer: PermissionAuthorizing {
     /// The asynchronous callback used to evaluate requests.
     public typealias Handler = @Sendable (PermissionRequest) async -> PermissionDecision
@@ -200,6 +202,8 @@ public struct PermissionRule: Sendable, Codable, Equatable {
 }
 
 /// A deterministic first-match path-prefix authorization policy.
+/// Deny rules match any endpoint; allow rules must cover every endpoint.
+/// Glob's `currentDirectory` is context rather than an endpoint and is excluded from deny matching.
 public actor RuleBasedPermissionAuthorizer: PermissionAuthorizing {
     private let rules: [PermissionRule]
     private let defaultEffect: PermissionRule.Effect
@@ -218,7 +222,7 @@ public actor RuleBasedPermissionAuthorizer: PermissionAuthorizing {
 
     public func authorize(_ request: PermissionRequest) async -> PermissionDecision {
         for (index, rule) in rules.enumerated()
-        where rule.operations.contains(request.operation) && Self.matchesPaths(request, prefix: rule.pathPrefix) {
+        where rule.operations.contains(request.operation) && Self.matchesPaths(request, rule: rule) {
             return decision(for: rule.effect, request: request, source: .rule(index))
         }
         return decision(for: defaultEffect, request: request, source: .defaultRule)
@@ -227,11 +231,19 @@ public actor RuleBasedPermissionAuthorizer: PermissionAuthorizing {
     public func auditLog() -> [PermissionAuditRecord] { auditRecords }
     public func clearAuditLog() { auditRecords.removeAll(keepingCapacity: true) }
 
-    private static func matchesPaths(_ request: PermissionRequest, prefix: WorkspacePath) -> Bool {
-        let paths = [request.path, request.sourcePath, request.destinationPath].compactMap { $0 }
+    private static func matchesPaths(_ request: PermissionRequest, rule: PermissionRule) -> Bool {
+        var endpoints = [request.path, request.sourcePath, request.destinationPath]
+        if request.operation == .glob, case .deny = rule.effect {
+            endpoints = [request.path, request.sourcePath]
+        }
+        let paths = endpoints.compactMap { $0 }
         guard !paths.isEmpty else { return false }
-        return paths.allSatisfy { path in
-            prefix.isRoot || path == prefix || path.string.hasPrefix(prefix.string + "/")
+        let matches: (WorkspacePath) -> Bool = { path in
+            rule.pathPrefix.isRoot || path == rule.pathPrefix || path.string.hasPrefix(rule.pathPrefix.string + "/")
+        }
+        switch rule.effect {
+        case .allow: return paths.allSatisfy(matches)
+        case .deny: return paths.contains(where: matches)
         }
     }
 
@@ -260,7 +272,15 @@ public actor RuleBasedPermissionAuthorizer: PermissionAuthorizing {
     }
 }
 
-/// A filesystem wrapper that authorizes each operation before forwarding it to another filesystem.
+/// Authorizes both the requested spelling and the resolved paths touched by an operation.
+/// A symlinked path produces a second authorization request when its resolved target differs;
+/// both requests must be allowed. Authorizers see both requests separately for caching and auditing.
+/// Entry operations resolve ancestors but retain the final link itself (lstat semantics).
+/// Resolution and execution are separate protocol calls: concurrent namespace changes can still
+/// race authorization. This wrapper is a policy safety layer, not a hostile-process sandbox.
+/// Backends advertising symlinks must support real-path resolution; unsupported resolution fails closed.
+/// Creation through an unresolved dangling link also fails closed. Existence checks conservatively
+/// authorize the target because some backends implement them with dereferencing semantics.
 public final class AuthorizedFileSystem: FileSystem, Sendable {
     private let base: any FileSystem
     private let authorizer: any PermissionAuthorizing
@@ -309,7 +329,7 @@ public final class AuthorizedFileSystem: FileSystem, Sendable {
 
     /// See ``FileSystem/createFile(path:data:)``.
     public func createFile(path: WorkspacePath, data: Data) async throws {
-        try await authorize(.init(operation: .writeFile, path: path))
+        try await authorize(.init(operation: .writeFile, path: path), entryOnly: true)
         try await base.createFile(path: path, data: data)
     }
 
@@ -408,10 +428,92 @@ public final class AuthorizedFileSystem: FileSystem, Sendable {
         return try await base.glob(pattern: normalizedPattern.description, currentDirectory: currentDirectory)
     }
 
-    private func authorize(_ request: PermissionRequest) async throws {
+    private func checkDecision(_ request: PermissionRequest) async throws {
         let decision = await authorizer.authorize(request)
-        if case let .deny(message) = decision {
+        if case .deny(let message) = decision {
             throw WorkspaceError.accessDenied(operation: request.operation.rawValue, message: message)
+        }
+    }
+
+    private func resolvedPath(_ path: WorkspacePath, followFinal: Bool) async throws -> WorkspacePath {
+        if !followFinal, !path.isRoot {
+            return try await resolvedPath(path.dirname, followFinal: true).appending(path.basename)
+        }
+        do {
+            return try await base.resolveRealPath(path: path)
+        } catch {
+            let failure = error as NSError
+            guard failure.domain == NSPOSIXErrorDomain, failure.code == Int(ENOENT) else {
+                throw error
+            }
+            // A dangling link must fail closed; synthetic mount parents and absent entries can
+            // use their resolved parent and let the base operation decide whether they exist.
+            if let info = try? await base.stat(path: path), info.kind == .symlink {
+                throw error
+            }
+            if path.isRoot {
+                return .root
+            }
+            return try await resolvedPath(path.dirname, followFinal: true).appending(path.basename)
+        }
+    }
+
+    private func authorize(_ request: PermissionRequest, entryOnly: Bool = false) async throws {
+        try await checkDecision(request)
+        let features = await base.capabilities()
+        guard features.contains(.realPathResolution) || features.contains(.symlinks) else {
+            return
+        }
+        var resolved = request
+        switch request.operation {
+        case .stat, .remove, .readSymlink:
+            if let path = request.path {
+                resolved.path = try await resolvedPath(path, followFinal: false)
+            }
+        case .exists:
+            if let path = request.path {
+                resolved.path = try await resolvedPath(path, followFinal: true)
+            }
+        case .move, .copy:
+            if let path = request.sourcePath {
+                resolved.sourcePath = try await resolvedPath(path, followFinal: false)
+            }
+            if let path = request.destinationPath {
+                resolved.destinationPath = try await resolvedPath(path, followFinal: false)
+            }
+        case .createSymlink, .createHardLink:
+            if let path = request.path {
+                resolved.path = try await resolvedPath(path, followFinal: false)
+            }
+            if let path = request.destinationPath {
+                resolved.destinationPath = try await resolvedPath(path, followFinal: true)
+            }
+        case .glob:
+            // Glob enumerates entries without dereferencing matched final links.
+            // Only its non-pattern prefix needs resolution.
+            if let path = request.path {
+                var prefix = WorkspacePath.root
+                var suffix: [String] = []
+                for component in path.components {
+                    if !suffix.isEmpty || WorkspacePath.containsGlob(component) {
+                        suffix.append(component)
+                    } else {
+                        prefix = prefix.appending(component)
+                    }
+                }
+                var target = try await resolvedPath(prefix, followFinal: true)
+                for component in suffix {
+                    target = target.appending(component)
+                }
+                resolved.path = target
+            }
+        default:
+            if let path = request.path {
+                resolved.path = try await resolvedPath(path, followFinal: !entryOnly)
+            }
+        }
+        if resolved != request {
+            try await checkDecision(resolved)
         }
     }
 }

@@ -916,12 +916,14 @@ struct FilesystemTests {
             .readFile,
             .readSymlink,
             .setPermissions,
-            .resolveRealPath,
+            .resolveRealPath, // lexical link
+            .resolveRealPath, // resolved target
             .exists,
-            .glob,
+            .glob, // pattern
             .remove,
         ])
 
+        #expect(requests.filter { $0.operation == .resolveRealPath }.map(\.path) == ["/links/link.txt", "/note.txt"])
         let symlinkRequest = try #require(requests.first { $0.operation == .createSymlink })
         #expect(symlinkRequest.path == "/links/link.txt")
         #expect(symlinkRequest.destinationPath == "/note.txt")
