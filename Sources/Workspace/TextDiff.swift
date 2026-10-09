@@ -216,17 +216,16 @@ private struct DiffLineToken: Hashable {
 private func diffLineTokens(in text: String) -> [DiffLineToken] {
     guard !text.isEmpty else { return [] }
     var tokens: [DiffLineToken] = []
-    var current = ""
-    for character in text {
-        if character == "\n" {
-            tokens.append(DiffLineToken(text: current, hasTrailingNewline: true))
-            current.removeAll(keepingCapacity: true)
-        } else {
-            current.append(character)
-        }
+    // CRLF is one Swift Character. Split UTF-8 code units so LF alone is the delimiter,
+    // preserving CR in the line's content and distinguishing a terminated final line.
+    let bytes = text.utf8
+    var start = bytes.startIndex
+    for index in bytes.indices where bytes[index] == 0x0A {
+        tokens.append(DiffLineToken(text: String(decoding: bytes[start..<index], as: UTF8.self), hasTrailingNewline: true))
+        start = bytes.index(after: index)
     }
-    if !current.isEmpty || text.last != "\n" {
-        tokens.append(DiffLineToken(text: current, hasTrailingNewline: false))
+    if start != bytes.endIndex {
+        tokens.append(DiffLineToken(text: String(decoding: bytes[start...], as: UTF8.self), hasTrailingNewline: false))
     }
     return tokens
 }

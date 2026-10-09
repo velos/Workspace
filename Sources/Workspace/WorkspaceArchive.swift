@@ -25,6 +25,29 @@ extension Workspace {
             self.root = root
             self.entry = entry
         }
+
+        /// Validates the entire tree before restore can remove or write any destination entry.
+        /// Decoded archives are untrusted: paths must form a tree rooted exactly at `root`.
+        public func validate() throws {
+            guard entry.path == root else {
+                throw WorkspaceError.unsupported("invalid archive: entry path \(entry.path) does not equal root \(root)")
+            }
+            // Immediate-child edges and a matching root prove containment inductively.
+            var pending = [entry]
+            while let entry = pending.popLast() {
+                guard case let .directory(parent, _, children) = entry else { continue }
+                var names = Set<String>()
+                for child in children {
+                    guard child.path != parent, child.path.parent == parent else {
+                        throw WorkspaceError.unsupported("invalid archive: \(child.path) is not an immediate child of \(parent)")
+                    }
+                    guard names.insert(child.path.name).inserted else {
+                        throw WorkspaceError.unsupported("invalid archive: duplicate child \(child.path.name) in \(parent)")
+                    }
+                    pending.append(child)
+                }
+            }
+        }
     }
 
     /// Materializes a subtree from the current workspace or a checkpoint.
@@ -43,6 +66,7 @@ extension Workspace {
     /// Restores a portable archive and records the resulting changes.
     @discardableResult
     public func restore(_ archive: Archive, at destination: WorkspacePath? = nil) async throws -> ChangeSet {
+        try archive.validate()
         await acquireOperation()
         defer { releaseOperation() }
         try Task.checkCancellation()

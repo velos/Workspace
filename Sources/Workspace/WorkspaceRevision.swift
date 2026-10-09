@@ -140,6 +140,43 @@ extension Workspace {
         throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP))
     }
 
+    /// Returns a read path and its size without loading file contents. Current paths
+    /// use filesystem resolution; stat and readData must use that same resolved path.
+    /// Checkpoint symlinks retain revisionData's normalization and POSIX errors.
+    func revisionFileSize(at path: WorkspacePath, revision: Revision) async throws -> (resolvedPath: WorkspacePath, size: UInt64) {
+        let index: RevisionIndex
+        switch revision {
+        case .current:
+            let resolvedPath = try await filesystem.resolveRealPath(path: path)
+            let metadata = try await filesystem.stat(path: resolvedPath)
+            guard metadata.kind == .file else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
+            }
+            return (resolvedPath, metadata.size)
+        case .checkpoint:
+            index = try await resolvedRevision(revision).index
+        }
+        var current = path
+        for _ in 0..<64 {
+            guard let entry = index.entry(at: current) else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+            }
+            if case .missing = entry {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+            }
+            let metadata = Self.info(for: entry)
+            if case let .symbolicLink(_, target, _) = entry {
+                current = WorkspacePath(normalizing: target, relativeTo: current.parent)
+                continue
+            }
+            guard metadata.kind == .file else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
+            }
+            return (current, metadata.size)
+        }
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP))
+    }
+
     public func info(_ path: WorkspacePath, at revision: Revision = .current) async throws -> FileInfo {
         switch revision {
         case .current:

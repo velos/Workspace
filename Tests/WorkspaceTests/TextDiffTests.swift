@@ -112,4 +112,18 @@ struct TextDiffTests {
 
         #expect(workspaceDiff == utilityDiff)
     }
+
+    @Test
+    func `CRLF and mixed endings retain CR content and line statistics`() throws {
+        let diff = TextDiff.lineBased(from: "one\r\ntwo\r\nthree\nlast\r", to: "one\r\nTWO\r\nthree\nlast\r\n")
+        #expect(diff.statistics == .init(originalLineCount: 4, updatedLineCount: 4, additions: 2, deletions: 2))
+        let hunk = try #require(diff.hunks.first)
+        #expect(hunk.oldLineCount == 4)
+        #expect(hunk.newLineCount == 4)
+        #expect(hunk.lines.filter { $0.kind == .context }.map(\.text) == ["one\r", "three"])
+        #expect(hunk.lines.filter { $0.kind == .removed }.map(\.text) == ["two\r", "last\r"])
+        #expect(hunk.lines.filter { !$0.hasTrailingNewline }.map(\.text) == ["last\r"])
+        #expect(hunk.lines.filter { $0.kind == .added }.allSatisfy { $0.hasTrailingNewline })
+        #expect(TextDiff.lineBased(from: "\r\n\r\n", to: "\r\n\r\n").originalLineCount == 2)
+    }
 }

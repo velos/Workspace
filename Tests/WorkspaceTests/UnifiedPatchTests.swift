@@ -36,4 +36,11 @@ struct UnifiedPatchTests {
         #expect(patch.contains("--- a/deleted.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"))
         #expect(!patch.contains("binary.dat"))
     }
+
+    @Test
+    func `CRLF patch preserves bytes with accurate hunk counts and EOF marker`() {
+        let diff = TextDiff.lineBased(from: "one\r\ntwo\r\nlast", to: "one\r\nTWO\r\nlast\r\n")
+        #expect(diff.unifiedPatch(oldPath: "a/note", newPath: "b/note") ==
+            "--- a/note\n+++ b/note\n@@ -1,3 +1,3 @@\n one\r\n-two\r\n-last\n\\ No newline at end of file\n+TWO\r\n+last\r\n")
+    }
 }
