@@ -489,7 +489,10 @@ public final class LocalFileSystem: FileSystem, @unchecked Sendable {
         }
         do {
             try removeEntry(resolve(path, followFinal: false), recursive: recursive)
-        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+        } catch let error as NSError
+            where error.domain == NSPOSIXErrorDomain && (error.code == Int(ENOENT) || error.code == Int(ENOTDIR))
+        {
+            // A path beneath a regular file can't exist, so removing it is the same no-op as a missing path.
             return
         }
     }
