@@ -898,7 +898,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         return entry.path
     }
 
-    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
         try resolve(path, followFinal: true, allowMissingAncestors: true).path
     }
 

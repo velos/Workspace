@@ -423,3 +423,56 @@ swift test --disable-xctest --enable-swift-testing
 ```
 
 CI runs Swift 6.2 tests on macOS and Linux.
+
+## Benchmarks
+
+The separate executable does not run in `swift test`. Run in release mode:
+
+```sh
+swift run -c release WorkspaceBenchmarks --preset small --json Benchmarks/Results/small.json
+swift run -c release WorkspaceBenchmarks --preset small --json Benchmarks/Results/after.json \
+  --compare Benchmarks/Results/small.json
+swift run -c release WorkspaceBenchmarks --preset medium --filter transaction,limitedWrite
+```
+
+Defaults: one warmup, five measured samples, a fresh child per scenario. Fast operations
+use inner repetitions with per-operation times/counts; writes use independent prepared
+stores (each `write1001` is exactly the 1,001st mutation). Fixtures have 1k/10k/100k
+regular files: small ~20 MiB, medium ~200 MiB, large ~98 MiB with deep dependency nesting.
+Allow roughly **2–5 minutes for small**, **10–30 minutes for medium**, and **well over
+an hour for large** at defaults, depending on filesystem and watcher availability.
+Fixture generation is excluded. `--fixture-dir PATH` generates/validates/reuses a
+preserved fixture; otherwise temporary trees/stores are removed on completion or SIGINT.
+`Benchmarks/Results/` is ignored. Use `--help` for filters, iteration counts and
+deadlines (30 minutes per child by default).
+
+| Scenario | What's timed | Setup excluded | Counter blind spots |
+| --- | --- | --- | --- |
+| `writeText`, `apply50`, `limitedWrite` | One recorded write, 50 edits, quota-limited write | No-op preparation, file reset | Checkpoint store; Limited metadata traversal is visible |
+| `transaction` / `transactionFirst` | Begin, one draft write, commit | Preparation; baseline checkpoint for `transaction` only | Draft filesystem, checkpoint store |
+| `preview` | One edit preview | Preparation | Draft filesystem |
+| `checkpointFirst` / `checkpointIncremental` | First capture / capture after one change | Preparation; baseline and change for incremental | Checkpoint store |
+| `diff`, `restore` | Checkpoint-to-current diff / restore after one change | Preparation, baseline, change | Checkpoint store |
+| `readCheckpoint` / `readCheckpointWarm`, `readCurrent` | Cold / primed checkpoint index read; direct current read | Baseline; first read for warm variant | Checkpoint store |
+| `search`, `glob` | Full absent-literal search / `**/*` glob | Preparation | Glob internals; returned `globMatches` is visible |
+| `history1000` / `history1000Cached` | Fresh directory Workspace log load/decode / cached memory history | Seed 1,000 mutations; new reader for cold variant | Checkpoint store |
+| `write1001` | Exactly the 1,001st recorded directory write | Preparation and 1,000 mutations | Checkpoint store |
+| `eventsInitial`, `eventsExternal` | Enable observation / direct external write until its event arrives | Preparation; initial observation and drain for external | External write bypasses counter; recaptures are visible |
+
+The table shows median/p90 wall time, backend read bytes/calls, stat/list calls, entries,
+glob matches, logical store bytes/files written, setup RSS high-water, operation increase
+in that high-water, and held RSS delta. Held RSS is sampled with the result live. The
+first-run column is the live-footprint figure: after the first run, allocator reuse hides
+most of a result's memory, so the measured-sample summary (which excludes warmups) can be
+near zero or slightly negative. Zero high-water growth can likewise mean allocator reuse.
+Percentiles use linear interpolation between samples. Setup high-water includes preceding
+samples in the same child; JSON retains each sample's values and process peak.
+Darwin/Linux RSS units are normalized to bytes. Store write counts include newly created
+empty lock files.
+
+Counters observe the `FileSystem` boundary, not syscalls. Store writes are estimated
+outside timing from directory metadata: append growth or final size of new/replaced
+files; transient/deleted files, repeated overwrites and OS write amplification are
+invisible. Compare identical presets for regressions: timing ratios and exact backend
+count deltas are printed. Watcher errors produce a nonzero exit while retaining successful
+results; run outside a restrictive macOS sandbox to measure FSEvents.

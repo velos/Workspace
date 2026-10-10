@@ -511,7 +511,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         return current
     }
 
-    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
         try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0, allowMissing: true)
     }
 

@@ -22,6 +22,11 @@ let package = Package(
             dependencies: [.target(name: "WorkspacePOSIX", condition: .when(platforms: [.linux]))]
         ),
         .target(name: "WorkspacePOSIX"),
+        .executableTarget(
+            name: "WorkspaceBenchmarks",
+            dependencies: ["Workspace"],
+            path: "Benchmarks/WorkspaceBenchmarks"
+        ),
         .testTarget(
             name: "WorkspaceTests",
             dependencies: ["Workspace"]

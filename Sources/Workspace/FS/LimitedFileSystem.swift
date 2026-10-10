@@ -75,7 +75,7 @@ public actor LimitedFileSystem: FileSystem, PotentialPathResolvingFileSystem {
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await base.resolveRealPath(path: path)
     }
-    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await pathResolver.resolve(path, features: await base.capabilities(), followFinal: true)
     }
     public func exists(path: WorkspacePath) async -> Bool { await base.exists(path: path) }

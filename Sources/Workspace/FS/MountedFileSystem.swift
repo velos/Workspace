@@ -282,7 +282,7 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
 
     // Used only when a symlink target or suffix is missing. Resolve inside the selected
     // backend before translating back; raw absolute targets are never outer virtual paths.
-    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
         let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
         let real = try await FileSystemPathResolver(base: resolved.filesystem).resolve(
             resolved.relativePath, features: await resolved.filesystem.capabilities(), followFinal: true

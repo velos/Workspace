@@ -216,7 +216,7 @@ public protocol FileSystemChangeSource: FileSystem {
 
 /// Resolves links in the backend's namespace without requiring the target to exist.
 /// Missing parent suffixes are retained for quota preflight without creating them.
-protocol PotentialPathResolvingFileSystem: FileSystem {
+package protocol PotentialPathResolvingFileSystem: FileSystem {
     func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath
 }
 

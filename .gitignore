@@ -4,3 +4,5 @@ references
 Package.resolved
 .DS_Store
 .cursor
+
+Benchmarks/Results/

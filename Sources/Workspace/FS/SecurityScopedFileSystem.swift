@@ -167,7 +167,7 @@ public final class SecurityScopedFileSystem: FileSystem, PotentialPathResolvingF
         await backing.capabilities()
     }
 
-    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await backing.resolvePotentialPath(path: path)
     }
 

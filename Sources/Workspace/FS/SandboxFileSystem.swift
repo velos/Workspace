@@ -63,7 +63,7 @@ public final class SandboxFileSystem: FileSystem, PotentialPathResolvingFileSyst
         await backing.capabilities()
     }
 
-    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await backing.resolvePotentialPath(path: path)
     }
 
