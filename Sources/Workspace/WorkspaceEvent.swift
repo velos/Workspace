@@ -48,7 +48,12 @@ extension Workspace {
         if eventWatchers.isEmpty {
             filesystemObservationTask?.cancel()
             filesystemObservationTask = nil
-            observedFilesystemSnapshot = nil
+            filesystemRefreshTask?.cancel()
+            filesystemRefreshTask = nil
+            filesystemRetryMilliseconds = 40
+            filesystemRefreshFailures = 0
+            pendingFilesystemSignal = nil
+            observedFilesystem = nil
         }
     }
 

@@ -14,7 +14,7 @@ struct SearchEquivalenceTests {
         for path in expected.reversed() {
             try await local.createFile(path: path, data: Data("match".utf8))
         }
-        let fallback = MountedFileSystem(base: local)
+        let fallback = HookableFileSystem(base: local)
         for fs: any FileSystem in [local, fallback] {
             var paths: [WorkspacePath] = []
             try await fs.walk { info, _, _ in

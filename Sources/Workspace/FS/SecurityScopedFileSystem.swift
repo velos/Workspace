@@ -5,7 +5,7 @@ import Foundation
 ///
 /// This adapter is intended for iOS and macOS workflows where filesystem access must be granted through
 /// a bookmark or document picker URL.
-public final class SecurityScopedFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+public final class SecurityScopedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     /// The permitted mutability for the scoped filesystem.
     public enum AccessMode: Sendable {
         /// Only read operations are allowed.
@@ -167,6 +167,10 @@ public final class SecurityScopedFileSystem: FileSystem, TraversingFileSystem, P
         try await backing.createFile(path: path, data: data)
     }
 
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        await backing.previewBehavior(at: path)
+    }
+
     /// See ``FileSystem/capabilities()``.
     public func capabilities() async -> FileSystemFeatures {
         await backing.capabilities()
@@ -293,4 +297,17 @@ public final class SecurityScopedFileSystem: FileSystem, TraversingFileSystem, P
 }
 
 typealias SecurityScopedFilesystem = SecurityScopedFileSystem
+
+extension SecurityScopedFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        unscopedChanges(try await changeSignals())
+    }
+
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        guard let source = (backing as any FileSystem) as? any FileSystemChangeSource else {
+            throw WorkspaceError.unsupported("filesystem change notifications are not supported")
+        }
+        return try await source.changeSignals()
+    }
+}
 #endif

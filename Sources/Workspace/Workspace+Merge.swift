@@ -2,15 +2,49 @@ import Foundation
 
 extension Workspace {
     /// A flat tree node used by transaction three-way commits.
-    struct MergeNode: Equatable {
+    struct MergeNode: Equatable, Sendable {
         var kind: FileTree.Kind
         var permissions: POSIXPermissions
-        var fileData: Data?
+        let fileData: Data?
         var symlinkTarget: String?
+        private var revisionContentID: String?
+        private let digest: ContentDigest?
+        var contentID: String? {
+            get { revisionContentID ?? fileData.flatMap { digest?.value(for: $0) } }
+            set { revisionContentID = newValue }
+        }
+
+        /// Shared by value copies of this immutable payload, synchronized for concurrent comparisons.
+        private final class ContentDigest: @unchecked Sendable {
+            private let lock = NSLock()
+            private var cached: String?
+            func value(for data: Data) -> String {
+                lock.withLock {
+                    if let cached { return cached }
+                    let value = SHA256.hexDigest(of: data)
+                    cached = value
+                    return value
+                }
+            }
+        }
+        var size: UInt64 = 0
+
+        init(kind: FileTree.Kind, permissions: POSIXPermissions, fileData: Data? = nil,
+             symlinkTarget: String? = nil, contentID: String? = nil, size: UInt64 = 0) {
+            self.kind = kind
+            self.permissions = permissions
+            self.fileData = fileData
+            self.symlinkTarget = symlinkTarget
+            self.revisionContentID = contentID
+            self.digest = fileData == nil || contentID != nil ? nil : ContentDigest()
+            self.size = size
+        }
 
         static func == (lhs: Self, rhs: Self) -> Bool {
-            lhs.kind == rhs.kind && lhs.permissions == rhs.permissions && lhs.fileData == rhs.fileData
-                && lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init)
+            guard lhs.kind == rhs.kind, lhs.permissions == rhs.permissions,
+                  lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init) else { return false }
+            if let left = lhs.fileData, let right = rhs.fileData { return left == right }
+            return lhs.contentID == rhs.contentID
         }
     }
 
@@ -19,7 +53,7 @@ extension Workspace {
         case .missing:
             return
         case let .file(file):
-            nodes[file.path] = MergeNode(kind: .file, permissions: file.permissions, fileData: file.data)
+            nodes[file.path] = MergeNode(kind: .file, permissions: file.permissions, fileData: file.data, size: UInt64(file.data.count))
         case let .symlink(link):
             nodes[link.path] = MergeNode(
                 kind: .symlink,
@@ -39,10 +73,11 @@ extension Workspace {
     static func structuralMergeConflicts(
         base: [WorkspacePath: MergeNode],
         parent: [WorkspacePath: MergeNode],
-        draft: [WorkspacePath: MergeNode]
+        draft: [WorkspacePath: MergeNode],
+        paths candidates: Set<WorkspacePath>? = nil
     ) -> Set<WorkspacePath> {
         var conflicts: Set<WorkspacePath> = []
-        let paths = Set(base.keys).union(parent.keys).union(draft.keys)
+        let paths = candidates ?? Set(base.keys).union(parent.keys).union(draft.keys)
         for path in paths where parent[path] != base[path] || draft[path] != base[path] {
             var ancestor = path
             var outermost: WorkspacePath?
@@ -62,38 +97,13 @@ extension Workspace {
         return conflicts
     }
 
-    static func buildEntryTree(from nodes: [WorkspacePath: MergeNode]) throws -> Snapshot.Entry {
-        guard let root = nodes[.root], root.kind == .directory else {
+    static func validateMergeNodes(_ nodes: [WorkspacePath: MergeNode]) throws {
+        guard nodes[.root]?.kind == .directory else {
             throw WorkspaceError.mutationFailed("merged tree must have a directory root")
         }
-        var childNames: [WorkspacePath: [(String, MergeNode)]] = [:]
-        for (path, node) in nodes where !path.isRoot {
-            // Checking every immediate parent proves the full ancestry inductively,
-            // since WorkspacePath parents strictly shorten toward the validated root.
-            guard nodes[path.parent]?.kind == .directory else {
-                throw WorkspaceError.mutationFailed("merged node \(path) has no directory parent")
-            }
-            childNames[path.parent, default: []].append((path.name, node))
+        // Immediate parents prove full ancestry because paths shorten toward root.
+        for path in nodes.keys where !path.isRoot && nodes[path.parent]?.kind != .directory {
+            throw WorkspaceError.mutationFailed("merged node \(path) has no directory parent")
         }
-
-        func subtree(at path: WorkspacePath, node: MergeNode) -> Snapshot.Entry {
-            switch node.kind {
-            case .file:
-                return .file(.init(path: path, data: node.fileData ?? Data(), permissions: node.permissions))
-            case .symlink:
-                return .symlink(.init(path: path, target: node.symlinkTarget ?? "", permissions: node.permissions))
-            case .directory:
-                return .directory(
-                    .init(
-                        path: path,
-                        permissions: node.permissions,
-                        children: (childNames[path] ?? []).sorted { PathName($0.0) < PathName($1.0) }.map { name, child in
-                            subtree(at: path.appending(name), node: child)
-                        }
-                    )
-                )
-            }
-        }
-        return subtree(at: .root, node: root)
     }
 }

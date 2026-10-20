@@ -13,7 +13,14 @@ import Glibc
 ///
 /// Actor isolation serializes access to the tree so the filesystem can be shared safely across
 /// concurrent tasks.
-public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
+public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, ExactTimestampFileSystem {
+    package nonisolated var hasExactContentTimestamps: Bool { true }
+    private var lastTimestamp = Date().timeIntervalSinceReferenceDate
+
+    private func nextTimestamp() -> Date {
+        lastTimestamp = max(Date().timeIntervalSinceReferenceDate, lastTimestamp.nextUp)
+        return Date(timeIntervalSinceReferenceDate: lastTimestamp)
+    }
     private final class Node {
         enum Kind {
             case file(Data)
@@ -147,7 +154,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
            let existing = children[PathName(name)],
            case let .file(existingData) = existing.kind {
             existing.kind = .file(existingData + data)
-            existing.modificationDate = Date()
+            existing.modificationDate = nextTimestamp()
             children[PathName(name)] = existing
         } else {
             if let existing = children[PathName(name)] { unlink(existing) }
@@ -156,7 +163,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         }
 
         parent.kind = .directory(children)
-        parent.modificationDate = Date()
+        parent.modificationDate = nextTimestamp()
     }
 
     /// See ``FileSystem/createDirectory(path:recursive:)``.
@@ -190,7 +197,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
                 let directory = makeNode(kind: .directory([:]), permissions: 0o755)
                 children[PathName(component)] = directory
                 current.kind = .directory(children)
-                current.modificationDate = Date()
+                current.modificationDate = nextTimestamp()
                 current = directory
             }
         }
@@ -214,7 +221,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         parentChildren.removeValue(forKey: PathName(name))
         unlink(entry)
         parent.kind = .directory(parentChildren)
-        parent.modificationDate = Date()
+        parent.modificationDate = nextTimestamp()
     }
 
     /// See ``FileSystem/move(from:to:)``.
@@ -242,7 +249,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
             children.removeValue(forKey: PathName(sourceName))
             children[PathName(destinationName)] = sourceNode
             sourceParent.kind = .directory(children)
-            sourceParent.modificationDate = Date()
+            sourceParent.modificationDate = nextTimestamp()
             return
         }
 
@@ -254,11 +261,11 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         var sourceChildren = try directoryChildren(of: sourceParent)
         sourceChildren.removeValue(forKey: PathName(sourceName))
         sourceParent.kind = .directory(sourceChildren)
-        sourceParent.modificationDate = Date()
+        sourceParent.modificationDate = nextTimestamp()
 
         destinationChildren[PathName(destinationName)] = sourceNode
         destinationParent.kind = .directory(destinationChildren)
-        destinationParent.modificationDate = Date()
+        destinationParent.modificationDate = nextTimestamp()
     }
 
     /// See ``FileSystem/copy(from:to:recursive:)``.
@@ -278,7 +285,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
 
         destinationChildren[PathName(destinationName)] = clone(sourceNode)
         destinationParent.kind = .directory(destinationChildren)
-        destinationParent.modificationDate = Date()
+        destinationParent.modificationDate = nextTimestamp()
     }
 
     /// See ``FileSystem/createSymlink(path:target:)``.
@@ -296,7 +303,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
 
         children[PathName(name)] = makeNode(kind: .symlink(target), permissions: 0o777)
         parent.kind = .directory(children)
-        parent.modificationDate = Date()
+        parent.modificationDate = nextTimestamp()
     }
 
     /// See ``FileSystem/createHardLink(path:target:)``.
@@ -319,7 +326,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         sourceNode.linkCount += 1
         children[PathName(name)] = sourceNode
         parent.kind = .directory(children)
-        parent.modificationDate = Date()
+        parent.modificationDate = nextTimestamp()
     }
 
     /// See ``FileSystem/readSymlink(path:)``.
@@ -337,7 +344,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
     public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
         let node = try node(at: path, followFinalSymlink: false)
         node.permissions = Int(permissions.rawValue)
-        node.modificationDate = Date()
+        node.modificationDate = nextTimestamp()
     }
 
     /// See ``FileSystem/resolveRealPath(path:)``.
@@ -381,10 +388,10 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         return matches.sorted()
     }
 
-    private func makeNode(kind: Node.Kind, permissions: Int, modificationDate: Date = Date()) -> Node {
+    private func makeNode(kind: Node.Kind, permissions: Int, modificationDate: Date? = nil) -> Node {
         let inode = nextInode
         nextInode += 1
-        return Node(inode: inode, kind: kind, permissions: permissions, modificationDate: modificationDate)
+        return Node(inode: inode, kind: kind, permissions: permissions, modificationDate: modificationDate ?? nextTimestamp())
     }
 
     private func clone(_ node: Node) -> Node {
@@ -564,4 +571,8 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
     private func posixError(_ code: Int32) -> NSError {
         NSError(domain: NSPOSIXErrorDomain, code: Int(code))
     }
+}
+
+extension InMemoryFileSystem: PreviewSemanticsFileSystem {
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics { .init() }
 }

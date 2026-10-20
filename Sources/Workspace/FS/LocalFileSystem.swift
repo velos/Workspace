@@ -18,7 +18,7 @@ private typealias LocalStat = Glibc.stat
 /// This is a safety layer, not a sandbox: a host process can relocate an already-open directory
 /// outside the root, change hard-linked data, or mutate entries during recursive operations.
 /// Watch subscriptions still use the configured URL and are not descriptor-pinned.
-public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem, TraversingFileSystem, @unchecked Sendable {
+public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     /// Returns zero on success or a captured POSIX errno on failure. Injection is per-instance
     /// so unsupported filesystem behavior can be tested without mounts or global syscall hooks.
     typealias ExclusiveRename = @Sendable (Int32, String, Int32, String) -> Int32
@@ -824,7 +824,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
 
     private func replace(_ entry: Entry, body: (Descriptor) throws -> Void) throws {
         try entry.requireVerified()
-        let temporary = ".workspace-" + UUID().uuidString
+        let temporary = LocalAtomicTemporaryName.make()
         let temporaryEntry = try verifiedEntry(Entry(parent: entry.parent, name: temporary, path: entry.path), creating: true)
         let fd = try openEntry(temporaryEntry, flags: O_WRONLY | O_CREAT | O_EXCL)
         defer {
@@ -1086,20 +1086,94 @@ extension LocalFileSystem: FileSystemChangeSource {
         let root = try requireConfiguration().rootURL
         return try FSEventsChangeStream.observe(root)
     }
+
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        let configuration = try requireConfiguration()
+        return try FSEventsChangeStream.observeSignals(configuration.rootURL, resolvedRootPath: configuration.resolvedRootPath)
+    }
 }
 
 enum FSEventsChangeStream {
+    // FileEvents supplies item flags; directory metadata/listing changes do not
+    // invalidate descendants unless structural or loss/coalescing flags say so.
+    static func scope(for flags: FSEventStreamEventFlags) -> FileSystemChangeSignal.Scope? {
+        let unknown = UInt32(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped
+            | kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagEventIdsWrapped
+            | kFSEventStreamEventFlagMount | kFSEventStreamEventFlagUnmount)
+        if flags & unknown != 0 { return nil }
+        if flags & UInt32(kFSEventStreamEventFlagMustScanSubDirs) != 0 { return .recursive }
+        if flags & UInt32(kFSEventStreamEventFlagItemIsDir) != 0 {
+            let structural = UInt32(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRemoved
+                | kFSEventStreamEventFlagItemRenamed)
+            return flags & structural != 0 ? .recursive : .shallow
+        }
+        if flags & UInt32(kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink) != 0 { return .entry }
+        return nil // No item type: do not assume directory-level coverage is complete.
+    }
+
+    /// Stream-local identity distinguishes late item events for the existing root
+    /// from replacement of the watched directory. Native names need no spelling lookup.
+    struct EventMapper {
+        let root: String
+        private let initialIdentity: FileIdentity?
+        #if DEBUG
+        private let trace = ProcessInfo.processInfo.environment["WORKSPACE_FSEVENTS_TRACE"] == "1"
+        #endif
+
+        init(root: String) {
+            self.root = root
+            initialIdentity = Self.identity(at: root)
+        }
+
+        private static func identity(at path: String) -> FileIdentity? {
+            var info = LocalStat()
+            guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { return nil }
+            return FileIdentity(device: UInt64(truncatingIfNeeded: info.st_dev), inode: UInt64(info.st_ino))
+        }
+
+        func signal(for events: [(path: String, flags: FSEventStreamEventFlags)]) -> FileSystemChangeSignal? {
+            let currentIdentity = Self.identity(at: root)
+            #if DEBUG
+            if trace {
+                for event in events {
+                    let message = "Workspace FSEvents root=\(String(reflecting: root)) path=\(String(reflecting: event.path)) flags=0x\(String(event.flags, radix: 16)) initialIdentity=\(String(describing: initialIdentity)) currentIdentity=\(String(describing: currentIdentity))\n"
+                    FileHandle.standardError.write(Data(message.utf8))
+                }
+            }
+            #endif
+            guard let initialIdentity, currentIdentity == initialIdentity else { return .rescan }
+            var changed: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
+            for event in events {
+                guard var scope = scope(for: event.flags),
+                      let path = nativeChangePath(event.path, relativeTo: root) else { return .rescan }
+                if path.isRoot {
+                    // Coalesced subtree coverage is still mandatory, even for an
+                    // unchanged root. Ordinary root item events only affect its listing.
+                    if event.flags & UInt32(kFSEventStreamEventFlagMustScanSubDirs) != 0 { return .rescan }
+                    scope = .shallow
+                }
+                if LocalAtomicTemporaryName.matches(path.name) { continue }
+                changed[path] = max(changed[path] ?? .entry, scope)
+            }
+            return changed.isEmpty ? nil : .paths(changed)
+        }
+    }
+
     private final class Box: @unchecked Sendable {
-        let continuation: AsyncStream<Void>.Continuation
-        init(_ continuation: AsyncStream<Void>.Continuation) { self.continuation = continuation }
+        let continuation: AsyncStream<FileSystemChangeSignal>.Continuation
+        let mapper: EventMapper
+        init(_ continuation: AsyncStream<FileSystemChangeSignal>.Continuation, resolvedRootPath: String) {
+            self.continuation = continuation
+            self.mapper = EventMapper(root: resolvedRootPath)
+        }
     }
 
     private final class Observation: @unchecked Sendable {
         private let stream: FSEventStreamRef
         private let box: Unmanaged<Box>
 
-        init(root: URL, continuation: AsyncStream<Void>.Continuation) throws {
-            box = .passRetained(Box(continuation))
+        init(root: URL, resolvedRootPath: String, continuation: AsyncStream<FileSystemChangeSignal>.Continuation) throws {
+            box = .passRetained(Box(continuation, resolvedRootPath: resolvedRootPath))
             var context = FSEventStreamContext(
                 version: 0,
                 info: box.toOpaque(),
@@ -1107,12 +1181,17 @@ enum FSEventsChangeStream {
                 release: nil,
                 copyDescription: nil
             )
-            let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            let callback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
                 guard let info else { return }
-                Unmanaged<Box>.fromOpaque(info).takeUnretainedValue().continuation.yield()
+                let box = Unmanaged<Box>.fromOpaque(info).takeUnretainedValue()
+                let names = unsafeBitCast(paths, to: NSArray.self) as! [String]
+                let events = (0..<count).map { (path: names[$0], flags: flags[$0]) }
+                if let signal = box.mapper.signal(for: events) {
+                    box.continuation.yield(signal)
+                }
             }
             let flags = FSEventStreamCreateFlags(
-                kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer
+                kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagWatchRoot
             )
             guard let stream = FSEventStreamCreate(
                 kCFAllocatorDefault,
@@ -1145,10 +1224,21 @@ enum FSEventsChangeStream {
     }
 
     static func observe(_ root: URL) throws -> AsyncStream<Void> {
+        let signals = try observeSignals(root)
+        return unscopedChanges(signals)
+    }
+
+    static func observeSignals(_ root: URL, resolvedRootPath: String? = nil) throws -> AsyncStream<FileSystemChangeSignal> {
+        let canonical: String
+        if let resolvedRootPath { canonical = resolvedRootPath }
+        else if let path = realpath(root.path, nil) {
+            canonical = String(cString: path)
+            free(path)
+        } else { canonical = root.path }
         var failure: Error?
-        let stream = AsyncStream<Void> { continuation in
+        let stream = AsyncStream<FileSystemChangeSignal> { continuation in
             do {
-                let observation = try Observation(root: root, continuation: continuation)
+                let observation = try Observation(root: root, resolvedRootPath: canonical, continuation: continuation)
                 continuation.onTermination = { _ in observation.cancel() }
             } catch {
                 failure = error
@@ -1165,5 +1255,16 @@ extension LocalFileSystem: FileSystemChangeSource {
     public func changes() async throws -> AsyncStream<Void> {
         try DirectoryChangeStream.observe(requireConfiguration().rootURL, recursive: true)
     }
+
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        try DirectoryChangeStream.observeSignals(requireConfiguration().rootURL, recursive: true)
+    }
 }
 #endif
+
+extension LocalFileSystem {
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        .init(preservesOverwritePermissions: true, followsDirectorySymlinks: true,
+              followsPermissionSymlinks: true, createsWriteParents: true)
+    }
+}

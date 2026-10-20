@@ -19,7 +19,7 @@ import Glibc
 ///
 /// `reload()` (or `configure(rootDirectory:)`) discards the upper layer and whiteouts, so the
 /// overlay reflects the source directory's current state again.
-public actor OverlayFileSystem: FileSystem {
+public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
     private let fileManager: FileManager
     private var upper: InMemoryFileSystem
     private var lower: (any FileSystem)?
@@ -28,6 +28,8 @@ public actor OverlayFileSystem: FileSystem {
     /// merged view. Creating a new entry at a cut path shadows it in the upper layer; the cut
     /// keeps hiding the original lower content.
     private var cuts: Set<WorkspacePath> = []
+    private var rootPermissionsChanged = false
+    private var previewSource: (any FileSystem)?
 
     /// Creates an unconfigured overlay filesystem.
     init(fileManager: FileManager = .default) {
@@ -41,6 +43,26 @@ public actor OverlayFileSystem: FileSystem {
         upper = InMemoryFileSystem()
         lower = base
         rootURL = nil
+    }
+
+    init(previewOf base: any FileSystem) {
+        fileManager = .default
+        upper = InMemoryFileSystem()
+        lower = base
+        previewSource = base
+    }
+
+    init(over base: any FileSystem, semanticsOf source: any FileSystem) {
+        fileManager = .default
+        upper = InMemoryFileSystem()
+        lower = base
+        previewSource = source
+    }
+
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        if let previewSource { return await previewSource.previewBehavior(at: path) }
+        return .init(preservesOverwritePermissions: true,
+                     followsDirectorySymlinks: true, followsPermissionSymlinks: true)
     }
 
     /// Creates and configures an overlay for `rootDirectory`.
@@ -75,6 +97,7 @@ public actor OverlayFileSystem: FileSystem {
     public func discardChanges() async throws {
         upper = InMemoryFileSystem()
         cuts = []
+        rootPermissionsChanged = false
         if rootURL != nil {
             try resetLayers()
         }
@@ -83,6 +106,7 @@ public actor OverlayFileSystem: FileSystem {
     private func resetLayers() throws {
         upper = InMemoryFileSystem()
         cuts = []
+        rootPermissionsChanged = false
         guard let rootURL else {
             lower = nil
             return
@@ -104,6 +128,9 @@ public actor OverlayFileSystem: FileSystem {
             throw posixError(ENOENT)
         }
         var adjusted = info
+        if path.isRoot, !rootPermissionsChanged, let lower {
+            adjusted.permissions = try await lower.stat(path: .root).permissions
+        }
         adjusted.path = path
         return adjusted
     }
@@ -219,9 +246,12 @@ public actor OverlayFileSystem: FileSystem {
         guard !path.isRoot else {
             throw posixError(EISDIR)
         }
+        let semantics = await previewSemantics(at: path)
+        if semantics.createsWriteParents { try await createDirectory(path: path.dirname, recursive: true) }
         let target = try await resolveMergedPath(path)
-        if await upperEntry(target) != nil {
+        if let info = await upperEntry(target) {
             try await upper.writeFile(path: target, data: data, append: append)
+            if semantics.preservesOverwritePermissions { try await upper.setPermissions(path: target, permissions: info.permissions) }
             return
         }
         if let info = await lowerVisibleEntry(target), let lower {
@@ -236,7 +266,7 @@ public actor OverlayFileSystem: FileSystem {
                 contents = data
             }
             try await upper.writeFile(path: target, data: contents, append: false)
-            try await upper.setPermissions(path: target, permissions: info.permissions)
+            try await upper.setPermissions(path: target, permissions: !semantics.preservesOverwritePermissions && !append ? .defaultFile : info.permissions)
             return
         }
         try await ensureUpperDirectories(for: target)
@@ -255,6 +285,13 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
+        if !(await previewSemantics(at: path)).followsDirectorySymlinks {
+            var current = WorkspacePath.root
+            for component in path.components {
+                current = current.appending(component)
+                if let info = await mergedEntry(current), info.kind != .directory { throw posixError(ENOTDIR) }
+            }
+        }
         let path = try await resolveMergedPath(path, allowMissingAncestors: recursive)
         if path.isRoot {
             return
@@ -394,7 +431,7 @@ public actor OverlayFileSystem: FileSystem {
 
     /// See ``FileSystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
-        let path = try await resolveMergedPath(path)
+        let path = try await resolveMergedPath(path, followFinal: previewSemantics(at: path).followsPermissionSymlinks)
         if await upperEntry(path) == nil {
             guard let info = await lowerVisibleEntry(path) else {
                 throw posixError(ENOENT)
@@ -407,6 +444,7 @@ public actor OverlayFileSystem: FileSystem {
             }
         }
         try await upper.setPermissions(path: path, permissions: permissions)
+        if path.isRoot { rootPermissionsChanged = true }
     }
 
     // MARK: - Merged view

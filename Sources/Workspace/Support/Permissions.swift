@@ -281,7 +281,7 @@ public actor RuleBasedPermissionAuthorizer: PermissionAuthorizing {
 /// Backends advertising symlinks must support real-path resolution; unsupported resolution fails closed.
 /// Creation through an unresolved dangling link also fails closed. Existence checks conservatively
 /// authorize the target because some backends implement them with dereferencing semantics.
-public final class AuthorizedFileSystem: FileSystem, Sendable {
+public final class AuthorizedFileSystem: FileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, Sendable {
     private let base: any FileSystem
     private let authorizer: any PermissionAuthorizing
 
@@ -331,6 +331,10 @@ public final class AuthorizedFileSystem: FileSystem, Sendable {
     public func createFile(path: WorkspacePath, data: Data) async throws {
         try await authorize(.init(operation: .writeFile, path: path), entryOnly: true)
         try await base.createFile(path: path, data: data)
+    }
+
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        await base.previewBehavior(at: path)
     }
 
     /// See ``FileSystem/capabilities()``.
@@ -404,6 +408,19 @@ public final class AuthorizedFileSystem: FileSystem, Sendable {
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         try await authorize(.init(operation: .resolveRealPath, path: path))
         return try await base.resolveRealPath(path: path)
+    }
+
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        // Potential paths deliberately include dangling targets. Authorize the
+        // request and backend-resolved result without requiring either to exist.
+        try await checkDecision(.init(operation: .resolveRealPath, path: path))
+        let resolved = try await FileSystemPathResolver(base: base).resolve(
+            path, features: await base.capabilities(), followFinal: true
+        )
+        if resolved != path {
+            try await checkDecision(.init(operation: .resolveRealPath, path: resolved))
+        }
+        return resolved
     }
 
     /// See ``FileSystem/exists(path:)``.
@@ -510,6 +527,40 @@ public final class AuthorizedFileSystem: FileSystem, Sendable {
         }
         if resolved != request {
             try await checkDecision(resolved)
+        }
+    }
+}
+
+
+extension AuthorizedFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        unscopedChanges(try await changeSignals())
+    }
+
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        guard let source = base as? any FileSystemChangeSource else {
+            throw WorkspaceError.unsupported("filesystem change notifications are not supported")
+        }
+        let signals = try await source.changeSignals()
+        return AsyncStream { continuation in
+            let task = Task {
+                for await signal in signals where !Task.isCancelled {
+                    switch signal {
+                    case .rescan: continuation.yield(.rescan)
+                    case let .paths(paths):
+                        var allowed: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
+                        for (path, scope) in paths {
+                            do {
+                                try await self.authorize(.init(operation: .stat, path: path))
+                                allowed[path] = scope
+                            } catch { continue }
+                        }
+                        if !allowed.isEmpty { continuation.yield(.paths(allowed)) }
+                    }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 }

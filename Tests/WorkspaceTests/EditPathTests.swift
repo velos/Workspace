@@ -4,6 +4,46 @@ import Testing
 
 @Suite("Edit path coverage")
 struct EditPathTests {
+    static var localWrappers: [String] {
+        var wrappers = ["limited", "sandbox", "mounted", "authorized"]
+        #if canImport(Darwin)
+        wrappers.append("securityScoped")
+        #endif
+        return wrappers
+    }
+
+    @Test(arguments: localWrappers)
+    func `wrapped local preview preserves overwrite modes and symlink semantics`(wrapper: String) async throws {
+        let root = try TestSupport.temporaryDirectory("WrappedPreview")
+        defer { TestSupport.remove(root) }
+        let local = try LocalFileSystem(root: root)
+        try await local.writeFile(path: "/tool", data: Data("old".utf8), append: false)
+        try await local.setPermissions(path: "/tool", permissions: POSIXPermissions(0o755))
+        try await local.createSymlink(path: "/alias", target: "tool")
+        let fs: any FileSystem
+        switch wrapper {
+        case "limited": fs = LimitedFileSystem(base: local, limits: .init())
+        case "sandbox": fs = try SandboxFileSystem(root: .url(root))
+        case "mounted": fs = MountedFileSystem(mounts: [.init(mountPoint: "/mount", fileSystem: local)])
+        #if canImport(Darwin)
+        case "securityScoped": fs = try SecurityScopedFileSystem(url: root)
+        #endif
+        default: fs = AuthorizedFileSystem(base: local, authorizer: PermissionAuthorizer { _ in .allow })
+        }
+        let prefix = wrapper == "mounted" ? "/mount" : ""
+        let workspace = Workspace(fileSystem: fs)
+        let edits: [Edit] = [.writeText(try WorkspacePath(prefix + "/alias"), "new")]
+        let before = try await Snapshot.capture(from: fs)
+        let preview = try await workspace.preview(edits)
+        #expect(try await Snapshot.capture(from: fs).entry == before.entry)
+        let applied = try await workspace.apply(edits)
+        #expect(preview == applied.changes)
+        #expect(preview.touchedPaths == [try WorkspacePath(prefix + "/tool")])
+        #expect(try await local.stat(path: "/tool").permissions == POSIXPermissions(0o755))
+        #expect(try await local.readSymlink(path: "/alias") == "tool")
+        #expect(try await local.readFile(path: "/tool") == Data("new".utf8))
+    }
+
     enum Backend: CaseIterable, Sendable { case memory, local, mounted }
 
     struct Scenario: Sendable, CustomStringConvertible {
@@ -14,6 +54,7 @@ struct EditPathTests {
 
     static let scenarios: [Scenario] = [
         .init(description: "nested mount write", edits: [.writeText("/mnt/data/x", "hi")]),
+        .init(description: "overwrite mode", edits: [.setPermissions("/dir/a", POSIXPermissions(0o600)), .writeText("/dir/a", "new")]),
         .init(description: "writeText", edits: [.writeText("/dir/a", "new")]),
         .init(description: "appendText", edits: [.appendText("/dir/a", "new")]),
         .init(description: "writeData", edits: [.writeData("/dir/a", Data([1, 2]))]),
@@ -91,6 +132,7 @@ struct EditPathTests {
             let before = try await Snapshot.capture(from: fs)
             let edits = scenario.edits + (failing ? [.copy(from: "/absent", to: "/failure")] : [])
             if failing || (backend != .local && scenario.memoryRejects) {
+                await #expect(throws: (any Error).self) { try await workspace.preview(edits) }
                 do {
                     try await workspace.apply(edits)
                     Issue.record("expected edit failure")
@@ -101,7 +143,10 @@ struct EditPathTests {
                 #expect(after.entry == before.entry)
                 #expect(try await workspace.history().isEmpty)
             } else {
+                let preview = try await workspace.preview(edits)
+                #expect(try await Snapshot.capture(from: fs).entry == before.entry)
                 let result = try await workspace.apply(edits)
+                #expect(preview == result.changes)
                 let after = try await Snapshot.capture(from: fs)
                 let expected = ChangeSet.compare(before: before, after: after, maxTextBytes: DiffOptions.default.maxTextBytes)
                 #expect(result.changes == expected)

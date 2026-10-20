@@ -10,16 +10,13 @@ extension Workspace {
         return text
     }
 
-    /// Previews edits against an isolated in-memory copy of the current workspace.
+    /// Previews edits against an isolated copy-on-write layer over the current workspace.
     public func preview(_ edits: [Edit]) async throws -> ChangeSet {
-        let before = try await Snapshot.capture(from: filesystem)
-        let scratch = InMemoryFileSystem()
-        try await Snapshot.restore(before, to: scratch)
-        for edit in edits {
-            try await Self.apply(edit, to: scratch)
-        }
-        let after = try await Snapshot.capture(from: scratch)
-        return changeSet(from: before, to: after)
+        await acquireOperation()
+        defer { releaseOperation() }
+        let scratch = OverlayFileSystem(previewOf: filesystem)
+        let workspace = Workspace(fileSystem: scratch, recording: .off)
+        return try await workspace.apply(edits).changes
     }
 
     /// Applies edits through one canonical execution and recording path.
@@ -43,6 +40,7 @@ extension Workspace {
                 do {
                     let paths = try await affectedRoots(for: edit)
                     try await journal.capture(paths, from: filesystem)
+                    if transactionRoots != nil { transactionRoots!.formUnion(paths) }
                     try await Self.apply(edit, to: filesystem)
                 } catch {
                     if policy == .atomic { throw error }
@@ -57,7 +55,7 @@ extension Workspace {
                 let recorded = recordingChanges(changes, from: journal.snapshots, to: after)
                 try await appendMutation(operation: .edit, changes: recorded)
             }
-            for snapshot in after { noteWorkspaceSnapshot(snapshot) }
+            for snapshot in after { await noteWorkspaceSnapshot(snapshot) }
             if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
             return EditResult(changes: changes, failures: failures)
         } catch {

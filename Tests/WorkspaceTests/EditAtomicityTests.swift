@@ -208,7 +208,8 @@ struct EditAtomicityTests {
     func `checkpoint persistence failure retracts history and restores filesystem`() async throws {
         let storage = try TestSupport.temporaryDirectory()
         defer { TestSupport.remove(storage) }
-        let workspace = Workspace(persistence: .directory(storage))
+        let fs = HookableFileSystem()
+        let workspace = Workspace(fileSystem: fs, persistence: .directory(storage))
         try await workspace.writeText("/a", "original")
         let checkpoint = try await workspace.createCheckpoint()
         let transaction = try await workspace.beginTransaction()
@@ -216,7 +217,9 @@ struct EditAtomicityTests {
         let before = try await workspace.history()
         let manifest = storage.appendingPathComponent(workspace.workspaceID.uuidString)
             .appendingPathComponent("snapshots").appendingPathComponent("\(checkpoint.snapshotId.uuidString).json")
-        try FileManager.default.removeItem(at: manifest)
+        // Remove the manifest only after merge reads, when commit starts writing.
+        // This still targets persistence compensation rather than lazy base loading.
+        await fs.onWrite { _ in try FileManager.default.removeItem(at: manifest) }
         await #expect(throws: (any Error).self) { try await transaction.commit() }
         #expect(try await workspace.readText("/a") == "original")
         #expect(try await workspace.history() == before)

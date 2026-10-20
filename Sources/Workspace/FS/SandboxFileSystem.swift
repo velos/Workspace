@@ -1,7 +1,7 @@
 import Foundation
 
 /// A disk-backed filesystem rooted in a standard app sandbox location.
-public final class SandboxFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvingFileSystem, Sendable {
+public final class SandboxFileSystem: FileSystem, TraversingFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, Sendable {
     /// Supported strategies for choosing the sandbox root.
     public enum Root: Sendable {
         /// The user's documents directory.
@@ -61,6 +61,10 @@ public final class SandboxFileSystem: FileSystem, TraversingFileSystem, Potentia
     /// See ``FileSystem/createFile(path:data:)``.
     public func createFile(path: WorkspacePath, data: Data) async throws {
         try await backing.createFile(path: path, data: data)
+    }
+
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        await backing.previewBehavior(at: path)
     }
 
     /// See ``FileSystem/capabilities()``.
@@ -167,3 +171,17 @@ public final class SandboxFileSystem: FileSystem, TraversingFileSystem, Potentia
 }
 
 typealias SandboxFilesystem = SandboxFileSystem
+
+
+extension SandboxFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        unscopedChanges(try await changeSignals())
+    }
+
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        guard let source = (backing as any FileSystem) as? any FileSystemChangeSource else {
+            throw WorkspaceError.unsupported("filesystem change notifications are not supported")
+        }
+        return try await source.changeSignals()
+    }
+}

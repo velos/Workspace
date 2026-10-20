@@ -6,6 +6,132 @@ import Testing
 
 @Suite("Linux recursive filesystem watching")
 struct LinuxFileChangeStreamTests {
+    @Test(arguments: ["limited", "sandbox", "mounted", "authorized"])
+    func `wrappers deliver scoped native changes in their virtual namespace`(wrapper: String) async throws {
+        let root = try TestSupport.temporaryDirectory("WrappedWatch")
+        defer { TestSupport.remove(root) }
+        let local = try LocalFileSystem(root: root)
+        let source: any FileSystemChangeSource = switch wrapper {
+        case "limited": LimitedFileSystem(base: local, limits: .init())
+        case "sandbox": try SandboxFileSystem(root: .url(root))
+        case "mounted": MountedFileSystem(mounts: [.init(mountPoint: "/mount", fileSystem: local)])
+        default: AuthorizedFileSystem(base: local, authorizer: PermissionAuthorizer { _ in .allow })
+        }
+        let stream = try await source.changeSignals()
+        let signals = LinuxScopedSignals()
+        let consumer = Task { for await signal in stream { await signals.record(signal) } }
+        defer { consumer.cancel() }
+        // Mounted subscriptions are installed asynchronously and announce their
+        // initial reconciliation after registering all native streams.
+        if wrapper == "mounted" { #expect(await signals.waitForRescan()) }
+        try await local.writeFile(path: "/x", data: Data("new".utf8), append: false)
+        let path: WorkspacePath = wrapper == "mounted" ? "/mount/x" : "/x"
+        #expect(await signals.waitForPath(path, after: 0))
+        #expect(await signals.scopes[path] == .entry)
+        if let mounted = source as? MountedFileSystem {
+            let rescans = await signals.rescans
+            mounted.mount("/added", fileSystem: local)
+            #expect(await signals.waitForRescan(after: rescans))
+            let previous = await signals.count
+            try await local.writeFile(path: "/later", data: Data("later".utf8), append: false)
+            #expect(await signals.waitForPath("/added/later", after: previous))
+            #expect(await signals.waitForPath("/mount/later", after: previous))
+        }
+    }
+
+    @Test
+    func `native stored spellings retain canonical twins and combining mark components`() async throws {
+        let container = try TestSupport.temporaryDirectory("UnicodeWatch")
+        defer { TestSupport.remove(container) }
+        let root = container.appendingPathComponent("\u{301}root")
+        let fs = try LocalFileSystem(root: root)
+        let paths: [WorkspacePath] = ["/caf\u{e9}/\u{301}file", "/cafe\u{301}/\u{301}file"]
+        for path in paths { try await fs.writeFile(path: path, data: Data("old".utf8), append: false) }
+        let stream = try await fs.changeSignals()
+        let signals = LinuxScopedSignals()
+        let consumer = Task { for await signal in stream { await signals.record(signal) } }
+        defer { consumer.cancel() }
+        for path in paths {
+            try await fs.writeFile(path: path, data: Data("new".utf8), append: false)
+            #expect(await signals.waitForPath(path, after: 0))
+            #expect(await signals.scopes[path] == .entry)
+        }
+        #expect(await signals.rescans == 0)
+    }
+
+    @Test
+    func `directory creation and removal emit recursive path invalidations`() async throws {
+        let root = try TestSupport.temporaryDirectory("ScopedDirectoryWatch")
+        defer { TestSupport.remove(root) }
+        let fs = try LocalFileSystem(root: root)
+        let stream = try await fs.changeSignals()
+        let signals = LinuxScopedSignals()
+        let consumer = Task { for await signal in stream { await signals.record(signal) } }
+        defer { consumer.cancel() }
+        try await fs.createDirectory(path: "/child", recursive: false)
+        #expect(await signals.waitForPath("/child", after: 0))
+        #expect(await signals.scopes["/child"] == .recursive)
+        let beforeRemoval = await signals.count
+        try await fs.remove(path: "/child", recursive: true)
+        #expect(await signals.waitForPath("/child", after: beforeRemoval))
+        // Include any queued IN_IGNORED notification after watch retirement.
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(await signals.rescans == 0)
+    }
+
+    @Test
+    func `file writes are entry scoped and directory metadata is shallow`() async throws {
+        let root = try TestSupport.temporaryDirectory("ScopedFileWatch")
+        defer { TestSupport.remove(root) }
+        let fs = try LocalFileSystem(root: root)
+        try await fs.createDirectory(path: "/d", recursive: false)
+        let stream = try await fs.changeSignals()
+        let signals = LinuxScopedSignals()
+        let consumer = Task { for await signal in stream { await signals.record(signal) } }
+        defer { consumer.cancel() }
+        try await fs.writeFile(path: "/x", data: Data("changed".utf8), append: false)
+        #expect(await signals.waitForPath("/x", after: 0))
+        try await fs.setPermissions(path: "/d", permissions: POSIXPermissions(0o700))
+        #expect(await signals.waitForPath("/d", after: 0))
+        let userName = ".workspace-" + UUID().uuidString
+        let userPath = try WorkspacePath("/" + userName)
+        try await fs.writeFile(path: userPath, data: Data("user file".utf8), append: false)
+        #expect(await signals.waitForPath(userPath, after: 0))
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(await signals.rescans == 0)
+        #expect(await signals.scopes["/x"] == .entry)
+        #expect(await signals.scopes["/d"] == .shallow)
+        #expect(await signals.scopes[userPath] == .entry)
+        #expect(await !signals.scopes.keys.contains { LocalAtomicTemporaryName.matches($0.name) })
+    }
+
+    @Test(arguments: [false, true])
+    func `directory rename and move out do not rescan after retiring watches`(moveOut: Bool) async throws {
+        let container = try TestSupport.temporaryDirectory("RetiredWatch")
+        defer { TestSupport.remove(container) }
+        let root = container.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("d/sub"), withIntermediateDirectories: true)
+        let fs = try LocalFileSystem(root: root)
+        let stream = try await fs.changeSignals()
+        let signals = LinuxScopedSignals()
+        let consumer = Task { for await signal in stream { await signals.record(signal) } }
+        defer { consumer.cancel() }
+        try FileManager.default.moveItem(at: root.appendingPathComponent("d"),
+            to: (moveOut ? container : root).appendingPathComponent("e"))
+        #expect(await signals.waitForPath("/d", after: 0))
+        if !moveOut { #expect(await signals.waitForPath("/e", after: 0)) }
+        // IN_IGNORED from our rm_watch arrives in a later batch.
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(await signals.rescans == 0)
+        #expect(await signals.scopes["/d"] == .recursive)
+        if !moveOut {
+            #expect(await signals.scopes["/e"] == .recursive)
+            let previous = await signals.count
+            try await fs.writeFile(path: "/e/sub/new", data: Data("new".utf8), append: false)
+            #expect(await signals.waitForPath("/e/sub/new", after: previous))
+        }
+    }
+
     @Test
     func `recursive watches observe writes inside hidden directories`() async throws {
         let root = try TestSupport.temporaryDirectory("HiddenDirectoryWatch")
@@ -141,6 +267,40 @@ struct LinuxFileChangeStreamTests {
         // Only the child's watch sees this write; directory creation events cannot satisfy it.
         try Data("later".utf8).write(to: replacement)
         #expect(await counter.waitForChange(after: settled))
+    }
+}
+
+private actor LinuxScopedSignals {
+    var count = 0
+    var rescans = 0
+    var scopes: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
+    var lastSeen: [WorkspacePath: Int] = [:]
+    func waitForRescan(after previous: Int = 0) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < deadline {
+            if rescans > previous { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+    func record(_ signal: FileSystemChangeSignal) {
+        count += 1
+        switch signal {
+        case .rescan: rescans += 1
+        case let .paths(paths):
+            for (path, scope) in paths {
+                lastSeen[path] = count
+                scopes[path] = max(scopes[path] ?? .entry, scope)
+            }
+        }
+    }
+    func waitForPath(_ path: WorkspacePath, after previous: Int) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < deadline {
+            if (lastSeen[path] ?? 0) > previous { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
     }
 }
 

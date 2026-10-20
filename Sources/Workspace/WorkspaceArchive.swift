@@ -97,7 +97,7 @@ extension Workspace {
                 let recorded = recordingChanges(changes, from: before, to: after)
                 try await appendMutation(operation: .archiveRestore, changes: recorded)
             }
-            noteWorkspaceSnapshot(after)
+            await noteWorkspaceSnapshot(after)
             if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
             return changes
         } catch {

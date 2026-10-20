@@ -77,6 +77,10 @@ print(result.changes.statistics.additions)
 `apply` is atomic by default. `.stopOnError` and `.continueAfterError` expose partial failures explicitly.
 Atomic recovery does not track hard-link aliases outside captured roots or roll back permission changes to symlink entries.
 
+Edit previews use an isolated copy-on-write layer and the same affected-root journal as `apply`.
+Their ChangeSets describe the edited paths, including link and permission changes. Preview does not
+simulate external races or guarantee that later writes pass filesystem permissions or quota checks.
+
 Direct conveniences—`writeText`, `writeData`, `appendText`, `createDirectory`, `remove`, `copy`, `move`, link creation, and permission changes—use the same edit pipeline.
 
 Text replacement is an edit and shares its file selection and pattern engine with search:
@@ -280,7 +284,35 @@ let result = try await workspace.transaction { transaction in
 }
 ```
 
-Transactions are logically atomic within cooperative workspace use. They are not crash-safe against an external process racing the commit.
+Transactions use a copy-on-write draft over a frozen base. The first transaction on an instance
+reads the tree, including after reopening a Workspace. Memory persistence retains the initial bytes.
+A cold directory-backed base retains up to 256 MiB of file contents in memory; files that do not fit
+use private temporary blobs until a checkpoint supplies immutable content. Live transaction handles
+own the cold base. Discarding or releasing the last handle releases its bytes; successful commit
+releases the completed handle's base and re-seeds the parent from the checkpoint. Other active handles
+retain their frozen contents. A later begin without a live cold base or checkpoint base reads anew.
+Beginning or discarding a transaction adds no public checkpoint. Subsequent begins and commits walk
+metadata and read changed or unverifiable files; previews and merges materialize affected paths.
+Metadata capture uses bulk traversal when available and per-path enumeration otherwise, including
+scoped subtree refreshes. Mounted traversal preserves virtual paths and shadowing; authorized
+traversal retains per-entry permission checks.
+Checkpoint persistence still requires the store's metadata and manifest work. Checkpoints prime a
+transaction base only after that instance has begun a transaction. Directory commits replace the base
+with the new revision index, without retaining changed-file contents or revision read caches.
+
+With `checkpointCapture: .trustMetadata`, transactions reuse contents when size and mtime match
+and the previous mtime is more than two seconds older than the start of the previous metadata
+capture. Identity must also match when both entries provide it. Missing mtimes and recent timestamps
+require reads; InMemoryFileSystem's exact timestamps skip this racy window. Writes that preserve
+safely old metadata can evade the check. Use `.verifyContents` to read and compare every file during
+transaction begin and commit, and to read and hash every file during directory checkpoint capture.
+
+Transactions are logically atomic within cooperative workspace use. They are not crash-safe against
+an external process racing the commit. In-process `Workspace.compact` protects revisions referenced
+by transaction handles and other Workspace instances. This instance's reusable base does not override
+retention: it survives dry runs and real compaction that retains its checkpoint, and is discarded
+when that checkpoint is removed. Coordinate compaction across processes: the store protocol has no
+cross-process revision lease.
 
 ## Events and History
 
@@ -302,6 +334,37 @@ inotify on Linux. `events()` and the path-focused `watchChanges(at:recursive:)` 
 invalidations into structured `ChangeSet` values. External changes remain unrecorded in mutation
 history, matching the direct-filesystem contract above. Directory-backed checkpoint stores use the
 same push model for cross-instance checkpoint events; there is no periodic polling loop.
+
+Filesystem observation keeps a metadata index and a bounded least-recently-used content cache.
+`observation: .init(contentCacheBytes: 32 * 1024 * 1024)` configures the cache on `Workspace`; 32 MiB is
+the default, zero disables it, and negative budgets are treated as zero. Initial observation reads
+at most that budget, excluding files above the text-diff size limit. A change whose old or new bytes
+are uncached has no text diff and reports `.observationCacheMiss` in `textDiffOmissions`.
+`.sizeLimitExceeded` identifies files above the text-diff limit. Failed content reads report the
+metadata change with `.contentReadFailed`, without blocking other changes.
+
+Full and recursive metadata rescans verify cached contents within the same two-second racy window
+used by transactions, and whenever mtime is unavailable. Exact-timestamp backends skip that window.
+Explicit path signals compare cached regular-file contents even when metadata matches. Rescans can
+miss writes that preserve safely old metadata. Without cached contents, observation relies on
+metadata and can report an identical rewrite as changed or miss a rewrite that preserves metadata.
+Observation is not an atomic snapshot of external activity: a mutation between a Workspace write
+and its metadata reconciliation can be absorbed into that write, particularly for uncached files
+or structural changes. Coordinate concurrent writers when every intermediate change must be recorded.
+
+`FileSystemChangeSource.changeSignals()` emits `.paths([WorkspacePath: Scope])` in the source's
+filesystem namespace. `.entry` checks one entry's contents and metadata; `.shallow` also checks a
+directory's immediate listing without traversing existing child directories; `.recursive` checks
+the whole subtree. Added, removed or replaced directories include their current or former descendants.
+Sources must name deleted or replaced ancestors, use recursive scopes for directory renames, and emit
+`.rescan` when coverage is uncertain. Coalescing keeps the strongest scope at each path without letting
+a shallow ancestor suppress descendant signals. The default maps `changes()` Void signals to `.rescan`;
+wrappers should forward richer signals when available. FSEvents and inotify provide scoped signals,
+coalesced over 40 ms, with full metadata rescans for dropped or unknown events. Native watchers exclude
+LocalFileSystem's atomic-replace temporary names in this process's private random namespace; similarly
+named user files and temporary files from other processes remain visible.
+Metadata failures retain their invalidations and retry with exponential backoff for at most three
+attempts. After that, observation waits for a new native signal before resuming the pending work.
 
 ## Path Identity
 
@@ -510,7 +573,7 @@ deadlines (30 minutes per child by default).
 | Scenario | What's timed | Setup excluded | Counter blind spots |
 | --- | --- | --- | --- |
 | `writeText`, `apply50`, `limitedWrite` | One recorded write, 50 edits, quota-limited write | No-op preparation, file reset | Checkpoint store; Limited metadata traversal is visible |
-| `transaction` / `transactionFirst` | Begin, one draft write, commit | Preparation; baseline checkpoint for `transaction` only | Draft filesystem, checkpoint store |
+| `transaction` / `transactionFirst` | Begin, one draft write, commit | Preparation; initial begin/discard and baseline checkpoint for steady-state `transaction` only | Draft filesystem, checkpoint store |
 | `preview` | One edit preview | Preparation | Draft filesystem |
 | `checkpointFirst` / `checkpointIncremental` | First capture / capture after one change | Preparation; baseline and change for incremental | Checkpoint store |
 | `diff`, `restore` | Checkpoint-to-current diff / restore after one change | Preparation, baseline, change | Checkpoint store |

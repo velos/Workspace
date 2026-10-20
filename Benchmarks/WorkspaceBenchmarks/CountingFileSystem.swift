@@ -13,7 +13,8 @@ struct IOCounts: Codable, Equatable, Sendable {
 }
 
 /// A lock only protects counter updates; no lock is held across an await.
-class CountingFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+class CountingFileSystem: FileSystem, TraversingFileSystem, ExactTimestampFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+    var hasExactContentTimestamps: Bool { get async { await base.supportsExactContentTimestamps } }
     let base: any FileSystem
     private let lock = NSLock()
     private var counts = IOCounts()
@@ -156,6 +157,9 @@ class CountingFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvi
         }
         return try await resolver.resolvePotentialPath(path: path)
     }
+    func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        await base.previewBehavior(at: path)
+    }
     func capabilities() async -> FileSystemFeatures {
         call("capabilities")
         return await base.capabilities()
@@ -166,6 +170,13 @@ class CountingFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvi
 final class ObservedCountingFileSystem: CountingFileSystem, FileSystemChangeSource,
     @unchecked Sendable
 {
+    func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        call("changeSignals")
+        guard let source = base as? any FileSystemChangeSource else {
+            throw BenchmarkError.message("backend does not provide filesystem notifications")
+        }
+        return try await source.changeSignals()
+    }
     func changes() async throws -> AsyncStream<Void> {
         call("changes")
         guard let source = base as? any FileSystemChangeSource else {

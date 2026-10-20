@@ -17,11 +17,12 @@ extension Workspace {
         }
     }
 
-    func restoreAfterFailure(_ before: [Snapshot], originalError: any Error) async throws -> Never {
+    func restoreAfterFailure(_ before: [Snapshot], originalError: any Error, restoringSymlinkPermissions: Bool = false) async throws -> Never {
         var rollbackError: (any Error)?
         for snapshot in before {
             do {
                 try await Snapshot.restore(snapshot, to: filesystem)
+                if restoringSymlinkPermissions { try await restoreTransactionSymlinkPermissions(snapshot.entry) }
             } catch {
                 if rollbackError == nil { rollbackError = error }
             }
@@ -204,34 +205,81 @@ extension Workspace {
         guard filesystemObservationTask == nil,
               let source = filesystem as? any FileSystemChangeSource
         else { return }
-        guard let stream = try? await source.changes(),
-              let initial = try? await Snapshot.capture(from: source)
+        guard let stream = try? await source.changeSignals(),
+              let initial = try? await FilesystemObservation.start(on: filesystem, budget: observation.contentCacheBytes)
         else { return }
-        observedFilesystemSnapshot = initial
+        observedFilesystem = initial
         filesystemObservationTask = Task { [weak self] in
-            for await _ in stream where !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(40))
-                await self?.refreshFilesystemEvents()
+            for await signal in stream where !Task.isCancelled {
+                await self?.enqueueFilesystemSignal(signal)
             }
         }
     }
 
-    func noteWorkspaceSnapshot(_ snapshot: Snapshot) {
+    func enqueueFilesystemSignal(_ signal: FileSystemChangeSignal, retry: Bool = false) {
         guard filesystemObservationTask != nil else { return }
-        guard var observed = observedFilesystemSnapshot else { return }
-        observed.entry = Snapshot.replacing(observed.entry, with: snapshot.entry)
-        observedFilesystemSnapshot = observed
+        if !retry {
+            filesystemRefreshFailures = 0
+            filesystemRetryMilliseconds = 40
+        }
+        switch (pendingFilesystemSignal, signal) {
+        case (.rescan, _), (_, .rescan): pendingFilesystemSignal = .rescan
+        case let (.paths(old), .paths(new)): pendingFilesystemSignal = .paths(old.merging(new, uniquingKeysWith: max))
+        case (nil, _): pendingFilesystemSignal = signal
+        }
+        guard filesystemRefreshTask == nil, filesystemRefreshFailures < 3 else { return }
+        let delay = filesystemRetryMilliseconds
+        filesystemRefreshTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(delay)) } catch { return }
+            await self?.refreshFilesystemEvents()
+        }
+    }
+
+    func noteWorkspaceSnapshot(_ snapshot: Snapshot) async {
+        guard var observed = observedFilesystem else { return }
+        observedFilesystem = nil
+        // No content reads: the edit journal already holds the after image. This
+        // reconciliation is not atomic with external writers; README documents the
+        // window between the journal's write and this metadata capture.
+        guard let metadata = try? await MetadataIndex.capture(from: filesystem, at: snapshot.rootPath) else {
+            if filesystemObservationTask != nil { observedFilesystem = observed }
+            return
+        }
+        observed.replace(root: snapshot.rootPath, metadata: metadata)
+        observed.remember(snapshot.entry)
+        if filesystemObservationTask != nil { observedFilesystem = observed }
     }
 
     func refreshFilesystemEvents() async {
         await acquireOperation()
         defer { releaseOperation() }
-        guard let before = observedFilesystemSnapshot,
-              let after = try? await Snapshot.capture(from: filesystem)
-        else { return }
-        observedFilesystemSnapshot = after
-        let changes = changeSet(from: before, to: after)
-        if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
+        let signal = pendingFilesystemSignal ?? .rescan
+        pendingFilesystemSignal = nil
+        guard var observed = observedFilesystem else {
+            filesystemRefreshTask = nil
+            return
+        }
+        observedFilesystem = nil
+        do {
+            let changes = try await observed.refresh(on: filesystem, signal: signal)
+            filesystemRetryMilliseconds = 40
+            filesystemRefreshFailures = 0
+            if filesystemObservationTask != nil {
+                observedFilesystem = observed
+                if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
+            }
+        } catch {
+            if filesystemObservationTask != nil {
+                observedFilesystem = observed
+                // Keep the consumed invalidation alongside signals received during the read.
+                // Bound automatic attempts; a new native signal restarts the retry budget.
+                filesystemRefreshFailures += 1
+                filesystemRetryMilliseconds = min(1_000, filesystemRetryMilliseconds * 2)
+                enqueueFilesystemSignal(signal, retry: true)
+            }
+        }
+        filesystemRefreshTask = nil
+        if let pending = pendingFilesystemSignal { enqueueFilesystemSignal(pending, retry: true) }
     }
 
     func checkpointSort(lhs: Checkpoint, rhs: Checkpoint) -> Bool {

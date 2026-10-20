@@ -71,8 +71,25 @@ extension Workspace {
         defer { releaseOperation() }
         try Task.checkCancellation()
         try await ensureLoaded()
-        let result = try await store.compact(workspaceId: workspaceId, retaining: retention, dryRun: dryRun)
+        // A reusable base alone does not override retention. Independent transaction
+        // handles and other workspace instances still protect their lazy revision reads.
+        let reusablePin = transactionBase?.revisionPin?.token
+        let store = store
+        let workspaceId = workspaceId
+        let result = try await TransactionRevisionGate.shared.withLock {
+            let effectiveRetention: Retention
+            if case let .latest(count, labels, preserving) = retention {
+                let known = Set(try await store.listCheckpoints(workspaceId: workspaceId).map(\.id))
+                let pins = TransactionRevisionPins.shared.checkpoints(in: workspaceId, excluding: reusablePin).intersection(known)
+                effectiveRetention = .latest(count, preservingLabeled: labels, preserving: preserving.union(pins))
+            } else { effectiveRetention = retention }
+            return try await store.compact(workspaceId: workspaceId, retaining: effectiveRetention, dryRun: dryRun)
+        }
         if !dryRun {
+            if let id = transactionBase?.checkpointID, !result.checkpoints.contains(where: { $0.id == id }) {
+                transactionBase = nil
+                transactionMetadata = nil
+            }
             checkpoints = result.checkpoints
             headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
         }

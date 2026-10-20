@@ -8,12 +8,13 @@ public actor Workspace {
         case directory(URL)
     }
 
-    /// Controls file-content verification during checkpoint capture with `.directory` persistence.
-    /// This policy has no effect on `.memory` persistence.
+    /// Controls content verification for transactions and directory checkpoint capture.
     public enum CheckpointCapturePolicy: Sendable, Equatable {
-        /// Reuse matching size and mtime only when the mtime is safely before the prior capture.
+        /// Reuse matching size and mtime when mtime is over two seconds older than the prior
+        /// capture, comparing identity when both entries provide it. Exact-timestamp backends
+        /// skip the transaction racy window. Missing mtimes always require reading contents.
         case trustMetadata
-        /// Read and hash every file, including changes that preserve older timestamps.
+        /// Read and verify every file, including changes that preserve older timestamps.
         case verifyContents
     }
 
@@ -26,6 +27,16 @@ public actor Workspace {
         case off
 
         public static let `default` = RecordingPolicy.full(maxTextBytes: 1_000_000)
+    }
+
+    /// Bounds the old-content cache used for external-change text diffs.
+    public struct ObservationPolicy: Sendable, Equatable {
+        public let contentCacheBytes: Int
+        /// Zero disables content caching. Negative budgets are treated as zero.
+        public init(contentCacheBytes: Int = 32 * 1024 * 1024) {
+            self.contentCacheBytes = max(0, contentCacheBytes)
+        }
+        public static let `default` = ObservationPolicy()
     }
 
     struct EventWatcher {
@@ -43,6 +54,7 @@ public actor Workspace {
     public nonisolated var fileSystem: any FileSystem { filesystem }
     public nonisolated let recording: RecordingPolicy
     let store: any CheckpointStore
+    let checkpointCapture: CheckpointCapturePolicy
 
     // Actor isolation alone does not span suspension points. Ownership is handed
     // directly to the next waiter, preventing newcomers from overtaking the queue.
@@ -61,19 +73,34 @@ public actor Workspace {
     var eventWatchers: [UUID: EventWatcher] = [:]
     var checkpointObservationTask: Task<Void, Never>?
     var filesystemObservationTask: Task<Void, Never>?
-    var observedFilesystemSnapshot: Snapshot?
+    var observedFilesystem: FilesystemObservation?
+    var pendingFilesystemSignal: FileSystemChangeSignal?
+    var filesystemRefreshTask: Task<Void, Never>?
+    var filesystemRetryMilliseconds = 40
+    var filesystemRefreshFailures = 0
+    public nonisolated let observation: ObservationPolicy
+    var hasBegunTransaction = false
+    var transactionBase: TransactionTree?
+    var transactionMetadata: MetadataIndex?
+    weak var coldTransactionBase: ColdTransactionBase?
+    var transactionRoots: Set<WorkspacePath>?
+    let usesMemoryPersistence: Bool
 
-    /// Creates a workspace over a filesystem. `checkpointCapture` affects only `.directory` persistence.
+    /// Creates a workspace over a filesystem with independent history and capture policies.
     public init(
         workspaceID: UUID = UUID(),
         fileSystem: any FileSystem = InMemoryFileSystem(),
         persistence: Persistence = .memory,
         recording: RecordingPolicy = .default,
-        checkpointCapture: CheckpointCapturePolicy = .trustMetadata
+        checkpointCapture: CheckpointCapturePolicy = .trustMetadata,
+        observation: ObservationPolicy = .default
     ) {
+        if case .memory = persistence { usesMemoryPersistence = true } else { usesMemoryPersistence = false }
         self.workspaceId = workspaceID
         self.filesystem = fileSystem
         self.recording = recording
+        self.checkpointCapture = checkpointCapture
+        self.observation = observation
         self.store = switch persistence {
         case .memory:
             InMemoryCheckpointStore()

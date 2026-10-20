@@ -9,6 +9,30 @@ import Glibc
 
 struct FileSystemTraversalTests {
     @Test
+    func mountedWalkRebasesPathsAndPreservesShadowing() async throws {
+        let root = try TestSupport.temporaryDirectory("MountedWalk")
+        defer { TestSupport.remove(root) }
+        let local = try LocalFileSystem(root: root)
+        try await local.writeFile(path: "/base", data: Data("base".utf8), append: false)
+        try await local.writeFile(path: "/mount/hidden", data: Data("hidden".utf8), append: false)
+        let counted = HookableFileSystem(base: local, scopedWalk: true)
+        let mounted = MountedFileSystem(base: counted, mounts: [
+            .init(mountPoint: "/mount", fileSystem: InMemoryFileSystem()),
+            .init(mountPoint: "/synthetic/deep", fileSystem: counted),
+        ])
+        try await mounted.writeFile(path: "/mount/visible", data: Data("visible".utf8), append: false)
+        let snapshot = try await Snapshot.capture(from: mounted)
+        #expect(await counted.walks.contains(.root))
+        #expect(!(await counted.walks.contains("/mount")))
+        let reference = try await Snapshot.capture(from: HookableFileSystem(base: mounted))
+        #expect(snapshot.entry == reference.entry)
+        let metadata = try await MetadataIndex.capture(from: mounted)
+        #expect(metadata.entries["/mount/hidden"] == nil)
+        #expect(metadata.entries["/mount/visible"]?.info.kind == .file)
+        #expect(metadata.entries["/synthetic/deep/mount/hidden"]?.info.kind == .file)
+    }
+
+    @Test
     func deepCaptureBoundsDescriptors() async throws {
         // Resource limits are process-wide. Re-execute only this test in a child so
         // the reduced limit cannot interfere with Swift Testing's parallel suites.
@@ -54,7 +78,7 @@ struct FileSystemTraversalTests {
         let local = try LocalFileSystem(root: root)
         try await local.writeFile(path: path, data: Data("leaf".utf8), append: false)
         let captured = try await Snapshot.capture(from: local)
-        let reference = try await Snapshot.capture(from: MountedFileSystem(base: local))
+        let reference = try await Snapshot.capture(from: HookableFileSystem(base: local))
         #expect(captured.entry == reference.entry)
         var visited = false
         try await local.walk { info, read, _ in
@@ -99,8 +123,8 @@ struct FileSystemTraversalTests {
             try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent(name).path,
                                                        withDestinationPath: target)
         }
-        // Mounted with no mounts preserves the namespace and deliberately uses per-path capture.
-        let perPath = MountedFileSystem(base: local)
+        // A plain forwarding test backend deliberately keeps the per-path reference walk.
+        let perPath = HookableFileSystem(base: local)
         for path: WorkspacePath in [.root, "/dir", "/dir/file", "/dangling", "/cycle", "/escape", "/absent", "/alias/empty"] {
             let bulk = try await Snapshot.capture(from: local, at: path)
             let reference = try await Snapshot.capture(from: perPath, at: path)
@@ -147,7 +171,7 @@ struct FileSystemTraversalTests {
         try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("alias"),
             withDestinationURL: root.appendingPathComponent("private").appendingPathComponent(name))
         #expect(try await local.readFile(path: "/alias") == Data("inside".utf8))
-        #expect(try await Snapshot.capture(from: local).entry == Snapshot.capture(from: MountedFileSystem(base: local)).entry)
+        #expect(try await Snapshot.capture(from: local).entry == Snapshot.capture(from: HookableFileSystem(base: local)).entry)
         let authorized = AuthorizedFileSystem(base: local, authorizer: RuleBasedPermissionAuthorizer(
             rules: [.init(operations: [.readFile], pathPrefix: "/private", effect: .deny(message: "private"))],
             defaultEffect: .allow))
@@ -215,7 +239,7 @@ struct FileSystemTraversalTests {
         let local = try LocalFileSystem(root: root)
         try await local.writeFile(path: "/blocked/child", data: Data(), append: false)
         #expect(chmod(blocked.path, 0) == 0)
-        for fs: any FileSystem in [local, MountedFileSystem(base: local)] {
+        for fs: any FileSystem in [local, HookableFileSystem(base: local)] {
             do {
                 _ = try await Snapshot.capture(from: fs)
                 Issue.record("capture must fail when a directory cannot be enumerated")
@@ -345,7 +369,7 @@ struct FileSystemTraversalTests {
             let request = SearchRequest(pattern: .literal("match", caseSensitive: true), files: selection,
                 limits: .init(maxFileBytes: 100, maxFiles: 3, maxMatches: 2), matchOffset: 1)
             let fast = try await Workspace.search(request, on: local)
-            let fallback = try await Workspace.search(request, on: MountedFileSystem(base: local))
+            let fallback = try await Workspace.search(request, on: HookableFileSystem(base: local))
             #expect(fast == fallback)
             #expect(fast.totalMatches > 0)
             if selection.include != ["alias/file"] {

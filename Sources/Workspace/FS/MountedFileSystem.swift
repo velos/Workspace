@@ -10,7 +10,7 @@ import Glibc
 ///
 /// Each mount is exposed at a virtual path, allowing callers to present a single workspace assembled
 /// from multiple independent roots.
-public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     /// A mounted filesystem and the virtual path where it appears.
     public struct Mount: Sendable {
         /// The normalized virtual mount point.
@@ -37,6 +37,7 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
     private let base: any FileSystem
     private let stateLock = NSLock()
     private var mounts: [Mount]
+    private var mountObservers: [UUID: AsyncStream<[Mount]>.Continuation] = [:]
 
     private func withLock<R>(_ body: () throws -> R) rethrows -> R {
         stateLock.lock()
@@ -63,6 +64,7 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
             let mount = Mount(mountPoint: mountPoint, fileSystem: fileSystem)
             mounts.append(mount)
             mounts.sort { $0.mountPoint.components.count > $1.mountPoint.components.count }
+            for observer in mountObservers.values { observer.yield(mounts) }
         }
     }
 
@@ -73,6 +75,57 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
     /// Convenience overload that accepts a string mount point.
     func mount(_ mountPoint: String, filesystem: any FileSystem) {
         mount(WorkspacePath(normalizing: mountPoint), fileSystem: filesystem)
+    }
+
+    package var supportsScopedWalk: Bool {
+        base.supportsScopedWalk || mountsSnapshot().contains { $0.fileSystem.supportsScopedWalk }
+    }
+
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+                                            visit: FileSystemWalkVisitor) async throws {
+        let mounts = mountsSnapshot()
+        // An entire subtree in one backend can use its descriptor-scoped walk.
+        // At mount junctions, virtual listings retain shadowing and synthetic parents.
+        if !mounts.contains(where: { $0.mountPoint != path && $0.mountPoint.isWithin(path) }) {
+            let resolved = resolveWritable(path: path, mounts: mounts)
+            var visited = false
+            do {
+                try await resolved.filesystem.walk(at: resolved.relativePath,
+                    skippingUnreadableDirectories: skippingUnreadableDirectories) { info, read, readLink in
+                    visited = true
+                    let virtual = resolved.mountPoint.appending(info.path.components.joined(separator: "/"))
+                    try await withoutActuallyEscaping(read) { scopedRead in
+                        try await withoutActuallyEscaping(readLink) { scopedLink in
+                            try await visit(Self.virtualInfo(info, at: virtual),
+                                            { try await scopedRead($0) }, { try await scopedLink() })
+                        }
+                    }
+                }
+            } catch {
+                // A backend root may be a skippable child in our virtual namespace.
+                guard !visited, resolved.relativePath.isRoot, skippingUnreadableDirectories,
+                      isSkippableWalkError(error, at: path) else { throw error }
+                try await walkUsingPaths(at: path, skippingUnreadableDirectories: true, visit: visit)
+            }
+            return
+        }
+        guard let info = try await Snapshot.infoIfPresent(at: path, on: self) else { return }
+        if info.kind == .directory {
+            let listing: [DirectoryEntry]
+            do { listing = try await listDirectory(path: path) }
+            catch {
+                guard skippingUnreadableDirectories, isSkippableWalkError(error, at: path) else { throw error }
+                try await visit(info, { _ in throw WorkspaceError.unsupported("cannot read a directory") },
+                                { throw WorkspaceError.unsupported("not a symlink") })
+                return
+            }
+            for child in listing.sorted(by: { PathName(walkSortKey($0)) < PathName(walkSortKey($1)) }) {
+                try await walk(at: child.info.path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+            }
+        }
+        try await visit(info, { length in
+            try await self.readFile(path: path, offset: 0, length: length)
+        }, { try await self.readSymlink(path: path) })
     }
 
     /// See ``FileSystem/stat(path:)``.
@@ -167,6 +220,11 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
     public func createFile(path: WorkspacePath, data: Data) async throws {
         let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
         try await resolved.filesystem.createFile(path: resolved.relativePath, data: data)
+    }
+
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
+        return await resolved.filesystem.previewBehavior(at: resolved.relativePath)
     }
 
     /// See ``FileSystem/capabilities()``. Reports the intersection of the base filesystem's and
@@ -431,5 +489,59 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
             }
         }
         return nil
+    }
+}
+
+extension MountedFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        unscopedChanges(try await changeSignals())
+    }
+
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        let id = UUID()
+        let (topology, updates) = AsyncStream<[Mount]>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        withLock {
+            mountObservers[id] = updates
+            updates.yield(mounts)
+        }
+        return AsyncStream { continuation in
+            let task = Task {
+                var subscriptions: [Task<Void, Never>] = []
+                defer { subscriptions.forEach { $0.cancel() } }
+                for await mounts in topology where !Task.isCancelled {
+                    subscriptions.forEach { $0.cancel() }
+                    subscriptions.removeAll()
+                    let sources = [Mount(mountPoint: .root, fileSystem: self.base)] + mounts
+                    for mount in sources {
+                        guard let source = mount.fileSystem as? any FileSystemChangeSource,
+                              let signals = try? await source.changeSignals() else { continue }
+                        subscriptions.append(Task {
+                            for await signal in signals where !Task.isCancelled {
+                                switch signal {
+                                case .rescan:
+                                    continuation.yield(.paths([mount.mountPoint: .recursive]))
+                                case let .paths(paths):
+                                    var visible: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
+                                    for (path, scope) in paths {
+                                        let virtual = mount.mountPoint.appending(path.components.joined(separator: "/"))
+                                        let owner = self.resolveWritable(path: virtual, mounts: mounts)
+                                        guard owner.mountPoint == mount.mountPoint else { continue }
+                                        visible[virtual] = scope
+                                    }
+                                    if !visible.isEmpty { continuation.yield(.paths(visible)) }
+                                }
+                            }
+                        })
+                    }
+                    // Reconcile changes during subscription setup and any new mount.
+                    continuation.yield(.rescan)
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+                self.withLock { self.mountObservers.removeValue(forKey: id)?.finish() }
+            }
+        }
     }
 }

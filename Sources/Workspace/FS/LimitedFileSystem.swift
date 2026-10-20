@@ -46,7 +46,7 @@ public enum FileSystemLimitError: Error, Sendable, Equatable, CustomStringConver
 /// Custom backends must follow standard mutation semantics: replacement changes one entry;
 /// append updates aliases; parents may be created. A composition cycle (for example a Mounted
 /// base that mounts this same LimitedFileSystem) deadlocks while the gate is held.
-public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvingFileSystem {
+public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem {
     private let base: any FileSystem
     private let pathResolver: FileSystemPathResolver
     public let limits: FileSystemLimits
@@ -77,6 +77,10 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PotentialPathR
     public func readFileChunks(path: WorkspacePath, chunkSize: Int) async throws -> AsyncThrowingStream<Data, Error> {
         try await base.readFileChunks(path: path, chunkSize: chunkSize)
     }
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        await base.previewBehavior(at: path)
+    }
+
     public func capabilities() async -> FileSystemFeatures { await base.capabilities() }
     public func readSymlink(path: WorkspacePath) async throws -> String { try await base.readSymlink(path: path) }
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
@@ -422,5 +426,19 @@ struct FileSystemPathResolver: Sendable {
         return (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
             || (error.domain == NSCocoaErrorDomain
                 && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code))
+    }
+}
+
+
+extension LimitedFileSystem: FileSystemChangeSource {
+    public func changes() async throws -> AsyncStream<Void> {
+        unscopedChanges(try await changeSignals())
+    }
+
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        guard let source = base as? any FileSystemChangeSource else {
+            throw WorkspaceError.unsupported("filesystem change notifications are not supported")
+        }
+        return try await source.changeSignals()
     }
 }

@@ -381,7 +381,7 @@ struct TransactionTests {
     }
 
     @Test(arguments: [false, true])
-    func `commit can retry after capture failure or successful rollback`(duringWrite: Bool) async throws {
+    func `commit can retry after read failure or successful rollback`(duringWrite: Bool) async throws {
         let fs = HookableFileSystem()
         let workspace = Workspace(fileSystem: fs)
         try await workspace.writeText("/a", "base")
@@ -435,7 +435,7 @@ struct TransactionTests {
     }
 
     @Test
-    func `tree reconstruction rejects missing or non-directory ancestry`() throws {
+    func `merge validation rejects missing or non-directory ancestry`() throws {
         let root = Workspace.MergeNode(kind: .directory, permissions: .defaultDirectory)
         let file = Workspace.MergeNode(kind: .file, permissions: .defaultFile, fileData: Data("keep".utf8))
         let link = Workspace.MergeNode(kind: .symlink, permissions: POSIXPermissions(0o777), symlinkTarget: "elsewhere")
@@ -447,7 +447,7 @@ struct TransactionTests {
             [.root: root, "/missing/deep": root, "/missing/deep/child": file]
         ]
         for nodes in invalid {
-            #expect(throws: WorkspaceError.self) { try Workspace.buildEntryTree(from: nodes) }
+            #expect(throws: WorkspaceError.self) { try Workspace.validateMergeNodes(nodes) }
         }
     }
 
@@ -458,7 +458,11 @@ struct TransactionTests {
         let draftFS = HookableFileSystem()
         let draft = Workspace(fileSystem: draftFS)
         // Use the existing initializer to supply a draft whose I/O can suspend.
-        let transaction = Workspace.Transaction(parent: workspace, draft: draft, base: base, baseCheckpointID: nil, label: nil)
+        var nodes: [WorkspacePath: Workspace.MergeNode] = [:]
+        Workspace.flattenMergeNodes(base.entry, into: &nodes)
+        let tree = TransactionTree(nodes: nodes, load: { _ in throw WorkspaceError.readOnly })
+        let transaction = Workspace.Transaction(parent: workspace, draft: draft, base: tree,
+            metadata: try await MetadataIndex.capture(from: workspace.fileSystem), baseCheckpointID: nil, label: nil)
         let entered = TestSignal()
         let resume = TestSignal()
         await draftFS.onWrite { _ in
@@ -486,7 +490,11 @@ struct TransactionTests {
         let base = try await workspace.revisionSnapshot(.current)
         let draftFS = HookableFileSystem()
         let draft = Workspace(fileSystem: draftFS)
-        let transaction = Workspace.Transaction(parent: workspace, draft: draft, base: base, baseCheckpointID: nil, label: nil)
+        var nodes: [WorkspacePath: Workspace.MergeNode] = [:]
+        Workspace.flattenMergeNodes(base.entry, into: &nodes)
+        let tree = TransactionTree(nodes: nodes, load: { _ in throw WorkspaceError.readOnly })
+        let transaction = Workspace.Transaction(parent: workspace, draft: draft, base: tree,
+            metadata: try await MetadataIndex.capture(from: workspace.fileSystem), baseCheckpointID: nil, label: nil)
         try await transaction.writeText("/a", "draft")
         let entered = TestSignal()
         let resume = TestSignal()

@@ -221,6 +221,44 @@ struct PathIdentityRegressionTests {
         }
     }
 
+    @Test
+    func transactionMergesCanonicalTwinsIndependently() async throws {
+        let workspace = Workspace()
+        try await workspace.createDirectory(nfc)
+        try await workspace.createDirectory(nfd)
+        try await workspace.writeText(nfc.appending("\u{301}file"), "NFC")
+        try await workspace.writeText(nfd.appending("\u{301}file"), "NFD")
+        let transaction = try await workspace.beginTransaction()
+        try await transaction.writeText(nfc.appending("\u{301}file"), "draft")
+        try await workspace.writeText(nfd.appending("\u{301}file"), "parent")
+        #expect(try await transaction.preview().touchedPaths == [nfc.appending("\u{301}file")])
+        #expect(try await transaction.commit().applied)
+        #expect(try await workspace.readText(nfc.appending("\u{301}file")) == "draft")
+        #expect(try await workspace.readText(nfd.appending("\u{301}file")) == "parent")
+    }
+
+    @Test
+    func observationDetectsByteOnlySymlinkChangesWithIdenticalMetadata() async throws {
+        let fs = CoarseFileSystem()
+        // Canonically equivalent targets with equal UTF-8 lengths and fixed metadata.
+        // Only the stored target bytes distinguish the two observations.
+        try await fs.base.createSymlink(path: "/link", target: "a\u{301}\u{323}")
+        var observation = try await FilesystemObservation.start(on: fs, budget: 0)
+        try await fs.base.remove(path: "/link", recursive: false)
+        try await fs.base.createSymlink(path: "/link", target: "a\u{323}\u{301}")
+        #expect(try await observation.refresh(on: fs, signal: .rescan).touchedPaths == ["/link"])
+    }
+
+    @Test
+    func nativePathRebasingUsesStoredByteComponents() throws {
+        let root = "/private/cafe\u{301}/\u{301}root"
+        #expect(nativeChangePath(root + "/\u{301}file", relativeTo: root) == "/\u{301}file")
+        #expect(nativeChangePath(root, relativeTo: root) == .root)
+        #expect(nativeChangePath("/caf\u{e9}/child", relativeTo: "/cafe\u{301}") == nil)
+        #expect(nativeChangePath("/root-other/file", relativeTo: "/root") == nil)
+        #expect(nativeChangePath("/\u{301}file", relativeTo: "/") == "/\u{301}file")
+    }
+
     #if canImport(Darwin)
     private func caseInsensitive(_ root: URL) throws -> Bool {
         try seed(root, "case-probe")

@@ -8,6 +8,7 @@ extension Workspace {
         try Task.checkCancellation()
         try await prepareForMutation()
         try await reconcileCheckpointsWithStore()
+        let metadata = hasBegunTransaction ? try await MetadataIndex.capture(from: filesystem) : nil
         let checkpoint = try await store.captureRevision(
             from: filesystem,
             draft: CheckpointDraft(
@@ -21,6 +22,7 @@ extension Workspace {
         checkpoints.append(checkpoint)
         checkpoints.sort(by: checkpointSort)
         headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
+        if let metadata { try? await seedTransactionBase(checkpoint, metadata: metadata) }
         emitWorkspaceEvent(.checkpoint(checkpoint))
         return checkpoint
     }
@@ -52,7 +54,7 @@ extension Workspace {
                 operation: .rollback,
                 changes: recordingChanges(changes, from: previousSnapshot, to: restoredSnapshot)
             )
-            noteWorkspaceSnapshot(restoredSnapshot)
+            await noteWorkspaceSnapshot(restoredSnapshot)
             if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
             return result
         } catch {

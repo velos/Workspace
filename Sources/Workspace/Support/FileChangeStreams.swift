@@ -6,6 +6,14 @@ import Darwin
 import Glibc
 #endif
 
+/// Native notifications already carry stored spellings. Parse and rebase their
+/// UTF-8 components without a second filesystem lookup (the entry may be gone).
+func nativeChangePath(_ name: String, relativeTo root: String) -> WorkspacePath? {
+    guard let absolute = try? WorkspacePath(name), let root = try? WorkspacePath(root),
+          absolute.isWithin(root) else { return nil }
+    return WorkspacePath(normalizing: absolute.components.dropFirst(root.components.count).joined(separator: "/"))
+}
+
 enum DirectoryChangeStream {
     static func observe(_ directory: URL, recursive: Bool = false) throws -> AsyncStream<Void> {
         #if os(macOS)
@@ -28,40 +36,63 @@ enum DirectoryChangeStream {
             source.resume()
         }
         #elseif canImport(Glibc)
-        return AsyncStream { continuation in
-            do {
-                let observation = try LinuxDirectoryObservation(
-                    directory: directory,
-                    recursive: recursive,
-                    continuation: continuation
-                )
-                continuation.onTermination = { _ in observation.cancel() }
-            } catch {
-                continuation.finish()
-            }
-        }
+        return unscopedChanges(try observeSignals(directory, recursive: recursive))
         #else
         throw WorkspaceError.unsupported("filesystem change streams are not supported on this platform")
         #endif
     }
+
+    static func observeSignals(_ directory: URL, recursive: Bool = false) throws -> AsyncStream<FileSystemChangeSignal> {
+        #if os(macOS)
+        return try FSEventsChangeStream.observeSignals(directory)
+        #elseif canImport(Glibc)
+        var failure: Error?
+        let stream = AsyncStream<FileSystemChangeSignal> { continuation in
+            do {
+                let observation = try LinuxDirectoryObservation(directory: directory, recursive: recursive, continuation: continuation)
+                continuation.onTermination = { _ in observation.cancel() }
+            } catch {
+                failure = error
+                continuation.finish()
+            }
+        }
+        if let failure { throw failure }
+        return stream
+        #else
+        let stream = try observe(directory, recursive: recursive)
+        return AsyncStream { continuation in
+            let task = Task {
+                for await _ in stream where !Task.isCancelled { continuation.yield(.rescan) }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+        #endif
+    }
+
 }
 
 #if canImport(Glibc)
 private final class LinuxDirectoryObservation: @unchecked Sendable {
     private let directory: URL
     private let recursive: Bool
-    private let continuation: AsyncStream<Void>.Continuation
+    private let continuation: AsyncStream<FileSystemChangeSignal>.Continuation
     private let descriptor: Int32
     private let source: DispatchSourceRead
     private var pathsByWatch: [Int32: Set<PathName>] = [:]
     // Keep the root's parent watched so recreating the root can restore coverage even
     // when it was absent during the IN_DELETE_SELF/IN_MOVE_SELF rescan.
     private var parentWatch: Int32?
+    private var pendingIgnored: Set<Int32> = []
+
+    private func removeWatch(_ watch: Int32) {
+        if inotify_rm_watch(descriptor, watch) == 0 { pendingIgnored.insert(watch) }
+    }
 
     init(
         directory: URL,
         recursive: Bool,
-        continuation: AsyncStream<Void>.Continuation
+        continuation: AsyncStream<FileSystemChangeSignal>.Continuation
     ) throws {
         self.directory = directory
         self.recursive = recursive
@@ -92,6 +123,9 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
         var retired = Set<Int32>()
         var ignored = Set<Int32>()
         var overflow = false
+        var reconcile = false
+        var unknown = false
+        var changed: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
         // Drain first, retire each descriptor once, then reconcile against the live tree.
         // No event performs a scan of the path cache or a scan of descendant prefixes.
         while true {
@@ -106,6 +140,7 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
                     let recordSize = headerSize + Int(event.len)
                     guard recordSize <= count - offset else { break }
                     defer { offset += recordSize }
+                    if event.mask & UInt32(IN_IGNORED) != 0, pendingIgnored.remove(event.wd) != nil { continue }
                     if event.wd == parentWatch {
                         if event.mask & UInt32(IN_IGNORED) != 0 {
                             parentWatch = nil
@@ -116,6 +151,26 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
                         }
                     }
                     received = true
+                    let nameBytes = bytes[(offset + headerSize)..<(offset + recordSize)].prefix { $0 != 0 }
+                    guard let name = String(bytes: nameBytes, encoding: .utf8) else {
+                        unknown = true
+                        continue
+                    }
+                    if LocalAtomicTemporaryName.matches(name) { continue }
+                    let structural = event.mask & UInt32(IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED) != 0
+                    let isDirectory = name.isEmpty || event.mask & UInt32(IN_ISDIR) != 0
+                    let scope: FileSystemChangeSignal.Scope = isDirectory ? (structural ? .recursive : .shallow) : .entry
+                    if let watched = pathsByWatch[event.wd] {
+                        for parent in watched {
+                            let absolute = name.isEmpty ? parent.string : parent.string + "/" + name
+                            if let path = nativeChangePath(absolute, relativeTo: directory.path) {
+                                changed[path] = max(changed[path] ?? .entry, scope)
+                            } else { unknown = true }
+                        }
+                    } else { reconcile = true; unknown = true }
+                    if isDirectory && structural {
+                        reconcile = true
+                    }
                     if event.mask & UInt32(IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF) != 0 {
                         retired.insert(event.wd)
                         if event.mask & UInt32(IN_IGNORED) != 0 { ignored.insert(event.wd) }
@@ -128,24 +183,25 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
         if overflow {
             var watches = Set(pathsByWatch.keys)
             if let parentWatch { watches.insert(parentWatch) }
-            for watch in watches where !ignored.contains(watch) { _ = inotify_rm_watch(descriptor, watch) }
+            for watch in watches where !ignored.contains(watch) { removeWatch(watch) }
             pathsByWatch.removeAll(keepingCapacity: true)
             parentWatch = nil
         } else {
             for watch in retired {
                 if pathsByWatch.removeValue(forKey: watch) != nil {
-                    if !ignored.contains(watch) { _ = inotify_rm_watch(descriptor, watch) }
+                    if !ignored.contains(watch) { removeWatch(watch) }
                 }
             }
         }
         do {
-            try addMissingWatches(requireRoot: false)
+            if reconcile || overflow { try addMissingWatches(requireRoot: false) }
         } catch {
             continuation.finish()
             cancel()
             return
         }
-        continuation.yield()
+        if overflow || unknown { continuation.yield(.rescan) }
+        else if !changed.isEmpty { continuation.yield(.paths(changed)) }
     }
 
     private func addMissingWatches(requireRoot: Bool) throws {
@@ -190,7 +246,7 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
         // A descriptor can serve multiple paths. Remove it only after every live path has
         // been registered, and only if the new reverse map no longer references that wd.
         for watch in pathsByWatch.keys where nextByWatch[watch] == nil {
-            _ = inotify_rm_watch(descriptor, watch)
+            removeWatch(watch)
         }
         pathsByWatch = nextByWatch
         if parentWatch == nil, directory.path != "/" {
@@ -204,3 +260,14 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
     }
 }
 #endif
+
+/// Retains compatibility for checkpoint stores and callers of the original Void stream.
+func unscopedChanges(_ stream: AsyncStream<FileSystemChangeSignal>) -> AsyncStream<Void> {
+    AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+        let task = Task {
+            for await _ in stream where !Task.isCancelled { continuation.yield() }
+            continuation.finish()
+        }
+        continuation.onTermination = { _ in task.cancel() }
+    }
+}

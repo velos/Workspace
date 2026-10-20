@@ -124,6 +124,10 @@ struct ScenarioRunner {
         // A no-op mutation loads AND prepares the store, without recording an edit.
         let priming = try await workspace.writeText(path, originalText)
         guard priming.isEmpty else { throw BenchmarkError.message("preparation recorded a mutation") }
+        // The steady-state transaction scenario excludes first-use base freezing.
+        // Ordinary checkpoints no longer opt an instance into transaction caching.
+        // transactionFirst measures that cold capture independently.
+        if operation == .transaction { try await workspace.beginTransaction().discard() }
         let checkpoint: Checkpoint? =
             operation.needsBaselineCheckpoint
             ? try await workspace.createCheckpoint() : nil
@@ -284,9 +288,10 @@ struct ScenarioRunner {
     }
 
     private func assertObservation(_ counter: CountingFileSystem) throws {
-        guard counter.snapshot().filesRead >= Int64(fixture.fileCount) else {
+        let calls = counter.snapshot().calls
+        guard (calls["walk"] ?? 0) > 0 || (calls["listDirectory"] ?? 0) > 0 else {
             throw BenchmarkError.message(
-                "notification setup unavailable: events() did not capture the initial tree")
+                "notification setup unavailable: events() did not index the initial tree")
         }
     }
 

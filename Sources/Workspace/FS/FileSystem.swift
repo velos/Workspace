@@ -210,8 +210,50 @@ public protocol FileSystem: AnyObject, Sendable {
 
 /// A filesystem that can push invalidations when its contents change outside Workspace APIs.
 public protocol FileSystemChangeSource: FileSystem {
-    /// Emits after one or more entries may have changed. Consumers should re-read the affected tree.
+    /// Emits an unscoped invalidation. Workspace consumes `changeSignals()`, whose
+    /// default implementation adapts this stream to `.rescan`.
     func changes() async throws -> AsyncStream<Void>
+    /// Emits scoped invalidations using the `FileSystemChangeSignal` contract.
+    func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal>
+}
+
+/// Invalidates paths in the change source's own filesystem namespace.
+/// Include deleted or replaced ancestors so their former descendants are checked.
+/// Use `.rescan` when paths are unknown, events were dropped, or coverage is uncertain.
+public enum FileSystemChangeSignal: Sendable, Equatable {
+    /// Invalidates the entire tree, including entries that no longer exist.
+    case rescan
+    /// Invalidates each path at its specified scope. Coalescing retains the strongest
+    /// scope for a path; a shallow ancestor does not subsume descendant signals.
+    case paths([WorkspacePath: Scope])
+
+    public enum Scope: Int, Sendable, Comparable {
+        /// Only this entry's contents or metadata changed. A removed or replaced
+        /// directory also invalidates its former descendants.
+        case entry
+        /// This entry and its immediate directory listing may have changed. Existing
+        /// child directories are not traversed; added or replaced subtrees are captured.
+        case shallow
+        /// Everything beneath this path is unknown, including former descendants.
+        /// Use for directory creation, removal or rename, and incomplete subtree coverage.
+        case recursive
+
+        public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+    }
+}
+
+extension FileSystemChangeSource {
+    /// Compatibility for sources that only provide unscoped invalidations.
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        let stream = try await changes()
+        return AsyncStream { continuation in
+            let task = Task {
+                for await _ in stream where !Task.isCancelled { continuation.yield(.rescan) }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 /// Resolves links in the backend's namespace without requiring the target to exist.
@@ -306,3 +348,42 @@ extension FileSystem {
 }
 
 typealias FileSystemCapabilities = FileSystemFeatures
+
+/// Backend differences relevant to copy-on-write edit previews.
+package struct FileSystemPreviewSemantics: Sendable {
+    package var preservesOverwritePermissions: Bool
+    package var followsDirectorySymlinks: Bool
+    package var followsPermissionSymlinks: Bool
+    package var createsWriteParents: Bool
+
+    package init(preservesOverwritePermissions: Bool = false, followsDirectorySymlinks: Bool = false,
+                followsPermissionSymlinks: Bool = false, createsWriteParents: Bool = false) {
+        self.preservesOverwritePermissions = preservesOverwritePermissions
+        self.followsDirectorySymlinks = followsDirectorySymlinks
+        self.followsPermissionSymlinks = followsPermissionSymlinks
+        self.createsWriteParents = createsWriteParents
+    }
+}
+
+package protocol PreviewSemanticsFileSystem: FileSystem {
+    func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics
+}
+
+extension FileSystem {
+    package func previewBehavior(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        if let source = self as? any PreviewSemanticsFileSystem { return await source.previewSemantics(at: path) }
+        return .init()
+    }
+}
+
+/// Backends whose content changes always change mtime or identity, even within a clock tick.
+/// Wrappers may forward this only when preserving those metadata guarantees.
+package protocol ExactTimestampFileSystem: FileSystem {
+    var hasExactContentTimestamps: Bool { get async }
+}
+
+extension FileSystem {
+    package var supportsExactContentTimestamps: Bool {
+        get async { await (self as? any ExactTimestampFileSystem)?.hasExactContentTimestamps ?? false }
+    }
+}
