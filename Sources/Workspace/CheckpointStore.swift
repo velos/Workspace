@@ -617,7 +617,7 @@ actor FileCheckpointStore: CheckpointStore {
         in node: SnapshotManifest.Node
     ) -> SnapshotManifest.Node? {
         if node.path == path { return node }
-        for child in node.children ?? [] where child.path == path || path.string.hasPrefix(child.path.string + "/") {
+        for child in node.children ?? [] where path.isWithin(child.path) {
             return manifestNodeStatic(at: path, in: child)
         }
         return nil
@@ -720,7 +720,7 @@ actor FileCheckpointStore: CheckpointStore {
 
     private func manifestNode(at path: WorkspacePath, in node: SnapshotManifest.Node) -> SnapshotManifest.Node? {
         if node.path == path { return node }
-        for child in node.children ?? [] where child.path == path || path.string.hasPrefix(child.path.string + "/") {
+        for child in node.children ?? [] where path.isWithin(child.path) {
             return manifestNode(at: path, in: child)
         }
         return nil

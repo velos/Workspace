@@ -139,16 +139,15 @@ extension Workspace {
         to destinationRoot: WorkspacePath
     ) -> WorkspacePath {
         guard path != sourceRoot else { return destinationRoot }
-        let prefix = sourceRoot.isRoot ? "/" : sourceRoot.string + "/"
-        guard path.string.hasPrefix(prefix) else { return path }
-        return destinationRoot.appending(String(path.string.dropFirst(prefix.count)))
+        guard path.isWithin(sourceRoot) else { return path }
+        return destinationRoot.appending(path.components.dropFirst(sourceRoot.components.count).joined(separator: "/"))
     }
 
     private static func entry(at path: WorkspacePath, in entry: Snapshot.Entry) -> Snapshot.Entry {
         if entry.path == path { return entry }
         guard case let .directory(directory) = entry else { return .missing(.init(path: path)) }
         for child in directory.children {
-            if child.path == path || path.string.hasPrefix(child.path.string + "/") {
+            if path.isWithin(child.path) {
                 return self.entry(at: path, in: child)
             }
         }

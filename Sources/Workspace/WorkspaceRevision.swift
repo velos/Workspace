@@ -226,7 +226,7 @@ extension Workspace {
         if entry.path == path { return entry }
         guard case let .directory(directory) = entry else { return nil }
         for child in directory.children {
-            if child.path == path || path.string.hasPrefix(child.path.string + "/") {
+            if path.isWithin(child.path) {
                 return snapshotEntry(at: path, in: child)
             }
         }

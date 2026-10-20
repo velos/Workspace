@@ -328,7 +328,7 @@ public actor LimitedFileSystem: FileSystem, PotentialPathResolvingFileSystem {
     }
 
     private static func contains(_ path: WorkspacePath, in parent: WorkspacePath) -> Bool {
-        parent.isRoot || path == parent || path.string.hasPrefix(parent.string + "/")
+        path.isWithin(parent)
     }
 
     private static func posix(_ code: Int32) -> NSError {

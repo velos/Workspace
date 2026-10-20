@@ -228,7 +228,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         }
 
         if sourceNode.isDirectory,
-           (destinationPath == sourcePath || destinationPath.string.hasPrefix(sourcePath.string + "/")) {
+           destinationPath.isWithin(sourcePath) {
             throw posixError(EINVAL)
         }
 

@@ -58,6 +58,29 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         let parent: Descriptor
         let name: String
         let path: WorkspacePath
+
+        // Every variable *at() name comes from an immutable, validated Entry.
+        // Even a future parser bug must not pass a multi-component path to the kernel.
+        init(parent: Descriptor, name: String, path: WorkspacePath) throws {
+            try LocalFileSystem.validateEntryName(name)
+            self.parent = parent
+            self.name = name
+            self.path = path
+        }
+
+        // The only permitted dot entry refers to an already resolved directory fd.
+        init(directory: Descriptor, path: WorkspacePath) {
+            self.parent = directory
+            self.name = "."
+            self.path = path
+        }
+    }
+
+    private static func validateEntryName(_ name: String) throws {
+        guard !name.isEmpty, name != ".", name != "..",
+              !name.utf8.contains(47), !name.utf8.contains(0) else {
+            throw WorkspaceError.invalidPath(name)
+        }
     }
 
     /// Creates an unconfigured disk-backed filesystem.
@@ -155,13 +178,13 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     /// Absolute disk symlink targets are host paths. Accept physical, Foundation-resolved, and
     /// configured root spellings, mapping each to the retained descriptor with exact boundaries.
     private func absoluteComponents(_ target: String, configuration: ConfigurationSnapshot) throws -> [String] {
+        // Keep dot components for descriptor-relative resolution; lexical normalization
+        // here would erase symlink traversal before a subsequent "..".
+        let targetComponents = WorkspacePath.splitComponents(target)
         for root in [configuration.resolvedRootPath, configuration.foundationRootPath, configuration.rootURL.path] {
-            if target == root {
-                return []
-            }
-            let prefix = root == "/" ? "/" : root + "/"
-            if target.hasPrefix(prefix) {
-                return String(target.dropFirst(prefix.count)).split(separator: "/").map(String.init)
+            let rootComponents = WorkspacePath.splitComponents(root)
+            if targetComponents.starts(with: rootComponents) {
+                return Array(targetComponents.dropFirst(rootComponents.count))
             }
         }
         throw WorkspaceError.invalidPath(target)
@@ -173,7 +196,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         configuration: ConfigurationSnapshot? = nil
     ) throws -> Entry {
         let config = try configuration ?? requireConfiguration()
-        guard !path.string.contains("\u{0}") else {
+        guard !path.string.utf8.contains(0) else {
             throw WorkspaceError.invalidPath(path.string)
         }
         var pending = path.components
@@ -194,7 +217,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
                 current = config.root
                 missingAncestor = false
                 for ancestor in names {
-                    let entry = Entry(parent: current, name: ancestor, path: .root)
+                    let entry = try Entry(parent: current, name: ancestor, path: .root)
                     do {
                         current = try openEntry(entry, flags: Self.searchDirectoryFlags)
                     } catch let error as NSError where allowMissingAncestors
@@ -206,7 +229,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
                 continue
             }
             let final = pending.isEmpty
-            let entry = Entry(
+            let entry = try Entry(
                 parent: current, name: name,
                 path: WorkspacePath(unchecked: "/" + (names + [name]).joined(separator: "/")))
             if final && !followFinal {
@@ -234,7 +257,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
                 guard createParents else {
                     throw error
                 }
-                let result = mkdirat(entry.parent.value, name, 0o755)
+                let result = mkdirat(entry.parent.value, entry.name, 0o755)
                 if result < 0 && errno != EEXIST {
                     try check(result)
                 }
@@ -246,12 +269,12 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
                     throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP))
                 }
                 let target = try linkTarget(entry)
-                if target.hasPrefix("/") {
+                if target.utf8.first == 47 {
                     pending = try absoluteComponents(target, configuration: config) + pending
                     current = config.root
                     names = []
                 } else {
-                    pending = target.split(separator: "/").map(String.init) + pending
+                    pending = WorkspacePath.splitComponents(target) + pending
                 }
                 continue
             }
@@ -261,7 +284,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             current = try openEntry(entry, flags: Self.searchDirectoryFlags)
             names.append(name)
         }
-        return Entry(parent: current, name: ".", path: WorkspacePath(unchecked: "/" + names.joined(separator: "/")))
+        return Entry(directory: current, path: WorkspacePath(unchecked: "/" + names.joined(separator: "/")))
     }
 
     private func openEntry(_ entry: Entry, flags: Int32, mode: mode_t = 0o666) throws -> Descriptor {
@@ -463,13 +486,13 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
 
     private func replace(_ entry: Entry, body: (Descriptor) throws -> Void) throws {
         let temporary = ".workspace-" + UUID().uuidString
-        let temporaryEntry = Entry(parent: entry.parent, name: temporary, path: entry.path)
+        let temporaryEntry = try Entry(parent: entry.parent, name: temporary, path: entry.path)
         let fd = try openEntry(temporaryEntry, flags: O_WRONLY | O_CREAT | O_EXCL)
         defer {
-            _ = unlinkat(entry.parent.value, temporary, 0)
+            _ = unlinkat(temporaryEntry.parent.value, temporaryEntry.name, 0)
         }
         try body(fd)
-        try check(renameat(entry.parent.value, temporary, entry.parent.value, entry.name))
+        try check(renameat(temporaryEntry.parent.value, temporaryEntry.name, entry.parent.value, entry.name))
     }
 
     /// See ``FileSystem/createDirectory(path:recursive:)``.
@@ -626,8 +649,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         let config = try requireConfiguration()
         let source = try resolve(sourcePath, followFinal: false, configuration: config)
         let destination = try resolve(destinationPath, followFinal: false, createParents: true, configuration: config)
-        guard source.path != destination.path,
-            !(destination.path.string.hasPrefix(source.path.string + "/")) && !source.path.isRoot
+        guard !destination.path.isWithin(source.path)
         else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
         }

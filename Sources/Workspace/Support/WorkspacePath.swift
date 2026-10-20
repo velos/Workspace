@@ -14,13 +14,13 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
 
     /// Creates a normalized path from a string literal.
     public init(stringLiteral value: StringLiteralType) {
-        precondition(!value.contains("\u{0}"), "workspace path contains a null byte")
+        precondition(!value.utf8.contains(0), "workspace path contains a null byte")
         storage = Self.normalizedString(path: value, currentDirectory: Self.root.storage)
     }
 
     /// Creates a validated, normalized path from dynamic text.
     public init(_ path: String, relativeTo currentDirectory: WorkspacePath = .root) throws {
-        if path.contains("\u{0}") {
+        if path.utf8.contains(0) {
             throw WorkspaceError.invalidPath(path)
         }
         storage = Self.normalizedString(path: path, currentDirectory: currentDirectory.storage)
@@ -40,7 +40,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     /// - Throws: ``WorkspaceError/invalidPath(_:)`` when the input contains unsupported characters.
     init(validating path: some StringProtocol, relativeTo currentDirectory: WorkspacePath = .root) throws {
         let string = String(path)
-        if string.contains("\u{0}") {
+        if string.utf8.contains(0) {
             throw WorkspaceError.invalidPath(string)
         }
         self.init(normalizing: string, relativeTo: currentDirectory)
@@ -68,6 +68,27 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     /// The path components excluding the leading `/`.
     public var components: [String] {
         Self.splitComponents(storage)
+    }
+
+    /// Whether this path is equal to or below `ancestor`, using canonical Unicode
+    /// equality for each component, just like path equality.
+    func isWithin(_ ancestor: WorkspacePath) -> Bool {
+        if ancestor.isRoot { return true }
+
+        // The fast path stays allocation-free: UTF-8 views and slices avoid
+        // constructing component arrays or new strings in containment hot loops.
+        let bytes = storage.utf8
+        let ancestorBytes = ancestor.storage.utf8
+        if bytes.starts(with: ancestorBytes) {
+            let next = bytes.dropFirst(ancestorBytes.count).first
+            if next == nil || next == 47 { return true }
+        }
+        if bytes.allSatisfy({ $0 < 128 }), ancestorBytes.allSatisfy({ $0 < 128 }) {
+            return false
+        }
+
+        // Different non-ASCII byte spellings may still be canonically equal.
+        return components.starts(with: ancestor.components)
     }
 
     /// The final path component, or `/` for the root path.
@@ -115,14 +136,16 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
         }
 
         let base: [String]
-        if path.hasPrefix("/") {
+        if path.utf8.first == 47 {
             base = []
         } else {
             base = splitComponents(currentDirectory)
         }
 
         var parts = base
-        for piece in path.split(separator: "/", omittingEmptySubsequences: true) {
+        // POSIX separators are bytes, not grapheme clusters. An extending scalar
+        // after '/' must not hide a component boundary from resolution.
+        for piece in splitComponents(path) {
             switch piece {
             case ".":
                 continue
@@ -138,19 +161,15 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
         return "/" + parts.joined(separator: "/")
     }
 
-    /// Splits an absolute path string into components, excluding the leading `/`.
+    /// Splits on UTF-8 slash bytes, omitting empty components and preserving `.` and `..`.
     static func splitComponents(_ absolutePath: some StringProtocol) -> [String] {
-        String(absolutePath).split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        absolutePath.utf8.split(separator: 47, omittingEmptySubsequences: true)
+            .map { String(decoding: $0, as: UTF8.self) }
     }
 
     /// Returns the last component of `path`, or `/` for the root path.
     static func basename(_ path: some StringProtocol) -> String {
-        let string = String(path)
-        let normalized = string == "/" ? "/" : string.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if normalized == "/" || normalized.isEmpty {
-            return "/"
-        }
-        return normalized.split(separator: "/").last.map(String.init) ?? "/"
+        splitComponents(path).last ?? "/"
     }
 
     /// Returns the parent directory of `path`.
@@ -172,11 +191,11 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     static func join(_ lhs: some StringProtocol, _ rhs: some StringProtocol) -> String {
         let left = String(lhs)
         let right = String(rhs)
-        if right.hasPrefix("/") {
+        if right.utf8.first == 47 {
             return normalizedString(path: right, currentDirectory: "/")
         }
 
-        let separator = left.hasSuffix("/") ? "" : "/"
+        let separator = left.utf8.last == 47 ? "" : "/"
         return normalizedString(path: left + separator + right, currentDirectory: "/")
     }
 
@@ -188,7 +207,7 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     /// Returns `true` when the token contains glob metacharacters.
     static func containsGlob(_ token: some StringProtocol) -> Bool {
         let string = String(token)
-        return string.contains("*") || string.contains("?") || string.contains("[")
+        return string.utf8.contains(42) || string.utf8.contains(63) || string.utf8.contains(91)
     }
 
     /// Converts a shell-style glob pattern into an anchored regular expression pattern.
@@ -196,49 +215,47 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
     /// `*` and `?` match within a single path component (they never cross `/`), `**` matches any
     /// characters including `/`, and character classes support shell-style negation (`[!abc]`).
     static func globToRegex(_ pattern: some StringProtocol) -> String {
-        let pattern = String(pattern)
-        var regex = "^"
-        var index = pattern.startIndex
+        let pattern = Array(pattern.utf8)
+        var regex = Array("^".utf8)
+        var index = 0
+        func append(_ text: String) { regex.append(contentsOf: text.utf8) }
 
-        while index < pattern.endIndex {
-            let char = pattern[index]
-            if char == "*" {
-                let nextIndex = pattern.index(after: index)
-                if nextIndex < pattern.endIndex, pattern[nextIndex] == "*" {
-                    let afterDoubleStar = pattern.index(after: nextIndex)
-                    if afterDoubleStar < pattern.endIndex, pattern[afterDoubleStar] == "/" {
-                        regex += "(?:.*/)?"
-                        index = afterDoubleStar
+        while index < pattern.count {
+            let byte = pattern[index]
+            if byte == 42 { // *
+                if index + 1 < pattern.count, pattern[index + 1] == 42 {
+                    if index + 2 < pattern.count, pattern[index + 2] == 47 {
+                        append("(?:.*/)?")
+                        index += 2
                     } else {
-                        regex += ".*"
-                        index = nextIndex
+                        append(".*")
+                        index += 1
                     }
                 } else {
-                    regex += "[^/]*"
+                    append("[^/]*")
                 }
-            } else if char == "?" {
-                regex += "[^/]"
-            } else if char == "[" {
-                if let closeIndex = pattern[index...].firstIndex(of: "]"),
-                   closeIndex > pattern.index(after: index)
-                {
-                    let range = pattern.index(after: index)..<closeIndex
-                    var body = String(pattern[range])
-                    if body.hasPrefix("!") {
-                        body = "^" + body.dropFirst()
-                    }
-                    regex += "[" + body + "]"
+            } else if byte == 63 { // ?
+                append("[^/]")
+            } else if byte == 91 { // [
+                if let closeIndex = pattern[index...].firstIndex(of: 93), closeIndex > index + 1 {
+                    var body = Array(pattern[(index + 1)..<closeIndex])
+                    if body.first == 33 { body[0] = 94 } // ! -> ^
+                    regex.append(91)
+                    regex.append(contentsOf: body)
+                    regex.append(93)
                     index = closeIndex
                 } else {
-                    regex += "\\["
+                    append("\\[")
                 }
+            } else if byte < 128 {
+                append(NSRegularExpression.escapedPattern(for: String(decoding: [byte], as: UTF8.self)))
             } else {
-                regex += NSRegularExpression.escapedPattern(for: String(char))
+                regex.append(byte)
             }
-            index = pattern.index(after: index)
+            index += 1
         }
 
-        regex += "$"
-        return regex
+        append("$")
+        return String(decoding: regex, as: UTF8.self)
     }
 }

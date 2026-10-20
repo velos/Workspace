@@ -77,7 +77,7 @@ extension Workspace {
             guard let path = filter.path else { return true }
             return changes.touchedPaths.contains { candidate in
                 if filter.recursive {
-                    return candidate == path || candidate.string.hasPrefix(path.isRoot ? "/" : path.string + "/")
+                    return candidate.isWithin(path)
                 }
                 return candidate == path
             }

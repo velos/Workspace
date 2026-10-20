@@ -54,7 +54,7 @@ extension ChangeSet {
     }
 
     private func patchPath(_ path: WorkspacePath, prefix: String) -> String {
-        let value = path.string == "/" ? "" : String(path.string.drop(while: { $0 == "/" }))
+        let value = path.components.joined(separator: "/")
         return value.isEmpty ? prefix : "\(prefix)/\(value)"
     }
 }

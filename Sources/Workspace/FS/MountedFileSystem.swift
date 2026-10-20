@@ -54,7 +54,7 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
         mounts: [Mount] = []
     ) {
         self.base = base
-        self.mounts = mounts.sorted { $0.mountPoint.string.count > $1.mountPoint.string.count }
+        self.mounts = mounts.sorted { $0.mountPoint.components.count > $1.mountPoint.components.count }
     }
 
     /// Adds a filesystem mount at `mountPoint`.
@@ -62,7 +62,7 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
         withLock {
             let mount = Mount(mountPoint: mountPoint, fileSystem: fileSystem)
             mounts.append(mount)
-            mounts.sort { $0.mountPoint.string.count > $1.mountPoint.string.count }
+            mounts.sort { $0.mountPoint.components.count > $1.mountPoint.components.count }
         }
     }
 
@@ -277,7 +277,7 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
         let real = try await resolved.filesystem.resolveRealPath(path: resolved.relativePath)
-        return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, String(real.string.dropFirst()))
+        return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, real.components.joined(separator: "/"))
     }
 
     // Used only when a symlink target or suffix is missing. Resolve inside the selected
@@ -287,7 +287,7 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
         let real = try await FileSystemPathResolver(base: resolved.filesystem).resolve(
             resolved.relativePath, features: await resolved.filesystem.capabilities(), followFinal: true
         )
-        return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, String(real.string.dropFirst()))
+        return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, real.components.joined(separator: "/"))
     }
 
     /// See ``FileSystem/exists(path:)``.
@@ -392,22 +392,15 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
             guard isPath(mount.mountPoint, inside: path) else {
                 continue
             }
-            let remaining = mount.mountPoint.isRoot
-                ? ""
-                : String(mount.mountPoint.string.dropFirst(path.isRoot ? 1 : path.string.count + 1))
-            guard !remaining.isEmpty else { continue }
-            if let first = remaining.split(separator: "/").first {
-                names.insert(String(first))
+            if let first = mount.mountPoint.components.dropFirst(path.components.count).first {
+                names.insert(first)
             }
         }
         return names.sorted()
     }
 
     private func isPath(_ candidate: WorkspacePath, inside parent: WorkspacePath) -> Bool {
-        if parent.isRoot {
-            return candidate.string.hasPrefix("/") && !candidate.isRoot
-        }
-        return candidate == parent || candidate.string.hasPrefix(parent.string + "/")
+        candidate.isWithin(parent)
     }
 
     private func resolveWritable(path: WorkspacePath, mounts: [Mount])
@@ -428,8 +421,8 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
                 return (mount.mountPoint, mount.fileSystem, path)
             }
 
-            if !mount.mountPoint.isRoot, path.string.hasPrefix(mount.mountPoint.string + "/") {
-                let suffix = String(path.string.dropFirst(mount.mountPoint.string.count))
+            if path.isWithin(mount.mountPoint) {
+                let suffix = path.components.dropFirst(mount.mountPoint.components.count).joined(separator: "/")
                 return (
                     mount.mountPoint,
                     mount.fileSystem,

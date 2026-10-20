@@ -110,7 +110,7 @@ struct RevisionIndex: Sendable, Equatable {
     private static func entry(at path: WorkspacePath, in entry: Entry) -> Entry? {
         if entry.path == path { return entry }
         guard case let .directory(_, _, children) = entry else { return nil }
-        for child in children where child.path == path || path.string.hasPrefix(child.path.string + "/") {
+        for child in children where path.isWithin(child.path) {
             return self.entry(at: path, in: child)
         }
         return nil

@@ -239,7 +239,7 @@ public actor RuleBasedPermissionAuthorizer: PermissionAuthorizing {
         let paths = endpoints.compactMap { $0 }
         guard !paths.isEmpty else { return false }
         let matches: (WorkspacePath) -> Bool = { path in
-            rule.pathPrefix.isRoot || path == rule.pathPrefix || path.string.hasPrefix(rule.pathPrefix.string + "/")
+            path.isWithin(rule.pathPrefix)
         }
         switch rule.effect {
         case .allow: return paths.allSatisfy(matches)

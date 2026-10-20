@@ -308,7 +308,7 @@ public actor OverlayFileSystem: FileSystem {
         }
         if lowerVisible {
             // Deeper cuts are redundant once this path is cut.
-            cuts = cuts.filter { !$0.string.hasPrefix(path.string + "/") }
+            cuts = cuts.filter { !$0.isWithin(path) }
             cuts.insert(path)
         }
     }
@@ -323,7 +323,7 @@ public actor OverlayFileSystem: FileSystem {
         guard let sourceInfo = await mergedEntry(sourcePath) else {
             throw posixError(ENOENT)
         }
-        if sourceInfo.kind == .directory, destinationPath.string.hasPrefix(sourcePath.string + "/") {
+        if sourceInfo.kind == .directory, destinationPath.isWithin(sourcePath) {
             throw posixError(EINVAL)
         }
         guard await mergedEntry(destinationPath) == nil else {
@@ -334,7 +334,7 @@ public actor OverlayFileSystem: FileSystem {
         try await ensureUpperDirectories(for: destinationPath)
         try await upper.move(from: sourcePath, to: destinationPath)
         if await lowerVisibleEntry(sourcePath) != nil {
-            cuts = cuts.filter { !$0.string.hasPrefix(sourcePath.string + "/") }
+            cuts = cuts.filter { !$0.isWithin(sourcePath) }
             cuts.insert(sourcePath)
         }
     }
@@ -415,7 +415,7 @@ public actor OverlayFileSystem: FileSystem {
         if cuts.contains(path) {
             return true
         }
-        return cuts.contains { path.string.hasPrefix($0.string + "/") }
+        return cuts.contains { path.isWithin($0) }
     }
 
     private func upperEntry(_ path: WorkspacePath) async -> FileInfo? {
@@ -475,10 +475,10 @@ public actor OverlayFileSystem: FileSystem {
                 } else {
                     throw posixError(ENOENT)
                 }
-                if target.hasPrefix("/") {
+                if target.utf8.first == 47 {
                     current = .root
                 }
-                pending = target.split(separator: "/").map(String.init) + pending
+                pending = WorkspacePath.splitComponents(target) + pending
                 continue
             }
             if !final && info.kind != .directory {

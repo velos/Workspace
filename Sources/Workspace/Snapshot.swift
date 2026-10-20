@@ -410,7 +410,7 @@ struct SnapshotJournal {
 
 extension Snapshot {
     static func contains(_ root: WorkspacePath, _ path: WorkspacePath) -> Bool {
-        root.isRoot || root == path || path.string.hasPrefix(root.string + "/")
+        path.isWithin(root)
     }
 
     static func replacing(_ tree: Entry, with replacement: Entry) -> Entry {
