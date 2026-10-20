@@ -93,12 +93,12 @@ struct UnicodePathRegressionTests {
     }
 
     @Test
-    func containmentFastPathPreservesCanonicalEqualityAndBoundaries() {
-        // These canonically equivalent spellings must reach the non-ASCII fallback.
+    func containmentUsesExactBytesAndBoundaries() {
+        // Canonically equivalent spellings are deliberately distinct workspace paths.
         let decomposed = WorkspacePath("/cafe\u{301}/x")
         let composed = WorkspacePath("/caf\u{e9}")
-        #expect(decomposed.isWithin(composed))
-        #expect(composed.isWithin(WorkspacePath("/cafe\u{301}")))
+        #expect(!decomposed.isWithin(composed))
+        #expect(!composed.isWithin(WorkspacePath("/cafe\u{301}")))
         #expect(!(WorkspacePath("/cafe\u{301}-other/x")).isWithin(composed))
         #expect(!(WorkspacePath("/caf\u{e9}/x")).isWithin(WorkspacePath("/cafe")))
 
@@ -112,12 +112,12 @@ struct UnicodePathRegressionTests {
     }
 
     @Test
-    func denyRulesUseComponentBoundariesAndCanonicalEquality() async throws {
+    func denyRulesUseComponentBoundariesAndExactEquality() async throws {
         let authorizer = RuleBasedPermissionAuthorizer(rules: [
             .init(operations: [.readFile], pathPrefix: "/private", effect: .deny(message: nil)),
             .init(operations: [.readFile], pathPrefix: "/caf\u{e9}", effect: .deny(message: nil)),
         ], defaultEffect: .allow)
-        for path: WorkspacePath in ["/private/\u{301}x", "/cafe\u{301}/\u{301}x", "/caf\u{e9}"] {
+        for path: WorkspacePath in ["/private/\u{301}x", "/caf\u{e9}/\u{301}x", "/caf\u{e9}"] {
             let decision = await authorizer.authorize(.init(operation: .readFile, path: path))
             guard case .deny = decision else {
                 Issue.record("deny rule did not match \(path)")

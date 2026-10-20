@@ -4,6 +4,8 @@ import Foundation
 ///
 /// `WorkspacePath` models shell-style paths independently of the host filesystem so the same value can
 /// be used with in-memory, mounted, overlay, and disk-backed filesystems.
+/// Identity, hashing, ordering, and containment use exact UTF-8 bytes. Case and Unicode
+/// normalization are significant: `/café` and `/cafe\u{301}` are different paths.
 public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, ExpressibleByStringLiteral,
     CustomStringConvertible
 {
@@ -70,25 +72,15 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
         Self.splitComponents(storage)
     }
 
-    /// Whether this path is equal to or below `ancestor`, using canonical Unicode
-    /// equality for each component, just like path equality.
+    /// Whether this path is equal to or below `ancestor`, comparing exact UTF-8
+    /// component bytes, just like WorkspacePath's `==`.
     func isWithin(_ ancestor: WorkspacePath) -> Bool {
         if ancestor.isRoot { return true }
-
-        // The fast path stays allocation-free: UTF-8 views and slices avoid
-        // constructing component arrays or new strings in containment hot loops.
         let bytes = storage.utf8
         let ancestorBytes = ancestor.storage.utf8
-        if bytes.starts(with: ancestorBytes) {
-            let next = bytes.dropFirst(ancestorBytes.count).first
-            if next == nil || next == 47 { return true }
-        }
-        if bytes.allSatisfy({ $0 < 128 }), ancestorBytes.allSatisfy({ $0 < 128 }) {
-            return false
-        }
-
-        // Different non-ASCII byte spellings may still be canonically equal.
-        return components.starts(with: ancestor.components)
+        guard bytes.starts(with: ancestorBytes) else { return false }
+        let next = bytes.dropFirst(ancestorBytes.count).first
+        return next == nil || next == 47
     }
 
     /// The final path component, or `/` for the root path.
@@ -112,9 +104,17 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
         Self.join(self, String(component))
     }
 
-    /// Orders paths lexicographically by their normalized string values.
+    public static func == (lhs: WorkspacePath, rhs: WorkspacePath) -> Bool {
+        lhs.storage.utf8.elementsEqual(rhs.storage.utf8)
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        PathName(storage).hash(into: &hasher)
+    }
+
+    /// Orders paths lexicographically by their normalized UTF-8 bytes.
     public static func < (lhs: WorkspacePath, rhs: WorkspacePath) -> Bool {
-        lhs.storage < rhs.storage
+        lhs.storage.utf8.lexicographicallyPrecedes(rhs.storage.utf8)
     }
 
     /// Decodes a path from its string representation.

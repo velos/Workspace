@@ -7,6 +7,11 @@ extension Workspace {
         var permissions: POSIXPermissions
         var fileData: Data?
         var symlinkTarget: String?
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.kind == rhs.kind && lhs.permissions == rhs.permissions && lhs.fileData == rhs.fileData
+                && lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init)
+        }
     }
 
     static func flattenMergeNodes(_ entry: Snapshot.Entry, into nodes: inout [WorkspacePath: MergeNode]) {
@@ -82,7 +87,7 @@ extension Workspace {
                     .init(
                         path: path,
                         permissions: node.permissions,
-                        children: (childNames[path] ?? []).sorted { $0.0 < $1.0 }.map { name, child in
+                        children: (childNames[path] ?? []).sorted { PathName($0.0) < PathName($1.0) }.map { name, child in
                             subtree(at: path.appending(name), node: child)
                         }
                     )

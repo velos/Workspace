@@ -7,6 +7,19 @@ struct RevisionIndex: Sendable, Equatable {
         case directory(path: WorkspacePath, permissions: POSIXPermissions, children: [Entry])
         case symbolicLink(path: WorkspacePath, target: String, permissions: POSIXPermissions)
 
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            switch (lhs, rhs) {
+            case let (.missing(a), .missing(b)): return a == b
+            case let (.file(a, sizeA, modeA, idA), .file(b, sizeB, modeB, idB)):
+                return a == b && sizeA == sizeB && modeA == modeB && idA == idB
+            case let (.directory(a, modeA, childrenA), .directory(b, modeB, childrenB)):
+                return a == b && modeA == modeB && childrenA == childrenB
+            case let (.symbolicLink(a, targetA, modeA), .symbolicLink(b, targetB, modeB)):
+                return a == b && modeA == modeB && targetA.utf8.elementsEqual(targetB.utf8)
+            default: return false
+            }
+        }
+
         var path: WorkspacePath {
             switch self {
             case let .missing(path), let .file(path, _, _, _), let .directory(path, _, _),

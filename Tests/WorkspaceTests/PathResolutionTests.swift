@@ -106,6 +106,37 @@ struct PathResolutionTests {
     }
 
     @Test
+    func nestedPathsSurviveRootRelocation() async throws {
+        let container = try TestSupport.temporaryDirectory("RelocatedRoot")
+        defer { TestSupport.remove(container) }
+        let parent = container.appendingPathComponent("parent")
+        let root = parent.appendingPathComponent("root")
+        let fs = try LocalFileSystem(root: root)
+        try await fs.createFile(path: "/top", data: Data([1]))
+        try await fs.createFile(path: "/d/f", data: Data([2]))
+
+        let renamed = parent.appendingPathComponent("renamed")
+        try FileManager.default.moveItem(at: root, to: renamed)
+        let movedParent = container.appendingPathComponent("moved-parent")
+        // Exercise both root and ancestor relocation on the same pinned fd.
+        for moveAncestor in [false, true] {
+            if moveAncestor {
+                try FileManager.default.moveItem(at: parent, to: movedParent)
+            }
+            #expect(try await fs.readFile(path: "/top") == Data([1]))
+            await #expect(throws: Never.self) {
+                let data = try await fs.readFile(path: "/d/f")
+                #expect(data == Data([2]))
+            }
+            await #expect(throws: Never.self) {
+                try await fs.writeFile(path: "/d/g", data: Data([3]), append: false)
+                #expect(try await fs.readFile(path: "/d/g") == Data([3]))
+                try await fs.remove(path: "/d/g", recursive: false)
+            }
+        }
+    }
+
+    @Test
     func realPathsUseCanonicalRoot() async throws {
         let container = try TestSupport.temporaryDirectory("RootAlias")
         defer {
@@ -421,9 +452,10 @@ struct PathResolutionTests {
         }
     }
 
-    // Search-only ancestors are a distinct permission contract from directory listing.
+    // Search-only traversal works with a cached byte-exact policy. Uncached Linux
+    // flag inspection or listing verification requires read access.
     @Test(.enabled(if: geteuid() != 0, "Root bypasses permission checks"))
-    func localOperationsTraverseSearchOnlyAncestors() async throws {
+    func localOperationsRespectSearchOnlyAncestorPolicy() async throws {
         let root = try TestSupport.temporaryDirectory("SearchOnly")
         let ancestor = root.appendingPathComponent("ancestor")
         defer {
@@ -434,11 +466,25 @@ struct PathResolutionTests {
         try await fs.createDirectory(path: "/ancestor/writable", recursive: true)
         try await fs.createFile(path: "/ancestor/writable/file", data: Data("inside".utf8))
         #expect(chmod(ancestor.path, 0o111) == 0)
+        #if canImport(Glibc)
+        do {
+            _ = try await fs.readFile(path: "/ancestor/writable/file")
+        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(EACCES) {
+            // FS_IOC_GETFLAGS cannot use O_PATH. If flags are not cached, listing
+            // verification must reject mutations too until read access is available.
+            await #expect(throws: POSIXError(.EACCES) as NSError) {
+                try await fs.createFile(path: "/ancestor/writable/new", data: Data())
+            }
+            #expect(!FileManager.default.fileExists(atPath: ancestor.path + "/writable/new"))
+            #expect(chmod(ancestor.path, 0o755) == 0)
+        }
+        #endif
         #expect(try await fs.readFile(path: "/ancestor/writable/file") == Data("inside".utf8))
         try await fs.createFile(path: "/ancestor/writable/new", data: Data())
         try await fs.move(from: "/ancestor/writable/new", to: "/ancestor/writable/moved")
         try await fs.remove(path: "/ancestor/writable/moved", recursive: false)
         #expect(try await fs.listDirectory(path: "/ancestor/writable").map(\.name) == ["file"])
+        #expect(chmod(ancestor.path, 0o111) == 0)
         await #expect(throws: (any Error).self) {
             _ = try await fs.listDirectory(path: "/ancestor")
         }

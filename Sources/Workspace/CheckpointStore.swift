@@ -298,8 +298,8 @@ actor FileCheckpointStore: CheckpointStore {
 
     private let checkpointCapture: Workspace.CheckpointCapturePolicy
     // Actor reentrancy must suspend contenders before they can conflict with this store's own fd.
-    private var heldLocks: Set<String> = []
-    private var lockWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var heldLocks: Set<PathName> = []
+    private var lockWaiters: [PathName: [CheckedContinuation<Void, Never>]] = [:]
 
     private var listCheckpointsCache: [UUID: (cacheKey: String, checkpoints: [Checkpoint])] = [:]
 
@@ -559,21 +559,21 @@ actor FileCheckpointStore: CheckpointStore {
                 modificationDate: info.modificationDate
             )
         case .directory:
-            var previousChildren: [String: SnapshotManifest.Node] = [:]
+            var previousChildren: [PathName: SnapshotManifest.Node] = [:]
             for child in previous?.kind == .directory ? previous?.children ?? [] : [] {
-                guard previousChildren.updateValue(child, forKey: child.path.name) == nil else {
+                guard previousChildren.updateValue(child, forKey: PathName(child.path.name)) == nil else {
                     throw WorkspaceError.storageCorrupted(
                         "snapshot directory \(path) contains duplicate child \(child.path.name)"
                     )
                 }
             }
             var children: [SnapshotManifest.Node] = []
-            for entry in try await filesystem.listDirectory(path: path).sorted(by: { $0.name < $1.name }) {
+            for entry in try await filesystem.listDirectory(path: path).sorted(by: { PathName($0.name) < PathName($1.name) }) {
                 children.append(
                     try await captureManifestNode(
                         from: filesystem,
                         at: path.appending(entry.name),
-                        reusing: previousChildren[entry.name],
+                        reusing: previousChildren[PathName(entry.name)],
                         previousCaptureStartedAt: previousCaptureStartedAt,
                         workspaceId: workspaceId
                     )
@@ -1067,7 +1067,7 @@ actor FileCheckpointStore: CheckpointStore {
                 throw WorkspaceError.storageCorrupted("unexpected artifact: \(url.lastPathComponent)")
             }
             return url
-        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        }.sorted { PathName($0.lastPathComponent) < PathName($1.lastPathComponent) }
     }
 
     private func blobURLs(workspaceId: UUID) throws -> [URL] {
@@ -1083,7 +1083,7 @@ actor FileCheckpointStore: CheckpointStore {
                 throw WorkspaceError.storageCorrupted("unexpected entry in blob store: \(url.lastPathComponent)")
             }
             return url
-        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        }.sorted { PathName($0.lastPathComponent) < PathName($1.lastPathComponent) }
     }
 
     private func fileSize(at url: URL) throws -> UInt64 {
@@ -1506,11 +1506,13 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     private func acquireGate(for path: String) async {
+        let path = PathName(path)
         if heldLocks.insert(path).inserted { return }
         await withCheckedContinuation { lockWaiters[path, default: []].append($0) }
     }
 
     private func releaseGate(for path: String) {
+        let path = PathName(path)
         guard var waiters = lockWaiters[path], !waiters.isEmpty else {
             heldLocks.remove(path)
             return

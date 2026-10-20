@@ -96,10 +96,10 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
         let mounts = mountsSnapshot()
         let syntheticNames = syntheticChildMountNames(under: path, mounts: mounts)
         let resolved = resolveWritable(path: path, mounts: mounts)
-        var merged: [String: DirectoryEntry] = [:]
+        var merged: [PathName: DirectoryEntry] = [:]
         do {
             for entry in try await resolved.filesystem.listDirectory(path: resolved.relativePath) {
-                merged[entry.name] = DirectoryEntry(
+                merged[PathName(entry.name)] = DirectoryEntry(
                     name: entry.name,
                     info: Self.virtualInfo(entry.info, at: path.appending(entry.name))
                 )
@@ -124,9 +124,9 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
             let child = path.appending(name)
             // Actual mounts shadow entries. Synthetic ancestors use backend metadata if
             // present, keeping traversal consistent with stat (including regular files).
-            merged[name] = DirectoryEntry(name: name, info: try await stat(path: child))
+            merged[PathName(name)] = DirectoryEntry(name: name, info: try await stat(path: child))
         }
-        return merged.values.sorted { $0.name < $1.name }
+        return merged.values.sorted { PathName($0.name) < PathName($1.name) }
     }
 
     /// See ``FileSystem/readFile(path:)``.
@@ -387,16 +387,16 @@ public final class MountedFileSystem: FileSystem, PotentialPathResolvingFileSyst
     }
 
     private func syntheticChildMountNames(under path: WorkspacePath, mounts: [Mount]) -> [String] {
-        var names = Set<String>()
+        var names = Set<PathName>()
         for mount in mounts where mount.mountPoint != path {
             guard isPath(mount.mountPoint, inside: path) else {
                 continue
             }
             if let first = mount.mountPoint.components.dropFirst(path.components.count).first {
-                names.insert(first)
+                names.insert(PathName(first))
             }
         }
-        return names.sorted()
+        return names.sorted().map(\.string)
     }
 
     private func isPath(_ candidate: WorkspacePath, inside parent: WorkspacePath) -> Bool {

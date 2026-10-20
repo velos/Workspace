@@ -83,6 +83,11 @@ struct Snapshot: Sendable, Codable, Equatable {
         /// The symbolic link's POSIX permissions at the time of capture.
         var permissions: POSIXPermissions
 
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.path == rhs.path && lhs.permissions == rhs.permissions
+                && lhs.target.utf8.elementsEqual(rhs.target.utf8)
+        }
+
         /// Creates a symlink entry.
         init(path: WorkspacePath, target: String, permissions: POSIXPermissions) {
             self.path = path
@@ -181,7 +186,7 @@ extension Snapshot {
         case .directory:
             let entries = try await target.listDirectory(path: path)
             let children = try await entries
-                .sorted { $0.name < $1.name }
+                .sorted { PathName($0.name) < PathName($1.name) }
                 .snapshotAsyncMap { entry in
                     try await captureEntry(from: target, at: path.appending(entry.name))
                 }
@@ -233,7 +238,7 @@ extension Snapshot {
 
             var rewriteRequired = true
             if let info = try await infoIfPresent(at: symlink.path, on: target) {
-                if info.kind == .symlink, try await target.readSymlink(path: symlink.path) == symlink.target {
+                if info.kind == .symlink, try await target.readSymlink(path: symlink.path).utf8.elementsEqual(symlink.target.utf8) {
                     rewriteRequired = false
                 } else {
                     try await removeRecursively(at: symlink.path, on: target)
@@ -333,10 +338,10 @@ extension Snapshot {
         under parentPath: WorkspacePath,
         on target: any FileSystem
     ) async throws {
-        let expectedNames = Set(expectedChildren.map { $0.path.basename })
+        let expectedNames = Set(expectedChildren.map { PathName($0.path.basename) })
         let existingEntries = try await target.listDirectory(path: parentPath)
 
-        for entry in existingEntries where !expectedNames.contains(entry.name) {
+        for entry in existingEntries where !expectedNames.contains(PathName(entry.name)) {
             try await removeRecursively(at: parentPath.appending(entry.name), on: target)
         }
 

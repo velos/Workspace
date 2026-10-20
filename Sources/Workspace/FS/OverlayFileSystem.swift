@@ -118,7 +118,7 @@ public actor OverlayFileSystem: FileSystem {
             throw posixError(ENOENT)
         }
 
-        var byName: [String: DirectoryEntry] = [:]
+        var byName: [PathName: DirectoryEntry] = [:]
         if let lowerInfo, upperInfo == nil || upperInfo?.kind == .directory {
             guard lowerInfo.kind == .directory || upperInfo != nil else {
                 throw posixError(ENOTDIR)
@@ -126,7 +126,7 @@ public actor OverlayFileSystem: FileSystem {
             if lowerInfo.kind == .directory, let lower {
                 for entry in try await lower.listDirectory(path: path)
                 where !isCut(path.appending(entry.name)) {
-                    byName[entry.name] = entry
+                    byName[PathName(entry.name)] = entry
                 }
             }
         }
@@ -135,14 +135,14 @@ public actor OverlayFileSystem: FileSystem {
                 throw posixError(ENOTDIR)
             }
             for entry in try await upper.listDirectory(path: path) {
-                byName[entry.name] = entry
+                byName[PathName(entry.name)] = entry
             }
         }
         return byName.values.map { entry in
             var info = entry.info
             info.path = originalPath.appending(entry.name)
             return DirectoryEntry(name: entry.name, info: info)
-        }.sorted { $0.name < $1.name }
+        }.sorted { PathName($0.name) < PathName($1.name) }
     }
 
     /// See ``FileSystem/readFile(path:)``.

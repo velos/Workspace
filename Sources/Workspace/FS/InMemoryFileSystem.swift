@@ -17,7 +17,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
     private final class Node {
         enum Kind {
             case file(Data)
-            case directory([String: Node])
+            case directory([PathName: Node])
             case symlink(String)
         }
 
@@ -98,8 +98,8 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
             guard let child = children[name] else {
                 return nil
             }
-            let childPath = path.appending(name)
-            return DirectoryEntry(name: name, info: fileInfo(for: child, path: childPath))
+            let childPath = path.appending(name.string)
+            return DirectoryEntry(name: name.string, info: fileInfo(for: child, path: childPath))
         }
     }
 
@@ -139,20 +139,20 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         let (parent, name) = try parentDirectoryAndName(for: writePath)
         var children = try directoryChildren(of: parent)
 
-        if children[name]?.isDirectory == true {
+        if children[PathName(name)]?.isDirectory == true {
             throw posixError(EISDIR)
         }
 
         if append,
-           let existing = children[name],
+           let existing = children[PathName(name)],
            case let .file(existingData) = existing.kind {
             existing.kind = .file(existingData + data)
             existing.modificationDate = Date()
-            children[name] = existing
+            children[PathName(name)] = existing
         } else {
-            if let existing = children[name] { unlink(existing) }
+            if let existing = children[PathName(name)] { unlink(existing) }
             let node = makeNode(kind: .file(data), permissions: 0o644)
-            children[name] = node
+            children[PathName(name)] = node
         }
 
         parent.kind = .directory(children)
@@ -172,7 +172,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
             var children = try directoryChildren(of: current)
             let isLast = index == components.count - 1
 
-            if let existing = children[component] {
+            if let existing = children[PathName(component)] {
                 guard existing.isDirectory else {
                     throw posixError(ENOTDIR)
                 }
@@ -188,7 +188,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
                 }
 
                 let directory = makeNode(kind: .directory([:]), permissions: 0o755)
-                children[component] = directory
+                children[PathName(component)] = directory
                 current.kind = .directory(children)
                 current.modificationDate = Date()
                 current = directory
@@ -211,7 +211,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         }
 
         var parentChildren = try directoryChildren(of: parent)
-        parentChildren.removeValue(forKey: name)
+        parentChildren.removeValue(forKey: PathName(name))
         unlink(entry)
         parent.kind = .directory(parentChildren)
         parent.modificationDate = Date()
@@ -235,28 +235,28 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         let (destinationParent, destinationName) = try parentDirectoryAndName(for: destinationPath)
         if sourceParent === destinationParent {
             var children = try directoryChildren(of: sourceParent)
-            if children[destinationName] != nil {
+            if children[PathName(destinationName)] != nil {
                 throw posixError(EEXIST)
             }
 
-            children.removeValue(forKey: sourceName)
-            children[destinationName] = sourceNode
+            children.removeValue(forKey: PathName(sourceName))
+            children[PathName(destinationName)] = sourceNode
             sourceParent.kind = .directory(children)
             sourceParent.modificationDate = Date()
             return
         }
 
         var destinationChildren = try directoryChildren(of: destinationParent)
-        if destinationChildren[destinationName] != nil {
+        if destinationChildren[PathName(destinationName)] != nil {
             throw posixError(EEXIST)
         }
 
         var sourceChildren = try directoryChildren(of: sourceParent)
-        sourceChildren.removeValue(forKey: sourceName)
+        sourceChildren.removeValue(forKey: PathName(sourceName))
         sourceParent.kind = .directory(sourceChildren)
         sourceParent.modificationDate = Date()
 
-        destinationChildren[destinationName] = sourceNode
+        destinationChildren[PathName(destinationName)] = sourceNode
         destinationParent.kind = .directory(destinationChildren)
         destinationParent.modificationDate = Date()
     }
@@ -272,11 +272,11 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
 
         let (destinationParent, destinationName) = try parentDirectoryAndName(for: destinationPath)
         var destinationChildren = try directoryChildren(of: destinationParent)
-        if destinationChildren[destinationName] != nil {
+        if destinationChildren[PathName(destinationName)] != nil {
             throw posixError(EEXIST)
         }
 
-        destinationChildren[destinationName] = clone(sourceNode)
+        destinationChildren[PathName(destinationName)] = clone(sourceNode)
         destinationParent.kind = .directory(destinationChildren)
         destinationParent.modificationDate = Date()
     }
@@ -290,11 +290,11 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
 
         let (parent, name) = try parentDirectoryAndName(for: path)
         var children = try directoryChildren(of: parent)
-        if children[name] != nil {
+        if children[PathName(name)] != nil {
             throw posixError(EEXIST)
         }
 
-        children[name] = makeNode(kind: .symlink(target), permissions: 0o777)
+        children[PathName(name)] = makeNode(kind: .symlink(target), permissions: 0o777)
         parent.kind = .directory(children)
         parent.modificationDate = Date()
     }
@@ -312,12 +312,12 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
 
         let (parent, name) = try parentDirectoryAndName(for: path)
         var children = try directoryChildren(of: parent)
-        if children[name] != nil {
+        if children[PathName(name)] != nil {
             throw posixError(EEXIST)
         }
 
         sourceNode.linkCount += 1
-        children[name] = sourceNode
+        children[PathName(name)] = sourceNode
         parent.kind = .directory(children)
         parent.modificationDate = Date()
     }
@@ -416,7 +416,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         }
 
         for (name, child) in children.sorted(by: { $0.key < $1.key }) {
-            let childPath = currentPath.appending(name)
+            let childPath = currentPath.appending(name.string)
             paths.append(childPath)
             collectPaths(node: child, currentPath: childPath, into: &paths)
         }
@@ -444,7 +444,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         )
     }
 
-    private func directoryChildren(of node: Node) throws -> [String: Node] {
+    private func directoryChildren(of node: Node) throws -> [PathName: Node] {
         guard case let .directory(children) = node.kind else {
             throw posixError(ENOTDIR)
         }
@@ -466,7 +466,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
     private func parentDirectoryEntryIfPresent(for path: WorkspacePath) throws -> (Node, String, Node)? {
         let (parent, name) = try parentDirectoryAndName(for: path)
         let children = try directoryChildren(of: parent)
-        guard let entry = children[name] else {
+        guard let entry = children[PathName(name)] else {
             return nil
         }
         return (parent, name, entry)
@@ -490,7 +490,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
                 throw posixError(ENOTDIR)
             }
 
-            guard let child = children[component] else {
+            guard let child = children[PathName(component)] else {
                 throw posixError(ENOENT)
             }
 
@@ -535,7 +535,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem {
                 throw posixError(ENOTDIR)
             }
 
-            guard let child = children[component] else {
+            guard let child = children[PathName(component)] else {
                 if allowMissing {
                     return resolvedPath.appending(components.dropFirst(index).joined(separator: "/"))
                 }

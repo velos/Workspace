@@ -62,7 +62,7 @@ extension ChangeSet {
             return ([.init(path: newPath, kind: .file, effect: .modified, diff: result.diff)], result.omission.map { [$0] } ?? [])
         case let (.symbolicLink(_, oldTarget, oldPermissions),
                   .symbolicLink(newPath, newTarget, newPermissions)):
-            guard oldTarget != newTarget || oldPermissions != newPermissions else { return ([], []) }
+            guard !oldTarget.utf8.elementsEqual(newTarget.utf8) || oldPermissions != newPermissions else { return ([], []) }
             return ([.init(path: newPath, kind: .symlink, effect: .modified)], [])
         case let (.directory(oldPath, oldPermissions, oldChildren),
                   .directory(newPath, newPermissions, newChildren)):
@@ -71,12 +71,12 @@ extension ChangeSet {
             if oldPermissions != newPermissions {
                 changes.append(.init(path: newPath, kind: .directory, effect: .modified))
             }
-            let oldByName = Dictionary(uniqueKeysWithValues: oldChildren.map { ($0.path.name, $0) })
-            let newByName = Dictionary(uniqueKeysWithValues: newChildren.map { ($0.path.name, $0) })
+            let oldByName = Dictionary(uniqueKeysWithValues: oldChildren.map { (PathName($0.path.name), $0) })
+            let newByName = Dictionary(uniqueKeysWithValues: newChildren.map { (PathName($0.path.name), $0) })
             for name in Set(oldByName.keys).union(newByName.keys).sorted() {
                 let result = try await compareIndexEntries(
-                    oldByName[name] ?? .missing(path: oldPath.appending(name)),
-                    newByName[name] ?? .missing(path: newPath.appending(name)),
+                    oldByName[name] ?? .missing(path: oldPath.appending(name.string)),
+                    newByName[name] ?? .missing(path: newPath.appending(name.string)),
                     maxTextBytes: maxTextBytes,
                     loadBefore: loadBefore,
                     loadAfter: loadAfter

@@ -9,6 +9,19 @@ extension Workspace {
             case directory(path: WorkspacePath, permissions: POSIXPermissions, children: [Entry])
             case symbolicLink(path: WorkspacePath, target: String, permissions: POSIXPermissions)
 
+            public static func == (lhs: Self, rhs: Self) -> Bool {
+                switch (lhs, rhs) {
+                case let (.missing(a), .missing(b)): return a == b
+                case let (.file(a, dataA, modeA), .file(b, dataB, modeB)):
+                    return a == b && dataA == dataB && modeA == modeB
+                case let (.directory(a, modeA, childrenA), .directory(b, modeB, childrenB)):
+                    return a == b && modeA == modeB && childrenA == childrenB
+                case let (.symbolicLink(a, targetA, modeA), .symbolicLink(b, targetB, modeB)):
+                    return a == b && modeA == modeB && targetA.utf8.elementsEqual(targetB.utf8)
+                default: return false
+                }
+            }
+
             public var path: WorkspacePath {
                 switch self {
                 case let .missing(path), let .file(path, _, _), let .directory(path, _, _),
@@ -36,12 +49,12 @@ extension Workspace {
             var pending = [entry]
             while let entry = pending.popLast() {
                 guard case let .directory(parent, _, children) = entry else { continue }
-                var names = Set<String>()
+                var names = Set<PathName>()
                 for child in children {
                     guard child.path != parent, child.path.parent == parent else {
                         throw WorkspaceError.unsupported("invalid archive: \(child.path) is not an immediate child of \(parent)")
                     }
-                    guard names.insert(child.path.name).inserted else {
+                    guard names.insert(PathName(child.path.name)).inserted else {
                         throw WorkspaceError.unsupported("invalid archive: duplicate child \(child.path.name) in \(parent)")
                     }
                     pending.append(child)

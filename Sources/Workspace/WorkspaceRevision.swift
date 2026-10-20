@@ -179,7 +179,7 @@ extension Workspace {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR))
             }
             return children.map { DirectoryEntry(name: $0.path.name, info: Self.info(for: $0)) }
-                .sorted { $0.name < $1.name }
+                .sorted { PathName($0.name) < PathName($1.name) }
         }
     }
 

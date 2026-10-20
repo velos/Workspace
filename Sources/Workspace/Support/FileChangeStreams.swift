@@ -53,7 +53,7 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
     private let continuation: AsyncStream<Void>.Continuation
     private let descriptor: Int32
     private let source: DispatchSourceRead
-    private var pathsByWatch: [Int32: Set<String>] = [:]
+    private var pathsByWatch: [Int32: Set<PathName>] = [:]
     // Keep the root's parent watched so recreating the root can restore coverage even
     // when it was absent during the IN_DELETE_SELF/IN_MOVE_SELF rescan.
     private var parentWatch: Int32?
@@ -112,7 +112,7 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
                             received = true
                         } else {
                             let nameBytes = bytes[(offset + headerSize)..<(offset + recordSize)].prefix { $0 != 0 }
-                            guard String(decoding: nameBytes, as: UTF8.self) == directory.lastPathComponent else { continue }
+                            guard nameBytes.elementsEqual(directory.lastPathComponent.utf8) else { continue }
                         }
                     }
                     received = true
@@ -171,21 +171,21 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
             IN_CREATE | IN_DELETE | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB
                 | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR
         )
-        var nextByWatch: [Int32: Set<String>] = [:]
+        var nextByWatch: [Int32: Set<PathName>] = [:]
         for path in paths {
             // The kernel returns the current wd for the same inode and a new wd for a
             // replacement. Re-register every discovered path, rather than trusting its name.
             let watch = path.withCString { inotify_add_watch(descriptor, $0, mask) }
             if watch < 0 {
                 let code = errno
-                if path == directory.path, requireRoot || (code != ENOENT && code != ENOTDIR) {
+                if path.utf8.elementsEqual(directory.path.utf8), requireRoot || (code != ENOENT && code != ENOTDIR) {
                     throw POSIXError(.init(rawValue: code) ?? .EIO)
                 }
                 // Children can disappear, become files, or deny reads during enumeration.
                 // Skip them and keep registering later siblings; future events will retry.
                 continue
             }
-            nextByWatch[watch, default: []].insert(path)
+            nextByWatch[watch, default: []].insert(PathName(path))
         }
         // A descriptor can serve multiple paths. Remove it only after every live path has
         // been registered, and only if the new reverse map no longer references that wd.

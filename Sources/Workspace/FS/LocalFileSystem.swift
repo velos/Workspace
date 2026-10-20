@@ -24,14 +24,19 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     typealias ExclusiveRename = @Sendable (Int32, String, Int32, String) -> Int32
 
     private let fileManager: FileManager
+    private let spelling = LocalPathSpelling()
     private let exclusiveRename: ExclusiveRename
     private let stateLock = NSLock()
     private var configuration: ConfigurationSnapshot?
 
     private final class Descriptor: @unchecked Sendable {
         let value: Int32
-        init(_ value: Int32) {
+        let spellingPolicy: LocalPathSpelling.Policy
+        let directoryInfo: LocalStat?
+        init(_ value: Int32, spellingPolicy: LocalPathSpelling.Policy, directoryInfo: LocalStat? = nil) {
             self.value = value
+            self.spellingPolicy = spellingPolicy
+            self.directoryInfo = directoryInfo
         }
         deinit {
             close(value)
@@ -43,6 +48,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         let resolvedRootPath: String
         let foundationRootPath: String
         let root: Descriptor
+        let rootSpelling: String?
     }
 
     // Glibc does not expose O_PATH without _GNU_SOURCE.
@@ -58,6 +64,8 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         let parent: Descriptor
         let name: String
         let path: WorkspacePath
+        var isVerified = false
+        var directoryInfo: LocalStat?
 
         // Every variable *at() name comes from an immutable, validated Entry.
         // Even a future parser bug must not pass a multi-component path to the kernel.
@@ -68,11 +76,24 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             self.path = path
         }
 
+        // Names emitted by readdir already have stored spelling. This initializer
+        // still applies the jail's byte-level single-component validation.
+        init(parent: Descriptor, storedName: String, path: WorkspacePath) throws {
+            try self.init(parent: parent, name: storedName, path: path)
+            isVerified = true
+        }
+
+        func requireVerified() throws {
+            guard isVerified else { throw WorkspaceError.invalidPath(path.string) }
+        }
+
         // The only permitted dot entry refers to an already resolved directory fd.
         init(directory: Descriptor, path: WorkspacePath) {
             self.parent = directory
             self.name = "."
             self.path = path
+            self.isVerified = true
+            self.directoryInfo = directory.directoryInfo
         }
     }
 
@@ -122,7 +143,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         let rootFD = open(canonical, Self.searchDirectoryFlags | O_NOFOLLOW | O_CLOEXEC)
         let openError = errno
         try check(rootFD, errorCode: openError)
-        let root = Descriptor(rootFD)
+        let root = try directoryDescriptor(rootFD)
         stateLock.lock()
         defer {
             stateLock.unlock()
@@ -131,7 +152,8 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             rootURL: url,
             resolvedRootPath: canonical,
             foundationRootPath: url.resolvingSymlinksInPath().standardizedFileURL.path,
-            root: root
+            root: root,
+            rootSpelling: root.spellingPolicy == .darwin ? Self.directoryPath(root.value) : nil
         )
     }
 
@@ -152,13 +174,42 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         }
     }
 
+    private func directoryDescriptor(_ fd: Int32, info suppliedInfo: LocalStat? = nil) throws -> Descriptor {
+        do {
+            var info = suppliedInfo ?? LocalStat()
+            #if canImport(Glibc)
+            // Flags belong to this opened inode. A concurrent workspace rename
+            // can replace a previously statted directory with a casefolded one.
+            try check(fstat(fd, &info))
+            #else
+            if suppliedInfo == nil { try check(fstat(fd, &info)) }
+            #endif
+            return Descriptor(fd, spellingPolicy: try spelling.policy(for: fd, info: info), directoryInfo: info)
+        }
+        catch { close(fd); throw error }
+    }
+
+    private func checkSpelling(_ entry: Entry, creating: Bool = false) throws {
+        try spelling.check(parent: entry.parent.value, name: entry.name,
+                           policy: entry.parent.spellingPolicy, creating: creating)
+    }
+
+    private func verifiedEntry(_ entry: Entry, creating: Bool = false) throws -> Entry {
+        try checkSpelling(entry, creating: creating)
+        var verified = entry
+        verified.isVerified = true
+        return verified
+    }
+
     private func metadata(_ entry: Entry) throws -> LocalStat {
+        try entry.requireVerified()
         var value = LocalStat()
         try check(fstatat(entry.parent.value, entry.name, &value, AT_SYMLINK_NOFOLLOW))
         return value
     }
 
     private func linkTarget(_ entry: Entry) throws -> String {
+        try entry.requireVerified()
         var bytes = [UInt8](repeating: 0, count: 256)
         while true {
             let count = bytes.withUnsafeMutableBytes {
@@ -169,7 +220,10 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
             }
             if count < bytes.count {
-                return String(decoding: bytes.prefix(count), as: UTF8.self)
+                guard let target = String(bytes: bytes.prefix(count), encoding: .utf8) else {
+                    throw WorkspaceError.invalidPath("non-UTF-8 symlink target at \(entry.path)")
+                }
+                return target
             }
             bytes = [UInt8](repeating: 0, count: bytes.count * 2)
         }
@@ -183,41 +237,93 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         let targetComponents = WorkspacePath.splitComponents(target)
         for root in [configuration.resolvedRootPath, configuration.foundationRootPath, configuration.rootURL.path] {
             let rootComponents = WorkspacePath.splitComponents(root)
-            if targetComponents.starts(with: rootComponents) {
+            if targetComponents.starts(with: rootComponents, by: { $0.utf8.elementsEqual($1.utf8) }) {
                 return Array(targetComponents.dropFirst(rootComponents.count))
             }
         }
         throw WorkspaceError.invalidPath(target)
     }
 
+    private enum ResolutionRetry: Error { case componentChecks }
+
+    /// F_GETPATH is used only for APFS directories, never final file descriptors:
+    /// directories have one physical path, whereas a file may have many hard links.
+    private static func directoryPath(_ fd: Int32) -> String? {
+        #if canImport(Darwin)
+        return withUnsafeTemporaryAllocation(of: CChar.self, capacity: Int(MAXPATHLEN)) { buffer in
+            guard fcntl(fd, F_GETPATH, buffer.baseAddress!) == 0 else { return nil }
+            return String(validatingCString: buffer.baseAddress!)
+        }
+        #else
+        return nil
+        #endif
+    }
+
+    private func verifyParent(
+        _ directory: Descriptor, names: [String], configuration: ConfigurationSnapshot,
+        batchAPFS: Bool
+    ) throws {
+        guard batchAPFS, !names.isEmpty else { return }
+        guard directory.spellingPolicy == .darwin,
+              let root = configuration.rootSpelling,
+              let stored = Self.directoryPath(directory.value) else {
+            throw ResolutionRetry.componentChecks
+        }
+        let expected = (root == "/" ? "" : root) + "/" + names.joined(separator: "/")
+        #if canImport(Darwin)
+        guard expected.utf8.count < Int(MAXPATHLEN) else { throw ResolutionRetry.componentChecks }
+        #endif
+        guard stored.utf8.elementsEqual(expected.utf8) else {
+            // The host may have relocated the pinned root or an ancestor since
+            // configuration. Only component checks can distinguish that from an alias.
+            throw ResolutionRetry.componentChecks
+        }
+    }
+
     private func resolve(
         _ path: WorkspacePath, followFinal: Bool, createParents: Bool = false,
-        allowMissingAncestors: Bool = false,
+        allowMissingAncestors: Bool = false, creating: Bool = false,
         configuration: ConfigurationSnapshot? = nil
     ) throws -> Entry {
         let config = try configuration ?? requireConfiguration()
-        guard !path.string.utf8.contains(0) else {
-            throw WorkspaceError.invalidPath(path.string)
+        do {
+            return try resolveComponents(path, followFinal: followFinal, createParents: createParents,
+                allowMissingAncestors: allowMissingAncestors, creating: creating, configuration: config,
+                batchAPFS: config.rootSpelling != nil)
+        } catch is ResolutionRetry {
+            // F_GETPATH failure/mismatch/overflow or crossing a non-APFS mount: do not trust
+            // an incomplete path. Retry descriptor-relative per-component checks.
+            return try resolveComponents(path, followFinal: followFinal, createParents: createParents,
+                allowMissingAncestors: allowMissingAncestors, creating: creating, configuration: config,
+                batchAPFS: false)
         }
+    }
+
+    private func resolveComponents(
+        _ path: WorkspacePath, followFinal: Bool, createParents: Bool,
+        allowMissingAncestors: Bool, creating: Bool, configuration config: ConfigurationSnapshot,
+        batchAPFS: Bool
+    ) throws -> Entry {
+        guard !path.string.utf8.contains(0) else { throw WorkspaceError.invalidPath(path.string) }
         var pending = path.components
-        var current = config.root
+        let root = config.root
+        var current = root
         var names: [String] = []
         var missingAncestor = false
         var hops = 0
         while !pending.isEmpty {
             let name = pending.removeFirst()
-            if name == "." || name.isEmpty {
-                continue
-            }
+            if name == "." || name.isEmpty { continue }
             if name == ".." {
-                guard !names.isEmpty else {
-                    throw WorkspaceError.invalidPath(path.string)
+                guard !names.isEmpty else { throw WorkspaceError.invalidPath(path.string) }
+                if !missingAncestor {
+                    try verifyParent(current, names: names, configuration: config, batchAPFS: batchAPFS)
                 }
                 names.removeLast()
-                current = config.root
+                current = root
                 missingAncestor = false
                 for ancestor in names {
-                    let entry = try Entry(parent: current, name: ancestor, path: .root)
+                    let entry = try verifiedEntry(Entry(parent: current, name: ancestor, path: .root), creating: creating)
                     do {
                         current = try openEntry(entry, flags: Self.searchDirectoryFlags)
                     } catch let error as NSError where allowMissingAncestors
@@ -229,69 +335,152 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
                 continue
             }
             let final = pending.isEmpty
-            let entry = try Entry(
-                parent: current, name: name,
+            var entry = try Entry(parent: current, name: name,
                 path: WorkspacePath(unchecked: "/" + (names + [name]).joined(separator: "/")))
-            if final && !followFinal {
-                return entry
-            }
-            // Only potential-path resolution permits missing ancestors. The descriptor is
-            // no longer an operation target; this mode consumes only the resulting path.
             if missingAncestor {
+                // Only potential-path resolution consumes unverified entries, and
+                // only their path strings. I/O helpers require a verified Entry.
                 if final { return entry }
                 names.append(name)
                 continue
             }
-            var info: LocalStat
-            do {
-                info = try metadata(entry)
-            } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
-                if final {
-                    return entry
+            if !batchAPFS { entry = try verifiedEntry(entry, creating: creating) }
+            if final && !followFinal {
+                if batchAPFS {
+                    try verifyParent(current, names: names, configuration: config, batchAPFS: true)
+                    entry = try verifiedEntry(entry, creating: creating)
                 }
+                return entry
+            }
+            var info = LocalStat()
+            let status = fstatat(entry.parent.value, entry.name, &info, AT_SYMLINK_NOFOLLOW)
+            let statusError = errno
+            // Directory traversal may defer spelling checks until the parent fd is
+            // verified as a whole. Before reading a link, returning a target, or
+            // creating anything, both the parent and current name are verified.
+            let traverseDirectory = status == 0 && info.st_mode & S_IFMT == S_IFDIR && !final
+            if batchAPFS && !traverseDirectory {
+                try verifyParent(current, names: names, configuration: config, batchAPFS: true)
+                entry = try verifiedEntry(entry, creating: creating)
+            }
+            if status < 0 {
+                guard statusError == ENOENT else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(statusError))
+                }
+                if final { return entry }
                 if allowMissingAncestors {
                     names.append(name)
                     missingAncestor = true
                     continue
                 }
-                guard createParents else {
-                    throw error
-                }
+                guard createParents else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)) }
                 let result = mkdirat(entry.parent.value, entry.name, 0o755)
-                if result < 0 && errno != EEXIST {
-                    try check(result)
-                }
+                if result < 0 && errno != EEXIST { try check(result) }
+                if result == 0 { try validateCreated(entry, directory: true) }
+                else { try checkSpelling(entry, creating: true) }
                 info = try metadata(entry)
             }
             if info.st_mode & S_IFMT == S_IFLNK {
                 hops += 1
-                guard hops <= 40 else {
-                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP))
-                }
+                guard hops <= 40 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP)) }
                 let target = try linkTarget(entry)
                 if target.utf8.first == 47 {
                     pending = try absoluteComponents(target, configuration: config) + pending
-                    current = config.root
+                    current = root
                     names = []
                 } else {
                     pending = WorkspacePath.splitComponents(target) + pending
                 }
                 continue
             }
-            if final {
-                return entry
+            if info.st_mode & S_IFMT == S_IFDIR { entry.directoryInfo = info }
+            if final { return entry }
+            if batchAPFS && !entry.isVerified {
+                // This is the only open of an unverified Entry. It opens a directory
+                // with O_NOFOLLOW, retains its mandatory policy, and cannot expose
+                // data or mutate it until verifyParent succeeds at the boundary.
+                let fd = openat(current.value, name, Self.searchDirectoryFlags | O_NOFOLLOW | O_CLOEXEC)
+                if fd < 0 {
+                    let error = errno
+                    try verifyParent(current, names: names, configuration: config, batchAPFS: true)
+                    _ = try verifiedEntry(entry, creating: creating)
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(error))
+                }
+                current = try directoryDescriptor(fd, info: info)
+                if current.spellingPolicy != .darwin { throw ResolutionRetry.componentChecks }
+            } else {
+                current = try openEntry(entry, flags: Self.searchDirectoryFlags, directoryInfo: info)
             }
-            current = try openEntry(entry, flags: Self.searchDirectoryFlags)
             names.append(name)
+        }
+        if !missingAncestor {
+            try verifyParent(current, names: names, configuration: config, batchAPFS: batchAPFS)
         }
         return Entry(directory: current, path: WorkspacePath(unchecked: "/" + names.joined(separator: "/")))
     }
 
-    private func openEntry(_ entry: Entry, flags: Int32, mode: mode_t = 0o666) throws -> Descriptor {
-        let fd = openat(entry.parent.value, entry.name, flags | O_NOFOLLOW | O_CLOEXEC, mode)
+    private func openEntry(
+        _ entry: Entry, flags: Int32, mode: mode_t = 0o666, directoryInfo: LocalStat? = nil
+    ) throws -> Descriptor {
+        try entry.requireVerified()
+        var openFlags = flags | O_NOFOLLOW | O_CLOEXEC
+        let verifyCreation = flags & O_CREAT != 0 && entry.parent.spellingPolicy.verifiesCreation
+        if verifyCreation { openFlags |= O_EXCL }
+        var fd = openat(entry.parent.value, entry.name, openFlags, mode)
+        let created = verifyCreation && fd >= 0
+        if fd < 0 && errno == EEXIST && verifyCreation && flags & O_EXCL == 0 {
+            // Open an existing entry without O_CREAT: cleanup must never unlink
+            // an old file, even if another process removes it between these calls.
+            fd = openat(entry.parent.value, entry.name, (openFlags & ~(O_CREAT | O_EXCL)), mode)
+        }
         let openError = errno
         try check(fd, errorCode: openError)
-        return Descriptor(fd)
+        if created {
+            do { try validateCreated(entry, directory: false) }
+            catch { close(fd); throw error }
+        }
+        if flags & O_DIRECTORY != 0 {
+            return try directoryDescriptor(fd, info: directoryInfo ?? entry.directoryInfo)
+        }
+        return Descriptor(fd, spellingPolicy: .exact) // non-directory fd; never a resolution parent
+    }
+
+    /// HFS+ can rewrite a new name; unknown filesystems must prove preservation too.
+    /// This is called only after a successful exclusive creation, before filling it.
+    private func validateCreated(_ entry: Entry, directory: Bool) throws {
+        if entry.parent.spellingPolicy.verifiesCreation {
+            do {
+                try spelling.check(parent: entry.parent.value, name: entry.name,
+                                   policy: entry.parent.spellingPolicy, creating: true, afterCreate: true)
+            } catch {
+                let result = unlinkat(entry.parent.value, entry.name, directory ? AT_REMOVEDIR : 0)
+                if result < 0 {
+                    throw WorkspaceRollbackError(originalError: error,
+                        rollbackError: NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
+                }
+                throw error
+            }
+        }
+        if directory {
+            // Inode reuse after a workspace-created directory must not reuse flags
+            // cached for an earlier directory, potentially under a different parent.
+            spelling.forget(try metadata(entry))
+        }
+    }
+
+    private func validateMoved(_ source: Entry, to destination: Entry) throws {
+        guard destination.parent.spellingPolicy.verifiesCreation else { return }
+        do {
+            try spelling.check(parent: destination.parent.value, name: destination.name,
+                               policy: destination.parent.spellingPolicy, creating: true, afterCreate: true)
+        } catch {
+            // A rename is not a disposable creation. Preserve the source on rewrite.
+            if renameat(destination.parent.value, destination.name, source.parent.value, source.name) < 0 {
+                throw WorkspaceRollbackError(originalError: error,
+                    rollbackError: NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
+            }
+            throw error
+        }
     }
 
     private func fileInfo(_ info: LocalStat, path: WorkspacePath) -> FileInfo {
@@ -341,14 +530,15 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             }
             let name = withUnsafePointer(to: &item.pointee.d_name) {
                 $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: item.pointee.d_name)) {
-                    String(cString: $0)
+                    String(validatingCString: $0)
                 }
             }
+            guard let name else { throw WorkspaceError.invalidPath("non-UTF-8 directory entry") }
             if name != "." && name != ".." {
                 result.append(name)
             }
         }
-        return result.sorted()
+        return result.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
     }
 
     /// See ``FileSystem/listDirectory(path:)``.
@@ -357,7 +547,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         return try names(in: directory).map { name in
             let child = path.appending(name)
             return DirectoryEntry(
-                name: name, info: fileInfo(try metadata(Entry(parent: directory, name: name, path: child)), path: child)
+                name: name, info: fileInfo(try metadata(Entry(parent: directory, storedName: name, path: child)), path: child)
             )
         }
     }
@@ -455,7 +645,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
 
     /// See ``FileSystem/createFile(path:data:)``.
     public func createFile(path: WorkspacePath, data: Data) async throws {
-        let entry = try resolve(path, followFinal: false, createParents: true)
+        let entry = try resolve(path, followFinal: false, createParents: true, creating: true)
         try write(data, to: openEntry(entry, flags: O_WRONLY | O_CREAT | O_EXCL))
     }
 
@@ -465,7 +655,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     /// breaking its hard-link sharing. Links that escape the root are rejected.
     /// Appends preserve the opened inode.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
-        let entry = try resolve(path, followFinal: true, createParents: true)
+        let entry = try resolve(path, followFinal: true, createParents: true, creating: true)
         if append {
             try write(data, to: openEntry(entry, flags: O_WRONLY | O_CREAT | O_APPEND | O_NONBLOCK))
         } else {
@@ -485,25 +675,29 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     }
 
     private func replace(_ entry: Entry, body: (Descriptor) throws -> Void) throws {
+        try entry.requireVerified()
         let temporary = ".workspace-" + UUID().uuidString
-        let temporaryEntry = try Entry(parent: entry.parent, name: temporary, path: entry.path)
+        let temporaryEntry = try verifiedEntry(Entry(parent: entry.parent, name: temporary, path: entry.path), creating: true)
         let fd = try openEntry(temporaryEntry, flags: O_WRONLY | O_CREAT | O_EXCL)
         defer {
             _ = unlinkat(temporaryEntry.parent.value, temporaryEntry.name, 0)
         }
         try body(fd)
+        try checkSpelling(entry, creating: true)
         try check(renameat(temporaryEntry.parent.value, temporaryEntry.name, entry.parent.value, entry.name))
+        try validateCreated(entry, directory: false)
     }
 
     /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
-        let entry = try resolve(path, followFinal: true, createParents: recursive)
+        let entry = try resolve(path, followFinal: true, createParents: recursive, creating: true)
         let result = mkdirat(entry.parent.value, entry.name, 0o755)
         if result < 0 && errno == EEXIST && recursive {
             _ = try openEntry(entry, flags: Self.searchDirectoryFlags)
             return
         }
         try check(result)
+        try validateCreated(entry, directory: true)
     }
 
     private func removeEntry(_ entry: Entry, recursive: Bool) throws {
@@ -515,13 +709,14 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         }
         if info.st_mode & S_IFMT == S_IFDIR {
             if recursive {
-                let directory = try openEntry(entry, flags: O_RDONLY | O_DIRECTORY)
+                let directory = try openEntry(entry, flags: O_RDONLY | O_DIRECTORY, directoryInfo: info)
                 for name in try names(in: directory) {
                     try removeEntry(
-                        Entry(parent: directory, name: name, path: entry.path.appending(name)), recursive: true)
+                        Entry(parent: directory, storedName: name, path: entry.path.appending(name)), recursive: true)
                 }
             }
             try check(unlinkat(entry.parent.value, entry.name, AT_REMOVEDIR))
+            spelling.forget(info)
         } else {
             try check(unlinkat(entry.parent.value, entry.name, 0))
         }
@@ -552,9 +747,10 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         let config = try requireConfiguration()
         let source = try resolve(sourcePath, followFinal: false, configuration: config)
-        let destination = try resolve(destinationPath, followFinal: false, createParents: true, configuration: config)
+        let destination = try resolve(destinationPath, followFinal: false, createParents: true, creating: true, configuration: config)
         let renameError = exclusiveRename(source.parent.value, source.name, destination.parent.value, destination.name)
         if renameError == 0 {
+            try validateMoved(source, to: destination)
             return
         }
         #if canImport(Darwin)
@@ -574,6 +770,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
             // Reuse the resolved descriptors. Only no-clobber atomicity is relaxed, not containment.
             try check(renameat(source.parent.value, source.name, destination.parent.value, destination.name))
+            try validateMoved(source, to: destination)
             return
         }
         throw NSError(domain: NSPOSIXErrorDomain, code: Int(EEXIST))
@@ -607,18 +804,20 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     }
 
     private func copyEntry(_ source: Entry, to destination: Entry, recursive: Bool) throws {
+        let destination = try verifiedEntry(destination, creating: true)
         let info = try metadata(source)
         switch info.st_mode & S_IFMT {
         case S_IFDIR:
             guard recursive else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
             }
-            let input = try openEntry(source, flags: O_RDONLY | O_DIRECTORY)
+            let input = try openEntry(source, flags: O_RDONLY | O_DIRECTORY, directoryInfo: info)
             try check(mkdirat(destination.parent.value, destination.name, 0o755))
+            try validateCreated(destination, directory: true)
             let output = try openEntry(destination, flags: O_RDONLY | O_DIRECTORY)
             for name in try names(in: input) {
                 try copyEntry(
-                    Entry(parent: input, name: name, path: source.path.appending(name)),
+                    Entry(parent: input, storedName: name, path: source.path.appending(name)),
                     to: Entry(parent: output, name: name, path: destination.path.appending(name)), recursive: true)
             }
             try check(fchmod(output.value, info.st_mode & 0o7777))
@@ -626,6 +825,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             let target = try linkTarget(source)
             try removeEntry(destination, recursive: false)
             try check(symlinkat(target, destination.parent.value, destination.name))
+            try validateCreated(destination, directory: false)
         case S_IFREG:
             let input = try openEntry(source, flags: O_RDONLY | O_NONBLOCK)
             let handle = FileHandle(fileDescriptor: try duplicateDescriptor(input.value), closeOnDealloc: true)
@@ -648,7 +848,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws {
         let config = try requireConfiguration()
         let source = try resolve(sourcePath, followFinal: false, configuration: config)
-        let destination = try resolve(destinationPath, followFinal: false, createParents: true, configuration: config)
+        let destination = try resolve(destinationPath, followFinal: false, createParents: true, creating: true, configuration: config)
         guard !destination.path.isWithin(source.path)
         else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
@@ -659,17 +859,19 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
         _ = try WorkspacePath(validating: target, relativeTo: path.dirname)
-        let entry = try resolve(path, followFinal: false, createParents: true)
+        let entry = try resolve(path, followFinal: false, createParents: true, creating: true)
         try check(symlinkat(target, entry.parent.value, entry.name))
+        try validateCreated(entry, directory: false)
     }
 
     /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         let config = try requireConfiguration()
         let source = try resolve(target, followFinal: true, configuration: config)
-        let destination = try resolve(path, followFinal: false, createParents: true, configuration: config)
+        let destination = try resolve(path, followFinal: false, createParents: true, creating: true, configuration: config)
         // No AT_SYMLINK_FOLLOW: a concurrent final-component swap must not dereference a link.
         try check(linkat(source.parent.value, source.name, destination.parent.value, destination.name, 0))
+        try validateCreated(destination, directory: false)
     }
 
     /// See ``FileSystem/readSymlink(path:)``.

@@ -251,6 +251,71 @@ invalidations into structured `ChangeSet` values. External changes remain unreco
 history, matching the direct-filesystem contract above. Directory-backed checkpoint stores use the
 same push model for cross-instance checkpoint events; there is no periodic polling loop.
 
+## Path Identity
+
+A `WorkspacePath` is a normalized absolute path whose identity is the exact UTF-8
+bytes of each component. Equality, hashing, ordering, containment, permission
+rules, and quota accounting do not fold case or Unicode normalization. For example,
+`/café` (NFC) and `/cafe\u{301}` (NFD) are different paths. This deliberately changes
+previous releases' use of Swift canonical-equivalence equality. Names and symlink
+targets must be valid UTF-8; undecodable host entries are rejected, not repaired
+into a different name. In-memory storage
+and byte-exact host filesystems can hold both names.
+
+`LocalFileSystem` requires the requested spelling to match the stored directory
+entry. On APFS, including case-sensitive APFS, case or normalization aliases are
+rejected: lookups and reads report `ENOENT`; creates, writes, and rename/copy
+destinations report `EEXIST` when an equivalent entry exists. Renaming an entry
+to an equivalent spelling is rejected too; move through a distinct temporary
+name if a spelling change is needed. Case-only renames remain possible on
+case-sensitive filesystems. Removing a missing/aliased spelling remains
+a no-op. Symlink targets must use the stored spelling, and `resolveRealPath`
+returns that spelling. Directory listings (and future bulk traversal) use names
+emitted by `readdir`, so they already carry the stored identity.
+
+On Darwin, volume policy is cached by device. APFS and HFS+ use
+`getattrlistat(ATTR_CMN_NAME, FSOPT_NOFOLLOW)` to verify stored names. For APFS,
+an `F_GETPATH` check on the held parent **directory** can verify its components
+together, against the root descriptor's own path plus the resolved physical
+components; the final name still uses `getattrlistat` so hard links remain valid.
+Unavailable, overlong, or mismatched directory paths fall back to per-component
+checks, so relocating the pinned root or an ancestor remains supported.
+No final file descriptor is checked with `F_GETPATH`.
+
+HFS+ and macOS's exFAT driver store Unicode names in decomposed form (NFD).
+Creating a precomposed (NFC) name that decomposes there fails with `EILSEQ` and
+the new entry is removed; use the NFD spelling reported by directory listings.
+New entries are checked before use on rewriting volumes. A rewritten rename is
+rolled back to preserve its source. Other Darwin
+filesystems (including exFAT/FSKit, network and unknown types) verify spelling by
+an exact byte match in the parent directory's `readdir` listing instead of trusting
+name-cache-sensitive attribute APIs. Their new entries are also checked for name
+rewriting. Listings are never cached, including on filesystems with coarse mtimes.
+
+On Linux, ext4/f2fs/bcachefs/overlayfs/tmpfs directory flags are inspected with
+`FS_IOC_GETFLAGS`. Directories with `FS_CASEFOLD_FL` use listing verification;
+others skip spelling verification. Flags are cached per `(device, inode)` in a
+bounded 4,096-entry cache under the existing exclusion of external host namespace
+and flag changes. A full cache is cleared before adding a new entry. Workspace
+creation/removal invalidates directory entries to prevent stale flags on inode
+reuse. Changing casefold requires ownership and an empty directory and is not
+exposed by the workspace API. Inspecting flags requires read permission;
+unavailable inspection falls back to listing verification, which also requires
+read access. While its policy remains cached, a byte-exact directory can still
+be traversed with search-only access.
+
+XFS volume geometry (`XFS_IOC_FSGEOMETRY`) is queried once per device: ascii-ci
+volumes use listing verification and ordinary XFS skips it. Known byte-exact btrfs
+and ramfs also skip it. Unknown filesystems, and unavailable sensitivity queries,
+use listing verification rather than being refused. An existing kernel lookup
+without an exact listing match is `ENOENT` for reads or `EEXIST` for creation;
+missing creations use exclusive creation. Errors do not disclose the stored name.
+
+These checks do not make metadata checks and later mutations atomic against an
+external process renaming entries; the existing concurrent-host mutation
+limitations still apply. Directory names emitted by `readdir` are already verified
+spelling and are not looked up a second time solely to check their spelling.
+
 ## Filesystems and Safety Layers
 
 Built-in filesystems use consistent names and constructor-driven configuration:
