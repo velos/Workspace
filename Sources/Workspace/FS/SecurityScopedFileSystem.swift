@@ -128,9 +128,10 @@ public final class SecurityScopedFileSystem: FileSystem, TraversingFileSystem, P
         }
     }
 
-    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
                       visit: FileSystemWalkVisitor) async throws {
-        try await backing.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+        try await backing.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+            skippingVanishedEntries: skippingVanishedEntries, visit: visit)
     }
 
     /// See ``FileSystem/stat(path:)``.

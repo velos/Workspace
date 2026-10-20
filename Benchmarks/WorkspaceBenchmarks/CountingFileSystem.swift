@@ -30,10 +30,11 @@ class CountingFileSystem: FileSystem, TraversingFileSystem, ExactTimestampFileSy
     }
     nonisolated package var supportsScopedWalk: Bool { base.supportsScopedWalk }
 
-    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
                       visit: FileSystemWalkVisitor) async throws {
         call("walk")
-        try await base.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories) { info, read, readLink in
+        try await base.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+            skippingVanishedEntries: skippingVanishedEntries) { info, read, readLink in
             self.call("walkEntry")
             if info.path != path { self.lock.withLock { self.counts.directoryEntries += 1 } }
             // The callbacks remain scoped to this awaited visit; the temporary

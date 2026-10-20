@@ -9,8 +9,10 @@ import Glibc
 /// never descended into. A missing root produces no visits. Read callbacks are
 /// nonescaping and valid only during their visit. This is a live read-only walk,
 /// not an atomic snapshot: errors from children disappearing during enumeration or
-/// reads propagate, except directory errors explicitly allowed by the caller's skip
-/// option. Local scoped no-follow opens reject substitutions with symlinks, even
+/// reads propagate. The caller can skip children missing at their metadata lookup
+/// (ENOENT/ENOTDIR), independently of skipping unreadable directories. Read errors
+/// after metadata always propagate. Local scoped no-follow opens reject substitutions
+/// with symlinks, even
 /// when the replacement link points inside the root. Very deep local subtrees fall
 /// back to ordinary per-path operations with a root identity check at the handoff.
 ///
@@ -19,7 +21,7 @@ import Glibc
 package protocol TraversingFileSystem: FileSystem {
     /// Forwarders return false when their base needs the per-path fallback.
     var supportsScopedWalk: Bool { get }
-    nonisolated(nonsending) func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+    nonisolated(nonsending) func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool,
               visit: FileSystemWalkVisitor) async throws
 }
 
@@ -38,20 +40,24 @@ extension FileSystem {
         (self as? any TraversingFileSystem)?.supportsScopedWalk ?? false
     }
     nonisolated(nonsending) package func walk(at path: WorkspacePath = .root, skippingUnreadableDirectories: Bool = false,
+        skippingVanishedEntries: Bool = false,
                       visit: FileSystemWalkVisitor) async throws {
         if let traversal = self as? any TraversingFileSystem {
-            try await traversal.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+            try await traversal.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+                skippingVanishedEntries: skippingVanishedEntries, visit: visit)
         } else {
-            try await walkUsingPaths(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+            try await walkUsingPaths(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+                skippingVanishedEntries: skippingVanishedEntries, visit: visit)
         }
     }
 
     // In particular, never unwrap AuthorizedFileSystem here: each stat, listing and
     // requested content read must pass through its normal per-entry checks.
     nonisolated(nonsending) package func walkUsingPaths(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+        skippingVanishedEntries: Bool = false,
                                requireExisting: Bool = false, visit: FileSystemWalkVisitor) async throws {
         let info: FileInfo
-        if requireExisting { info = try await stat(path: path) }
+        if requireExisting && !skippingVanishedEntries { info = try await stat(path: path) }
         else {
             guard let existing = try await Snapshot.infoIfPresent(at: path, on: self) else { return }
             info = existing
@@ -69,7 +75,8 @@ extension FileSystem {
                 $0.1.utf8.lexicographicallyPrecedes($1.1.utf8)
             }) {
                 try await walkUsingPaths(at: path.appending(child.name),
-                                         skippingUnreadableDirectories: skippingUnreadableDirectories, requireExisting: true, visit: visit)
+                                         skippingUnreadableDirectories: skippingUnreadableDirectories,
+                                             skippingVanishedEntries: skippingVanishedEntries, requireExisting: true, visit: visit)
             }
         }
         try await visit(info, { length in

@@ -508,7 +508,7 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     /// Names are validated before entering the cache; no absolute paths are persisted.
-    private struct TreeEntry: Codable, Sendable {
+    private struct TreeEntry: Codable, Sendable, Equatable {
         var name: String
         var kind: SnapshotManifest.Node.Kind
         var permissions: POSIXPermissions?
@@ -519,9 +519,15 @@ actor FileCheckpointStore: CheckpointStore {
         var treeHash: String?
         var packed: PackedBlob?
 
-        init(_ node: SnapshotManifest.Node) throws {
-            name = node.path.name
-            try Self.validate(name)
+        init(_ node: SnapshotManifest.Node, name: String? = nil) throws {
+            self.init(metadataOf: node, name: name ?? node.path.name)
+            try Self.validate(self.name)
+        }
+
+        /// Prior leaf metadata can also represent a file at the snapshot root.
+        /// This initializer is never used to publish or cache directory entries.
+        init(metadataOf node: SnapshotManifest.Node, name: String) {
+            self.name = name
             kind = node.kind
             permissions = node.permissions
             contentHash = node.contentHash
@@ -540,9 +546,32 @@ actor FileCheckpointStore: CheckpointStore {
         }
 
         func node(in parent: WorkspacePath) -> SnapshotManifest.Node {
-            .init(kind: kind, path: parent.appending(name), permissions: permissions,
+            node(at: parent.appending(name))
+        }
+
+        func node(at path: WorkspacePath) -> SnapshotManifest.Node {
+            .init(kind: kind, path: path, permissions: permissions,
                   contentHash: contentHash, contentSize: contentSize, modificationDate: modificationDate,
                   symlinkTarget: symlinkTarget, treeHash: treeHash, packed: packed)
+        }
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.name.utf8.elementsEqual(rhs.name.utf8) && lhs.kind == rhs.kind &&
+                lhs.permissions == rhs.permissions && lhs.contentHash == rhs.contentHash &&
+                lhs.contentSize == rhs.contentSize && lhs.modificationDate == rhs.modificationDate &&
+                lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init) &&
+                lhs.treeHash == rhs.treeHash && lhs.packed == rhs.packed
+        }
+
+        /// Trees are validated and sorted by exact name bytes before being cached.
+        static func index(of name: String, in entries: [Self]) -> Int? {
+            var low = 0, high = entries.count
+            while low < high {
+                let mid = (low + high) / 2
+                if entries[mid].name.utf8.lexicographicallyPrecedes(name.utf8) { low = mid + 1 }
+                else { high = mid }
+            }
+            return low < entries.count && entries[low].name.utf8.elementsEqual(name.utf8) ? low : nil
         }
 
         var estimatedBytes: Int {
@@ -580,9 +609,8 @@ actor FileCheckpointStore: CheckpointStore {
             batch.summarizeInsertions = parentManifest == nil
             let captureStartedAt = Date()
             let snapshotID = UUID()
-            let root = try await self.captureManifestNode(
+            let root = try await self.captureManifest(
                 from: filesystem,
-                at: .root,
                 reusing: parentManifest?.root,
                 previousCaptureStartedAt: parentManifest?.captureStartedAt,
                 workspaceId: draft.workspaceID,
@@ -594,9 +622,9 @@ actor FileCheckpointStore: CheckpointStore {
             )
             let summary: ChangeSet.Summary
             if let parentManifest {
-                summary = try await self.compareNodes(parentManifest.root, root, workspaceId: draft.workspaceID).summary
+                summary = try await self.compareNodes(parentManifest.root, root, workspaceId: draft.workspaceID, capturing: true).summary
             } else {
-                summary = try self.creationSummary(root, workspaceId: draft.workspaceID, insertedLines: batch.insertedLines)
+                summary = try self.creationSummary(root, workspaceId: draft.workspaceID, insertedLines: batch.insertedLines, capturing: true)
             }
             let checkpoint = Checkpoint.make(
                 snapshotID: snapshotID,
@@ -641,6 +669,142 @@ actor FileCheckpointStore: CheckpointStore {
         return manifest
     }
 
+    /// A frame keeps cached name-only entries intact. Only a requested old child
+    /// becomes a Node; legacy recursive manifests retain their embedded children.
+    private struct CaptureDirectory {
+        var path: WorkspacePath
+        var name: String
+        var childOffset: Int
+        var previous: SnapshotManifest.Node?
+        var previousEntries: [TreeEntry]
+        var legacyChildren: [SnapshotManifest.Node]?
+        var children: [TreeEntry] = []
+
+        func previousEntry(named name: String) -> TreeEntry? {
+            guard let index = TreeEntry.index(of: name, in: previousEntries) else { return nil }
+            return previousEntries[index]
+        }
+
+        func previousNode(named name: String, at path: WorkspacePath) -> SnapshotManifest.Node? {
+            guard let index = TreeEntry.index(of: name, in: previousEntries) else { return nil }
+            return legacyChildren?[index] ?? previousEntries[index].node(at: path)
+        }
+    }
+
+    private func captureManifest(
+        from filesystem: any FileSystem,
+        reusing previous: SnapshotManifest.Node?,
+        previousCaptureStartedAt: Date?,
+        workspaceId: UUID,
+        batch: BlobBatch
+    ) async throws -> SnapshotManifest.Node {
+        guard filesystem.supportsScopedWalk else {
+            return try await captureManifestNode(from: filesystem, at: .root, reusing: previous,
+                previousCaptureStartedAt: previousCaptureStartedAt, workspaceId: workspaceId, batch: batch)
+        }
+        var stack: [CaptureDirectory] = []
+        var root = SnapshotManifest.Node(kind: .missing, path: .root)
+        try await filesystem.walk(skippingVanishedEntries: true) { info, read, readLink in
+            try Task.checkCancellation()
+            let path = info.path
+            let node: SnapshotManifest.Node
+            let name: String
+            if info.kind == .directory, stack.last?.path == path {
+                // A nonempty directory closes after its descendants. Its name and
+                // parent are already known; there is no path lookup on this branch.
+                let directory = stack.removeLast()
+                name = directory.name
+                node = try self.finishCaptureDirectory(info, directory: directory, workspaceId: workspaceId)
+            } else if path.isRoot {
+                name = "/"
+                if info.kind == .directory {
+                    node = try self.finishCaptureDirectory(info,
+                        directory: self.captureDirectory(reusing: previous, at: path, name: name, workspaceId: workspaceId),
+                        workspaceId: workspaceId)
+                } else {
+                    node = try await self.captureLeaf(info, reusing: previous.map { TreeEntry(metadataOf: $0, name: "/") },
+                        previousCaptureStartedAt: previousCaptureStartedAt, workspaceId: workspaceId,
+                        batch: batch, read: read, readLink: readLink)
+                }
+            } else {
+                if stack.isEmpty {
+                    stack.append(try self.captureDirectory(reusing: previous, at: .root, name: "/", workspaceId: workspaceId))
+                }
+                // Postorder first reaches a new directory through a descendant.
+                // Parse only the suffix below the current frame; ordinary siblings
+                // need just their stored name, without hashing/constructing parents.
+                guard path != stack.last!.path, path.isWithin(stack.last!.path) else {
+                    // A walker that breaks depth-first postorder would otherwise build wrong trees.
+                    throw WorkspaceError.storageCorrupted("capture walk visited \(path) outside \(stack.last!.path)")
+                }
+                var suffix = path.string.utf8.dropFirst(stack.last!.childOffset)
+                while let slash = suffix.firstIndex(of: 47) {
+                    let component = String(decoding: suffix[..<slash], as: UTF8.self)
+                    try TreeEntry.validate(component)
+                    let parent = stack.last!
+                    let directoryPath = parent.path.appending(component)
+                    let old = parent.previousNode(named: component, at: directoryPath)
+                    stack.append(try self.captureDirectory(reusing: old, at: directoryPath, name: component, workspaceId: workspaceId))
+                    suffix = suffix[suffix.index(after: slash)...]
+                }
+                name = String(decoding: suffix, as: UTF8.self)
+                try TreeEntry.validate(name)
+                if info.kind == .directory {
+                    let old = stack.last!.previousNode(named: name, at: path)
+                    node = try self.finishCaptureDirectory(info,
+                        directory: self.captureDirectory(reusing: old, at: path, name: name, workspaceId: workspaceId),
+                        workspaceId: workspaceId)
+                } else {
+                    node = try await self.captureLeaf(info, reusing: stack.last!.previousEntry(named: name),
+                        previousCaptureStartedAt: previousCaptureStartedAt, workspaceId: workspaceId,
+                        batch: batch, read: read, readLink: readLink)
+                }
+            }
+            if path.isRoot { root = node }
+            else { stack[stack.count - 1].children.append(try TreeEntry(node, name: name)) }
+        }
+        return root
+    }
+
+    private func captureDirectory(
+        reusing previous: SnapshotManifest.Node?, at path: WorkspacePath, name: String, workspaceId: UUID
+    ) throws -> CaptureDirectory {
+        let entries: [TreeEntry]
+        let legacy: [SnapshotManifest.Node]?
+        if let previous, previous.kind == .directory {
+            if let hash = previous.treeHash {
+                entries = try treeEntries(hash: hash, workspaceId: workspaceId, capturing: true)
+                legacy = nil
+            } else {
+                legacy = (previous.children ?? []).sorted { PathName($0.path.name) < PathName($1.path.name) }
+                entries = try legacy!.map { try TreeEntry($0) }
+                for index in entries.indices.dropFirst() {
+                    guard PathName(entries[index - 1].name) < PathName(entries[index].name) else {
+                        throw WorkspaceError.storageCorrupted("snapshot directory \(path) contains duplicate child \(entries[index].name)")
+                    }
+                }
+            }
+        } else { entries = []; legacy = nil }
+        return CaptureDirectory(path: path, name: name, childOffset: path.isRoot ? 1 : path.string.utf8.count + 1,
+                                previous: previous, previousEntries: entries, legacyChildren: legacy)
+    }
+
+    private func finishCaptureDirectory(
+        _ info: FileInfo, directory: CaptureDirectory, workspaceId: UUID
+    ) throws -> SnapshotManifest.Node {
+        let entries = directory.children.sorted { PathName($0.name) < PathName($1.name) }
+        if let previous = directory.previous, previous.kind == .directory, previous.treeHash != nil,
+           directory.previousEntries == entries {
+            var reused = previous
+            reused.permissions = info.permissions
+            reused.modificationDate = info.modificationDate
+            return reused
+        }
+        return try persistDirectory(SnapshotManifest.Node(
+            kind: .directory, path: info.path, permissions: info.permissions, modificationDate: info.modificationDate
+        ), entries: entries, workspaceId: workspaceId, capturing: true)
+    }
+
     private func captureManifestNode(
         from filesystem: any FileSystem,
         at path: WorkspacePath,
@@ -650,11 +814,39 @@ actor FileCheckpointStore: CheckpointStore {
         batch: BlobBatch
     ) async throws -> SnapshotManifest.Node {
         try Task.checkCancellation()
-        // exists follows the final symlink on some backends, losing dangling
-        // links and cycles. Capture the entry itself, just as Snapshot.capture does.
         guard let info = try await Snapshot.infoIfPresent(at: path, on: filesystem) else {
             return SnapshotManifest.Node(kind: .missing, path: path)
         }
+        if info.kind == .directory {
+            var directory = try captureDirectory(reusing: previous, at: path, name: path.name, workspaceId: workspaceId)
+            for entry in try await filesystem.listDirectory(path: path).sorted(by: { PathName(walkSortKey($0)) < PathName(walkSortKey($1)) }) {
+                try TreeEntry.validate(entry.name)
+                let childPath = path.appending(entry.name)
+                let child = try await captureManifestNode(from: filesystem, at: childPath,
+                    reusing: directory.previousNode(named: entry.name, at: childPath),
+                    previousCaptureStartedAt: previousCaptureStartedAt, workspaceId: workspaceId, batch: batch)
+                // A listed child can vanish before its own lstat. Skip it on both
+                // routes, while content read failures after metadata still propagate.
+                if child.kind != .missing { directory.children.append(try TreeEntry(child, name: entry.name)) }
+            }
+            return try finishCaptureDirectory(info, directory: directory, workspaceId: workspaceId)
+        }
+        return try await captureLeaf(info, reusing: previous.map { TreeEntry(metadataOf: $0, name: path.name) }, previousCaptureStartedAt: previousCaptureStartedAt,
+            workspaceId: workspaceId, batch: batch,
+            read: { _ in try await filesystem.readFile(path: path) },
+            readLink: { try await filesystem.readSymlink(path: path) })
+    }
+
+    private func captureLeaf(
+        _ info: FileInfo,
+        reusing previous: TreeEntry?,
+        previousCaptureStartedAt: Date?,
+        workspaceId: UUID,
+        batch: BlobBatch,
+        read: @Sendable (Int?) async throws -> Data,
+        readLink: @Sendable () async throws -> String
+    ) async throws -> SnapshotManifest.Node {
+        let path = info.path
         switch info.kind {
         case .file:
             // Conservatively cover second-resolution and two-second-resolution timestamps.
@@ -670,7 +862,7 @@ actor FileCheckpointStore: CheckpointStore {
                let hash = previous?.contentHash,
                Self.isValidContentHash(hash),
                let previous,
-               blobExists(previous, workspaceId: workspaceId, batch: batch) {
+               blobExists(previous.node(at: path), workspaceId: workspaceId, batch: batch) {
                 return SnapshotManifest.Node(
                     kind: .file,
                     path: path,
@@ -681,7 +873,7 @@ actor FileCheckpointStore: CheckpointStore {
                     packed: previous.packed
                 )
             }
-            let data = try await filesystem.readFile(path: path)
+            let data = try await read(nil)
             let hash = SHA256.hexDigest(of: data)
             if batch.summarizeInsertions, data.count <= 1_000_000,
                !data.withUnsafeBytes({ $0.contains(0) }), let text = String(data: data, encoding: .utf8) {
@@ -697,52 +889,16 @@ actor FileCheckpointStore: CheckpointStore {
                 modificationDate: info.modificationDate,
                 packed: packed
             )
-        case .directory:
-            var previousChildren: [PathName: SnapshotManifest.Node] = [:]
-            let previousEntries = try previous.map { try self.children(of: $0, workspaceId: workspaceId) } ?? []
-            for child in previousEntries {
-                guard previousChildren.updateValue(child, forKey: PathName(child.path.name)) == nil else {
-                    throw WorkspaceError.storageCorrupted(
-                        "snapshot directory \(path) contains duplicate child \(child.path.name)"
-                    )
-                }
-            }
-            var children: [SnapshotManifest.Node] = []
-            for entry in try await filesystem.listDirectory(path: path).sorted(by: { PathName($0.name) < PathName($1.name) }) {
-                try TreeEntry.validate(entry.name)
-                children.append(
-                    try await captureManifestNode(
-                        from: filesystem,
-                        at: path.appending(entry.name),
-                        reusing: previousChildren[PathName(entry.name)],
-                        previousCaptureStartedAt: previousCaptureStartedAt,
-                        workspaceId: workspaceId,
-                        batch: batch
-                    )
-                )
-            }
-            if let previous, previous.kind == .directory, previous.treeHash != nil,
-               previousEntries == children {
-                var reused = previous
-                reused.permissions = info.permissions
-                reused.modificationDate = info.modificationDate
-                return reused
-            }
-            return try persistDirectory(SnapshotManifest.Node(
-                kind: .directory,
-                path: path,
-                permissions: info.permissions,
-                modificationDate: info.modificationDate,
-                children: children
-            ), workspaceId: workspaceId)
         case .symlink:
             return SnapshotManifest.Node(
                 kind: .symlink,
                 path: path,
                 permissions: info.permissions,
                 modificationDate: info.modificationDate,
-                symlinkTarget: try await filesystem.readSymlink(path: path)
+                symlinkTarget: try await readLink()
             )
+        case .directory:
+            preconditionFailure("directories must be captured postorder")
         }
     }
 
@@ -790,7 +946,8 @@ actor FileCheckpointStore: CheckpointStore {
     private func revisionEntry(
         from node: SnapshotManifest.Node,
         workspaceId: UUID,
-        depth: Int? = nil
+        depth: Int? = nil,
+        capturing: Bool = false
     ) throws -> RevisionIndex.Entry {
         switch node.kind {
         case .missing:
@@ -809,8 +966,8 @@ actor FileCheckpointStore: CheckpointStore {
             return .directory(
                 path: node.path,
                 permissions: node.permissions ?? .defaultDirectory,
-                children: depth == 0 ? [] : try children(of: node, workspaceId: workspaceId).map {
-                    try revisionEntry(from: $0, workspaceId: workspaceId, depth: depth.map { $0 - 1 })
+                children: depth == 0 ? [] : try children(of: node, workspaceId: workspaceId, capturing: capturing).map {
+                    try revisionEntry(from: $0, workspaceId: workspaceId, depth: depth.map { $0 - 1 }, capturing: capturing)
                 }
             )
         case .symlink:
@@ -832,13 +989,8 @@ actor FileCheckpointStore: CheckpointStore {
             guard node.kind == .directory else { return nil }
             if let hash = node.treeHash {
                 let entries = try treeEntries(hash: hash, workspaceId: workspaceId)
-                var low = 0, high = entries.count
-                while low < high {
-                    let mid = (low + high) / 2
-                    if PathName(entries[mid].name) < name { low = mid + 1 } else { high = mid }
-                }
-                guard low < entries.count, PathName(entries[low].name) == name else { return nil }
-                node = entries[low].node(in: node.path)
+                guard let index = TreeEntry.index(of: component, in: entries) else { return nil }
+                node = entries[index].node(in: node.path)
             } else {
                 // Legacy manifests already contain absolute child nodes.
                 guard let child = node.children?.first(where: { PathName($0.path.name) == name }) else { return nil }
@@ -1960,19 +2112,19 @@ actor FileCheckpointStore: CheckpointStore {
         try Self.syncDirectory(treesDirectoryURL(workspaceId: workspaceId))
     }
 
-    private func cacheTree(_ entries: [TreeEntry], hash: String, workspaceId: UUID) {
+    private func cacheTree(_ entries: [TreeEntry], hash: String, workspaceId: UUID, capturing: Bool = false) {
         let key = workspaceId.uuidString + hash
         let cost = 256 + key.utf8.count * 2 + entries.reduce(0) { $0 + $1.estimatedBytes }
-        treeCache.insert(entries, for: key, cost: cost)
+        treeCache.insert(entries, for: key, cost: cost, evicting: capturing ? .mostRecent : .leastRecent)
     }
 
-    private func children(of node: SnapshotManifest.Node, workspaceId: UUID) throws -> [SnapshotManifest.Node] {
+    private func children(of node: SnapshotManifest.Node, workspaceId: UUID, capturing: Bool = false) throws -> [SnapshotManifest.Node] {
         guard node.kind == .directory else { return [] }
         guard let hash = node.treeHash else { return (node.children ?? []).sorted { PathName($0.path.name) < PathName($1.path.name) } }
-        return try treeEntries(hash: hash, workspaceId: workspaceId).map { $0.node(in: node.path) }
+        return try treeEntries(hash: hash, workspaceId: workspaceId, capturing: capturing).map { $0.node(in: node.path) }
     }
 
-    private func treeEntries(hash: String, workspaceId: UUID) throws -> [TreeEntry] {
+    private func treeEntries(hash: String, workspaceId: UUID, capturing: Bool = false) throws -> [TreeEntry] {
         guard Self.isValidContentHash(hash) else { throw WorkspaceError.storageCorrupted("invalid tree hash") }
         let url = treesDirectoryURL(workspaceId: workspaceId).appendingPathComponent(hash)
         guard fileManager.fileExists(atPath: url.path) else { throw WorkspaceError.storageCorrupted("missing tree \(hash)") }
@@ -1991,7 +2143,7 @@ actor FileCheckpointStore: CheckpointStore {
                 }
                 previous = PathName(entry.name)
             }
-            cacheTree(entries, hash: hash, workspaceId: workspaceId)
+            cacheTree(entries, hash: hash, workspaceId: workspaceId, capturing: capturing)
         }
         return entries
     }
@@ -2001,14 +2153,21 @@ actor FileCheckpointStore: CheckpointStore {
     ) throws -> SnapshotManifest.Node {
         let entries = try (node.children ?? []).sorted {
             PathName($0.path.name) < PathName($1.path.name)
-        }.map(TreeEntry.init)
+        }.map { try TreeEntry($0) }
+        return try persistDirectory(node, entries: entries, workspaceId: workspaceId, syncParent: syncParent)
+    }
+
+    private func persistDirectory(
+        _ node: SnapshotManifest.Node, entries: [TreeEntry], workspaceId: UUID,
+        syncParent: Bool = false, capturing: Bool = false
+    ) throws -> SnapshotManifest.Node {
         let bytes = try compactEncoder.encode(entries)
         let hash = SHA256.hexDigest(of: bytes)
         let url = treesDirectoryURL(workspaceId: workspaceId).appendingPathComponent(hash)
         if !fileManager.fileExists(atPath: url.path) {
             try Self.durableWrite(bytes, to: url, syncParent: syncParent)
         }
-        cacheTree(entries, hash: hash, workspaceId: workspaceId)
+        cacheTree(entries, hash: hash, workspaceId: workspaceId, capturing: capturing)
         var reference = node
         reference.children = nil
         reference.treeHash = hash
@@ -2142,14 +2301,14 @@ actor FileCheckpointStore: CheckpointStore {
         }
     }
 
-    private func creationSummary(_ root: SnapshotManifest.Node, workspaceId: UUID, insertedLines: [WorkspacePath: Int]) throws -> ChangeSet.Summary {
+    private func creationSummary(_ root: SnapshotManifest.Node, workspaceId: UUID, insertedLines: [WorkspacePath: Int], capturing: Bool = false) throws -> ChangeSet.Summary {
         var paths: [WorkspacePath] = []
         var files = 0
         func visit(_ node: SnapshotManifest.Node) throws {
             if node.kind == .missing { return }
             paths.append(node.path)
             if node.kind == .file { files += 1 }
-            for child in try children(of: node, workspaceId: workspaceId) { try visit(child) }
+            for child in try children(of: node, workspaceId: workspaceId, capturing: capturing) { try visit(child) }
         }
         try visit(root)
         let additions = insertedLines.values.reduce(0, +)
@@ -2157,19 +2316,19 @@ actor FileCheckpointStore: CheckpointStore {
                      statistics: .init(changedPathCount: paths.count, changedFileCount: files, additions: additions, deletions: 0))
     }
 
-    private func compareNodes(_ old: SnapshotManifest.Node, _ new: SnapshotManifest.Node, workspaceId: UUID) async throws -> ChangeSet {
+    private func compareNodes(_ old: SnapshotManifest.Node, _ new: SnapshotManifest.Node, workspaceId: UUID, capturing: Bool = false) async throws -> ChangeSet {
         if old == new { return ChangeSet(changes: []) }
         if old.kind == .directory, new.kind == .directory {
             var changes: [FileChange] = (old.permissions ?? .defaultDirectory) == (new.permissions ?? .defaultDirectory) ? [] : [.init(path: new.path, kind: .directory, effect: .modified)]
             var omissions: [TextDiffOmission] = []
             if old.treeHash != nil, old.treeHash == new.treeHash { return ChangeSet(changes: changes) }
-            let before = Dictionary(uniqueKeysWithValues: try children(of: old, workspaceId: workspaceId).map { (PathName($0.path.name), $0) })
-            let after = Dictionary(uniqueKeysWithValues: try children(of: new, workspaceId: workspaceId).map { (PathName($0.path.name), $0) })
+            let before = Dictionary(uniqueKeysWithValues: try children(of: old, workspaceId: workspaceId, capturing: capturing).map { (PathName($0.path.name), $0) })
+            let after = Dictionary(uniqueKeysWithValues: try children(of: new, workspaceId: workspaceId, capturing: capturing).map { (PathName($0.path.name), $0) })
             for key in Set(before.keys).union(after.keys).sorted() {
                 let name = key.string
                 let result = try await compareNodes(
                     before[key] ?? .init(kind: .missing, path: old.path.appending(name)),
-                    after[key] ?? .init(kind: .missing, path: new.path.appending(name)), workspaceId: workspaceId)
+                    after[key] ?? .init(kind: .missing, path: new.path.appending(name)), workspaceId: workspaceId, capturing: capturing)
                 changes += result.changes
                 omissions += result.textDiffOmissions
             }
@@ -2177,8 +2336,8 @@ actor FileCheckpointStore: CheckpointStore {
         }
         // Newly created/deleted trees need their complete summaries; normal incremental
         // changes reach this path only for changed leaves.
-        let before = RevisionIndex(id: UUID(), root: old.path, entry: try revisionEntry(from: old, workspaceId: workspaceId))
-        let after = RevisionIndex(id: UUID(), root: new.path, entry: try revisionEntry(from: new, workspaceId: workspaceId))
+        let before = RevisionIndex(id: UUID(), root: old.path, entry: try revisionEntry(from: old, workspaceId: workspaceId, capturing: capturing))
+        let after = RevisionIndex(id: UUID(), root: new.path, entry: try revisionEntry(from: new, workspaceId: workspaceId, capturing: capturing))
         return try await ChangeSet.compare(before: before, after: after, maxTextBytes: 1_000_000,
             loadBefore: { path in try await self.readNodeFile(path, root: old, workspaceId: workspaceId) },
             loadAfter: { path in try await self.readNodeFile(path, root: new, workspaceId: workspaceId) })

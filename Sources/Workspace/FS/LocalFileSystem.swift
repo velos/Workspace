@@ -556,7 +556,7 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
 
     /// Holds only the active directory ancestry, for this read-only call. Descents and
     /// file opens use O_NOFOLLOW; metadata and link targets use the same parent fd.
-    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
                       visit: FileSystemWalkVisitor) async throws {
         let entry: Entry
         let info: LocalStat
@@ -568,20 +568,28 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
             if Snapshot.isMissingEntry(error) { return }
             throw error
         }
-        try await walkEntry(entry, info: info, depth: 0, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+        try await walkEntry(entry, info: info, depth: 0, skippingUnreadableDirectories: skippingUnreadableDirectories,
+            skippingVanishedEntries: skippingVanishedEntries, visit: visit)
     }
 
     nonisolated(nonsending) private func walkEntry(_ entry: Entry, info: LocalStat, depth: Int, skippingUnreadableDirectories: Bool,
+        skippingVanishedEntries: Bool = false,
                            visit: FileSystemWalkVisitor) async throws {
         try Task.checkCancellation()
         // Bound this call's retained ancestry, leaving room for unrelated operations at
         // the usual 256-descriptor soft limit. The fallback resolves each operation anew.
         if depth == 32 {
-            let current = try self.metadata(resolve(entry.path, followFinal: false))
+            let current: LocalStat
+            do { current = try self.metadata(resolve(entry.path, followFinal: false)) }
+            catch {
+                guard skippingVanishedEntries, Snapshot.isMissingEntry(error) else { throw error }
+                return
+            }
             guard current.st_dev == info.st_dev, current.st_ino == info.st_ino else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(ESTALE))
             }
             try await walkUsingPaths(at: entry.path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+                skippingVanishedEntries: skippingVanishedEntries,
                                      requireExisting: true, visit: visit)
             return
         }
@@ -591,9 +599,14 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
             let children: [(entry: Entry, info: LocalStat, key: String)]
             do {
                 directory = try openEntry(entry, flags: O_RDONLY | O_DIRECTORY)
-                children = try names(in: directory, consumingOffset: true).map { name in
+                children = try names(in: directory, consumingOffset: true).compactMap { name -> (entry: Entry, info: LocalStat, key: String)? in
                     let child = try Entry(parent: directory, storedName: name, path: entry.path.appending(name))
-                    let info = try self.metadata(child)
+                    let info: LocalStat
+                    do { info = try self.metadata(child) }
+                    catch {
+                        guard skippingVanishedEntries, Snapshot.isMissingEntry(error) else { throw error }
+                        return nil
+                    }
                     return (child, info, walkSortKey(name: name, isDirectory: info.st_mode & S_IFMT == S_IFDIR))
                 }.sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
             } catch {
@@ -603,7 +616,8 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
                 return
             }
             for (child, info, _) in children {
-                try await walkEntry(child, info: info, depth: depth + 1, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+                try await walkEntry(child, info: info, depth: depth + 1, skippingUnreadableDirectories: skippingUnreadableDirectories,
+                    skippingVanishedEntries: skippingVanishedEntries, visit: visit)
             }
         }
         try await visit(metadata, { length in try self.readEntry(entry, length: length) },

@@ -81,7 +81,7 @@ public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewS
         base.supportsScopedWalk || mountsSnapshot().contains { $0.fileSystem.supportsScopedWalk }
     }
 
-    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
                                             visit: FileSystemWalkVisitor) async throws {
         let mounts = mountsSnapshot()
         // An entire subtree in one backend can use its descriptor-scoped walk.
@@ -91,7 +91,8 @@ public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewS
             var visited = false
             do {
                 try await resolved.filesystem.walk(at: resolved.relativePath,
-                    skippingUnreadableDirectories: skippingUnreadableDirectories) { info, read, readLink in
+                    skippingUnreadableDirectories: skippingUnreadableDirectories,
+                        skippingVanishedEntries: skippingVanishedEntries) { info, read, readLink in
                     visited = true
                     let virtual = resolved.mountPoint.appending(info.path.components.joined(separator: "/"))
                     try await withoutActuallyEscaping(read) { scopedRead in
@@ -105,7 +106,8 @@ public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewS
                 // A backend root may be a skippable child in our virtual namespace.
                 guard !visited, resolved.relativePath.isRoot, skippingUnreadableDirectories,
                       isSkippableWalkError(error, at: path) else { throw error }
-                try await walkUsingPaths(at: path, skippingUnreadableDirectories: true, visit: visit)
+                try await walkUsingPaths(at: path, skippingUnreadableDirectories: true,
+                    skippingVanishedEntries: skippingVanishedEntries, visit: visit)
             }
             return
         }
@@ -120,7 +122,8 @@ public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewS
                 return
             }
             for child in listing.sorted(by: { PathName(walkSortKey($0)) < PathName(walkSortKey($1)) }) {
-                try await walk(at: child.info.path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+                try await walk(at: child.info.path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+                    skippingVanishedEntries: skippingVanishedEntries, visit: visit)
             }
         }
         try await visit(info, { length in

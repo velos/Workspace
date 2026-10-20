@@ -61,9 +61,10 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
 
     nonisolated package var supportsScopedWalk: Bool { base.supportsScopedWalk }
 
-    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
                       visit: FileSystemWalkVisitor) async throws {
-        try await base.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+        try await base.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+            skippingVanishedEntries: skippingVanishedEntries, visit: visit)
     }
 
     public func stat(path: WorkspacePath) async throws -> FileInfo { try await base.stat(path: path) }

@@ -325,6 +325,18 @@ struct CheckpointFormatTests {
         #expect(cache.cost == 0 && cache.count == 0)
     }
 
+    @Test func `capture cache inserts retain resident trees across an oversized scan`() {
+        var cache = CostLRU<Int, Int>(limit: 8)
+        for key in 0..<7 { cache.insert(key, for: key, cost: 1) }
+        for key in 7..<100 {
+            cache.insert(key, for: key, cost: 1, evicting: .mostRecent)
+            #expect(cache.cost <= 8)
+        }
+        for key in 0..<7 { #expect(cache.value(for: key) == key) }
+        #expect(cache.value(for: 99) == 99)
+        #expect(cache.count == 8 && cache.cost == 8)
+    }
+
     @Test func `durable orphan root is swept after metadata publication fails`() async throws {
         let root = try TestSupport.temporaryDirectory("OrphanRoot")
         defer { TestSupport.remove(root) }

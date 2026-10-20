@@ -199,8 +199,10 @@ objects in `trees/`. Each object contains byte-sorted immediate child names (nev
 referenced by hash. An incremental capture writes only changed directories and their ancestors;
 unchanged objects remain shared. File reads decode only directories on the requested path.
 Decoded trees and the write catalog share a **32 MiB estimated decoded-storage budget** per
-store (24 MiB for trees, 8 MiB for the catalog). Both use O(1) LRU eviction and refresh recency on
-hits. Estimates include entry, string-buffer and bookkeeping costs; this is not a process-RSS cap.
+store (24 MiB for trees, 8 MiB for the catalog). Both refresh recency on hits and normally use
+O(1) LRU eviction. Capture-time tree inserts evict the most recent entry instead, so repeated
+whole-tree scans retain a resident set when the trees exceed the budget. Estimates include entry,
+string-buffer and bookkeeping costs; this is not a process-RSS cap.
 File metadata and directory listings also use path-only lookup. Full revision indexes are still materialized
 when a whole-tree operation requests them. Metadata capture still walks the filesystem.
 
@@ -476,7 +478,9 @@ Authorization supports one-shot, duration-limited, and session approvals plus bo
 Local scans record symlinks without descending into them and retain per-entry authorization
 checks when using an authorized filesystem. Scans are live reads, not atomic snapshots:
 concurrent changes can affect the result or cause an error. Snapshot capture fails when a
-listed child disappears before it can be inspected or read. Scoped no-follow opens reject
+listed child disappears before it can be inspected or read. Directory-backed checkpoints omit
+listed children that vanish before their metadata lookup (ENOENT/ENOTDIR); failures after metadata,
+including content reads, still abort the checkpoint. Scoped no-follow opens reject
 substituted symlinks even when they point inside the root. Deep scans bound open directory
 handles by falling back to ordinary per-path operations; no handles are cached between calls.
 As with other local operations, host processes can relocate open directories or mutate

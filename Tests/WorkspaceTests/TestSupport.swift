@@ -24,13 +24,15 @@ actor HookableFileSystem: FileSystem, ExactTimestampFileSystem, TraversingFileSy
     var walks: [WorkspacePath] = []
     private let scopedWalk: Bool
     nonisolated var supportsScopedWalk: Bool { scopedWalk && base.supportsScopedWalk }
-    nonisolated(nonsending) func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+    nonisolated(nonsending) func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
                                      visit: FileSystemWalkVisitor) async throws {
         guard supportsScopedWalk else {
-            return try await walkUsingPaths(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+            return try await walkUsingPaths(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+                skippingVanishedEntries: skippingVanishedEntries, visit: visit)
         }
         await recordWalk(path)
-        try await base.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+        try await base.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+            skippingVanishedEntries: skippingVanishedEntries, visit: visit)
     }
     private func recordWalk(_ path: WorkspacePath) { walks.append(path) }
     func resetMetadataCounts() { walks = []; statCount = 0; listings = [] }

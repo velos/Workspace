@@ -1,6 +1,8 @@
 /// A byte-budgeted LRU. Dictionary links make lookup, promotion and eviction O(1).
 /// Costs include estimated decoded storage and bookkeeping, not encoded JSON sizes.
 struct CostLRU<Key: Hashable & Sendable, Value: Sendable>: Sendable {
+    enum Eviction { case leastRecent, mostRecent }
+
     private struct Entry: Sendable {
         var value: Value
         var cost: Int
@@ -23,10 +25,12 @@ struct CostLRU<Key: Hashable & Sendable, Value: Sendable>: Sendable {
         return entry.value
     }
 
-    mutating func insert(_ value: Value, for key: Key, cost entryCost: Int) {
+    /// MRU eviction lets a whole-tree scan retain most of the resident set.
+    /// Lookup promotion and the decoded-storage bound are the same for both policies.
+    mutating func insert(_ value: Value, for key: Key, cost entryCost: Int, evicting eviction: Eviction = .leastRecent) {
         remove(key)
         guard entryCost >= 0, entryCost <= limit else { return }
-        while cost > limit - entryCost, let key = oldest { remove(key) }
+        while cost > limit - entryCost, let key = (eviction == .mostRecent ? newest : oldest) { remove(key) }
         entries[key] = Entry(value: value, cost: entryCost, previous: newest)
         if let newest { entries[newest]?.next = key } else { oldest = key }
         newest = key

@@ -105,6 +105,35 @@ struct FileSystemTraversalTests {
         print("DeepTreeLimitChecked")
     }
 
+    @Test(arguments: [false, true])
+    func missingChildAtDescriptorFallbackHonorsWalkOption(skipVanished: Bool) async throws {
+        let root = try TestSupport.temporaryDirectory("WalkVanishedAtCap")
+        defer { TestSupport.remove(root) }
+        let local = try LocalFileSystem(root: root)
+        let parent = WorkspacePath(normalizing: String(repeating: "/d", count: 31))
+        let first = parent.appending("a"), vanished = parent.appending("b")
+        try await local.createFile(path: first, data: Data([1]))
+        try await local.createFile(path: vanished, data: Data([2]))
+        var visited: [WorkspacePath] = []
+        do {
+            try await local.walk(skippingVanishedEntries: skipVanished) { info, read, _ in
+                visited.append(info.path)
+                if info.path == first {
+                    #expect(try await read(nil) == Data([1]))
+                    // Both siblings have already been enumerated/lstat'ed. The
+                    // depth-32 handoff must tolerate a now-missing child lstat.
+                    try await local.remove(path: vanished, recursive: false)
+                }
+            }
+            #expect(skipVanished)
+        } catch {
+            #expect(!skipVanished)
+            #expect((error as NSError).code == Int(ENOENT))
+        }
+        #expect(visited.contains(first))
+        #expect(!visited.contains(vanished))
+    }
+
     @Test
     func captureParityIncludesLinksModesAndSubtreeSpelling() async throws {
         let container = try TestSupport.temporaryDirectory("WalkParity")
