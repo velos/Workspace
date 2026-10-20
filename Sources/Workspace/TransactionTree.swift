@@ -253,7 +253,7 @@ actor TransactionRevisionContent {
     }
 
     func read(_ path: WorkspacePath) async throws -> Data {
-        guard let data = try await store.readSnapshotFile(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceId,
+        guard let data = try await store.readSnapshotFile(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceID,
                                                         path: path, offset: 0, length: nil) else {
             throw WorkspaceError.revisionDataNotFound(checkpoint.snapshotId)
         }
@@ -279,7 +279,7 @@ final class TransactionRevisionPins: @unchecked Sendable {
     private var pins: [UUID: (workspace: UUID, checkpoint: UUID)] = [:]
     func insert(_ checkpoint: Checkpoint) -> UUID {
         let token = UUID()
-        lock.withLock { pins[token] = (checkpoint.workspaceId, checkpoint.id) }
+        lock.withLock { pins[token] = (checkpoint.workspaceID, checkpoint.id) }
         return token
     }
     func remove(_ token: UUID) { _ = lock.withLock { pins.removeValue(forKey: token) } }

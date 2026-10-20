@@ -77,7 +77,7 @@ extension Workspace {
     func checkpointComparison(_ checkpoint: Checkpoint) async throws -> (RevisionComparison, TransactionRevisionPin) {
         let store = store
         let (revision, pin) = try await TransactionRevisionGate.shared.withLock {
-            guard let revision = try await store.loadCapturedRevision(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceId) else {
+            guard let revision = try await store.loadCapturedRevision(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceID) else {
                 throw WorkspaceError.revisionDataNotFound(checkpoint.snapshotId)
             }
             return (revision, TransactionRevisionPin(checkpoint))

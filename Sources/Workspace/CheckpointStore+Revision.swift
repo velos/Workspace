@@ -37,7 +37,7 @@ struct CaptureMetadataCache: Sendable {
 }
 
 extension CheckpointStore {
-    // Conservative compatibility for decorators and stores without capture hints.
+    // Content verification for decorators and stores without capture hints.
     func loadCapturedRevision(id: UUID, workspaceId: UUID) async throws -> CapturedRevision? {
         guard let index = try await loadRevisionIndex(id: id, workspaceId: workspaceId) else { return nil }
         return CapturedRevision(index: index, metadata: MetadataIndex())
@@ -94,9 +94,9 @@ extension FileCheckpointStore {
         return try await withSharedLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
             guard let manifest = try loadManifestUnlocked(id: id, workspaceId: workspaceId) else { return nil }
             var metadata = MetadataIndex()
-            // Legacy materialized snapshots have no trustworthy capture timestamp.
+            // Materialized snapshots have no trustworthy capture timestamp.
             metadata.capturedAt = manifest.captureStartedAt ?? .distantPast
-            metadata.exactTimestamps = manifest.exactContentTimestamps ?? false
+            metadata.exactTimestamps = manifest.exactContentTimestamps
             func visit(_ node: SnapshotManifest.Node) throws -> RevisionIndex.Entry {
                 let entry = try revisionEntry(from: node, workspaceId: workspaceId, depth: 0)
                 if let kind = entry.kind {
@@ -134,7 +134,6 @@ extension FileCheckpointStore {
                 }
                 return manifest
             }
-            try requireCurrentFormatUnlocked(workspaceId: workspaceId)
             let batch = try makeBlobBatch(workspaceId: workspaceId)
             defer { batch.close() }
             func apply(_ patch: Snapshot.Entry, to old: SnapshotManifest.Node?) throws -> SnapshotManifest.Node {
@@ -157,8 +156,7 @@ extension FileCheckpointStore {
                         node.treeHash = old.treeHash
                         return node
                     }
-                    node.children = updated
-                    return try persistDirectory(node, workspaceId: workspaceId)
+                    return try persistDirectory(node, children: updated, workspaceId: workspaceId)
                 }
                 var node = try writeManifestNode(patch, workspaceId: workspaceId, batch: batch, reusing: old)
                 node.modificationDate = metadata.entries[patch.path]?.info.modificationDate
@@ -167,7 +165,7 @@ extension FileCheckpointStore {
             }
             let root = try apply(patch.entry, to: source.root)
             try finish(batch, workspaceId: workspaceId)
-            let manifest = SnapshotManifest(version: 3, id: UUID(), rootPath: source.rootPath,
+            let manifest = SnapshotManifest(id: UUID(), rootPath: source.rootPath,
                 root: root, captureStartedAt: metadata.capturedAt,
                 exactContentTimestamps: metadata.exactTimestamps)
             let summary: ChangeSet.Summary

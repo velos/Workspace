@@ -22,15 +22,6 @@ public struct SearchRequest: Sendable, Codable, Equatable {
             self.maxMatches = maxMatches
             self.maxOutputBytes = maxOutputBytes
         }
-
-        private enum CodingKeys: String, CodingKey { case maxFileBytes, maxFiles, maxMatches, maxOutputBytes }
-        public init(from decoder: Decoder) throws {
-            let values = try decoder.container(keyedBy: CodingKeys.self)
-            maxFileBytes = try values.decode(UInt64.self, forKey: .maxFileBytes)
-            maxFiles = try values.decode(Int.self, forKey: .maxFiles)
-            maxMatches = try values.decode(Int.self, forKey: .maxMatches)
-            maxOutputBytes = try values.decodeIfPresent(Int.self, forKey: .maxOutputBytes)
-        }
     }
 
     /// Maximum context on each side is 100 lines; negative requests are rejected.
@@ -55,16 +46,6 @@ public struct SearchRequest: Sendable, Codable, Equatable {
         self.contextLines = contextLines
         self.limits = limits
         self.matchOffset = matchOffset
-    }
-
-    private enum CodingKeys: String, CodingKey { case files, pattern, contextLines, limits, matchOffset }
-    public init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        files = try values.decode(FileSelection.self, forKey: .files)
-        pattern = try values.decode(TextPattern.self, forKey: .pattern)
-        contextLines = try values.decode(Int.self, forKey: .contextLines)
-        limits = try values.decode(Limits.self, forKey: .limits)
-        matchOffset = try values.decodeIfPresent(Int.self, forKey: .matchOffset) ?? 0
     }
 }
 
@@ -109,20 +90,6 @@ public struct SearchResult: Sendable, Codable, Equatable {
             self.totalBytes = totalBytes ?? (before + after).reduce(UInt64(line.utf8.count)) {
                 saturatedByteSum($0, UInt64($1.text.utf8.count))
             }
-        }
-
-        private enum CodingKeys: String, CodingKey { case path, lineNumber, line, before, after, truncated, totalBytes }
-        public init(from decoder: Decoder) throws {
-            let values = try decoder.container(keyedBy: CodingKeys.self)
-            self.init(
-                path: try values.decode(WorkspacePath.self, forKey: .path),
-                lineNumber: try values.decode(Int.self, forKey: .lineNumber),
-                line: try values.decode(String.self, forKey: .line),
-                before: try values.decode([ContextLine].self, forKey: .before),
-                after: try values.decode([ContextLine].self, forKey: .after),
-                truncated: try values.decodeIfPresent(Bool.self, forKey: .truncated) ?? false,
-                totalBytes: try values.decodeIfPresent(UInt64.self, forKey: .totalBytes)
-            )
         }
     }
 
@@ -176,20 +143,9 @@ public struct SearchResult: Sendable, Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case matches, skippedFiles, searchedFileCount, truncation, truncated, totalMatches, nextMatchOffset
+        case matches, skippedFiles, searchedFileCount, truncation, totalMatches, nextMatchOffset
     }
-    public init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        let matches = try values.decode([Match].self, forKey: .matches)
-        self.init(
-            matches: matches,
-            skippedFiles: try values.decode([SkippedFile].self, forKey: .skippedFiles),
-            searchedFileCount: try values.decode(Int.self, forKey: .searchedFileCount),
-            truncation: try values.decodeIfPresent(Truncation.self, forKey: .truncation),
-            totalMatches: try values.decodeIfPresent(Int.self, forKey: .totalMatches) ?? matches.count,
-            nextMatchOffset: try values.decodeIfPresent(Int.self, forKey: .nextMatchOffset)
-        )
-    }
+    private enum ComputedCodingKeys: String, CodingKey { case truncated }
 
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
@@ -197,7 +153,8 @@ public struct SearchResult: Sendable, Codable, Equatable {
         try values.encode(skippedFiles, forKey: .skippedFiles)
         try values.encode(searchedFileCount, forKey: .searchedFileCount)
         try values.encodeIfPresent(truncation, forKey: .truncation)
-        try values.encode(truncated, forKey: .truncated)
+        var computed = encoder.container(keyedBy: ComputedCodingKeys.self)
+        try computed.encode(truncated, forKey: .truncated)
         try values.encode(totalMatches, forKey: .totalMatches)
         try values.encodeIfPresent(nextMatchOffset, forKey: .nextMatchOffset)
     }

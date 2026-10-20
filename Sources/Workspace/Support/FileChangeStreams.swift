@@ -270,7 +270,7 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
 }
 #endif
 
-/// Retains compatibility for checkpoint stores and callers of the original Void stream.
+/// Coalesces checkpoint-store notifications, whose consumers reload checkpoint metadata.
 func unscopedChanges(_ stream: AsyncStream<FileSystemChangeSignal>) -> AsyncStream<Void> {
     AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
         let task = Task {

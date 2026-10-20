@@ -25,12 +25,6 @@ class CountingFileSystem: CompleteFileSystemChangeSource, MutationGenerationFile
         }
         return try await source.changeSignals()
     }
-    func changes() async throws -> AsyncStream<Void> {
-        guard let source = base as? any FileSystemChangeSource else {
-            throw BenchmarkError.message("backend does not provide filesystem notifications")
-        }
-        return try await source.changes()
-    }
     let base: any FileSystem
     private let lock = NSLock()
     private var counts = IOCounts()
@@ -193,13 +187,6 @@ final class ObservedCountingFileSystem: CountingFileSystem,
             throw BenchmarkError.message("backend does not provide filesystem notifications")
         }
         return try await source.changeSignals()
-    }
-    override func changes() async throws -> AsyncStream<Void> {
-        call("changes")
-        guard let source = base as? any FileSystemChangeSource else {
-            throw BenchmarkError.message("backend does not provide filesystem notifications")
-        }
-        return try await source.changes()
     }
 }
 

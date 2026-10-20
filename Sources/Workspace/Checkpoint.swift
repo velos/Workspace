@@ -23,13 +23,6 @@ public struct Checkpoint: Sendable, Codable, Equatable {
     var mutationCursor: Int
     var snapshotId: UUID
 
-    var workspaceId: UUID { workspaceID }
-    var parentCheckpointId: UUID? { parentID }
-    var rollbackSourceCheckpointId: UUID? {
-        if case let .rollback(from) = origin { return from }
-        return nil
-    }
-
     var provenanceCheckpointID: UUID? {
         switch origin {
         case let .rollback(from): from

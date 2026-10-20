@@ -66,14 +66,6 @@ extension Workspace {
         }
     }
 
-    /// Compatibility spelling for observing future workspace changes at a path.
-    public func watchChanges(
-        at path: WorkspacePath = .root,
-        recursive: Bool = true
-    ) async -> AsyncStream<WorkspaceEvent> {
-        await events(.init(path: path, recursive: recursive, includeCheckpoints: false))
-    }
-
     private static func matches(_ event: WorkspaceEvent, filter: WorkspaceEvent.Filter) -> Bool {
         switch event {
         case .checkpoint:

@@ -29,8 +29,7 @@ let package = Package(
         ),
         .testTarget(
             name: "WorkspaceTests",
-            dependencies: ["Workspace"],
-            resources: [.copy("Fixtures")]
+            dependencies: ["Workspace"]
         ),
     ]
 )

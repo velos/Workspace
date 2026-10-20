@@ -218,9 +218,6 @@ public protocol FileSystem: AnyObject, Sendable {
 
 /// A filesystem that can push invalidations when its contents change outside Workspace APIs.
 public protocol FileSystemChangeSource: FileSystem {
-    /// Emits an unscoped invalidation. Workspace consumes `changeSignals()`, whose
-    /// default implementation adapts this stream to `.rescan`.
-    func changes() async throws -> AsyncStream<Void>
     /// Emits scoped invalidations using the `FileSystemChangeSignal` contract.
     func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal>
 }
@@ -265,20 +262,6 @@ public enum FileSystemChangeSignal: Sendable, Equatable {
         case recursive
 
         public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
-    }
-}
-
-extension FileSystemChangeSource {
-    /// Compatibility for sources that only provide unscoped invalidations.
-    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
-        let stream = try await changes()
-        return AsyncStream { continuation in
-            let task = Task {
-                for await _ in stream where !Task.isCancelled { continuation.yield(.rescan) }
-                continuation.finish()
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
     }
 }
 
@@ -372,8 +355,6 @@ extension FileSystem {
         try await writeFile(path: path, data: data, append: false)
     }
 }
-
-typealias FileSystemCapabilities = FileSystemFeatures
 
 /// Backend differences relevant to copy-on-write edit previews.
 package struct FileSystemPreviewSemantics: Sendable {

@@ -456,7 +456,6 @@ private actor LimitedCacheBackend: CompleteFileSystemChangeSource, PotentialPath
         if subscriptionFails { throw CacheTestError.injected }
         return stream
     }
-    func changes() async throws -> AsyncStream<Void> { unscopedChanges(try await changeSignals()) }
     func stat(path: WorkspacePath) async throws -> FileInfo {
         statted.append(path)
         if path.dirname.isRoot, path.basename.hasPrefix("fixed-"),

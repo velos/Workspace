@@ -34,8 +34,8 @@ struct CheckpointStoreTests {
         #expect(other.sequence == 1)
     }
 
-    @Test(arguments: [false, true])
-    func `legacy sequence sidecars and reserved torn appends preserve the cursor`(legacySidecar: Bool) async throws {
+    @Test
+    func `reserved torn appends preserve the cursor`() async throws {
         let root = try TestSupport.temporaryDirectory("SequenceSidecar")
         defer { TestSupport.remove(root) }
         let id = UUID()
@@ -43,8 +43,8 @@ struct CheckpointStoreTests {
         try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/a"))
         let directory = root.appendingPathComponent(id.uuidString)
         let sidecar = directory.appendingPathComponent("mutations.sequence.json")
-        // Simulate a reserved sequence whose append failed mid-UTF8; old stores wrote an Int.
-        let state = legacySidecar ? "7" : #"{"highWaterMark":7,"retractionEpoch":3}"#
+        // Simulate a reserved sequence whose append failed mid-UTF8.
+        let state = #"{"highWaterMark":7,"retractionEpoch":3}"#
         try Data(state.utf8).write(to: sidecar)
         let log = directory.appendingPathComponent("mutations.jsonl")
         let handle = try FileHandle(forWritingTo: log)
@@ -57,7 +57,7 @@ struct CheckpointStoreTests {
         try await store.removeMutation(sequence: 1, workspaceId: id)
         let page = try await store.listMutations(workspaceId: id, afterSequence: 0)
         #expect(page.records.isEmpty)
-        #expect(page.retractionEpoch == (legacySidecar ? 1 : 4))
+        #expect(page.retractionEpoch == 4)
         let next = try await FileCheckpointStore(rootDirectory: root).appendMutation(Self.sampleMutation(workspaceID: id, path: "/next"))
         #expect(next.sequence == 8)
     }
@@ -200,19 +200,34 @@ struct CheckpointStoreTests {
         }
     }
 
-    @Test
-    func `unsupported store versions are rejected`() async throws {
-        let root = try TestSupport.temporaryDirectory("StoreVersion")
+    @Test(arguments: [nil, "{}", "not JSON", #"{"version":1}"#,
+                      #"{"format":"other","version":1}"#,
+                      #"{"format":"workspace-history","version":0}"#,
+                      #"{"format":"workspace-history","version":2}"#] as [String?])
+    func `invalid store markers require deleting the history directory`(marker: String?) async throws {
+        let root = try TestSupport.temporaryDirectory("StoreFormat")
         defer { TestSupport.remove(root) }
         let workspaceID = UUID()
         let directory = root.appendingPathComponent(workspaceID.uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try Data("{\"version\":999}".utf8).write(to: directory.appendingPathComponent("format.json"))
+        let format = directory.appendingPathComponent("format.json")
+        if let marker { try Data(marker.utf8).write(to: format) }
 
         let store = FileCheckpointStore(rootDirectory: root)
-        await #expect(throws: WorkspaceError.self) {
-            _ = try await store.listMutations(workspaceId: workspaceID)
+        // Neither opening for writes nor reading may silently initialize an existing directory.
+        for writing in [false, true] {
+            do {
+                if writing { try await store.prepare(workspaceId: workspaceID) }
+                else { _ = try await store.listMutations(workspaceId: workspaceID) }
+                Issue.record("invalid store marker was accepted")
+            } catch let error as WorkspaceError {
+                guard case let .storageCorrupted(message) = error else { throw error }
+                #expect(message.contains("delete the history directory"))
+                #expect(message.contains(directory.path))
+            }
         }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == (marker == nil ? [] : ["format.json"]))
+        if let marker { #expect(try String(contentsOf: format, encoding: .utf8) == marker) }
     }
 
     private static func sampleSnapshot() -> Snapshot {

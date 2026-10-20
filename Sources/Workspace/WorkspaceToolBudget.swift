@@ -1,7 +1,7 @@
 import Foundation
 
-/// Adapter envelopes retain the original ChangeSet/EditResult keys. Statistics
-/// cover the whole selected operation; the nested ChangeSet describes this page.
+/// Adapter statistics cover the whole selected operation; the nested ChangeSet
+/// describes this page.
 struct ToolChangesOutput: Encodable {
     var changes = ChangeSet()
     var statistics: ChangeSet.Statistics

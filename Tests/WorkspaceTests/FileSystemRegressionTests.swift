@@ -175,16 +175,6 @@ struct FileSystemRegressionTests {
     }
 
     @Test
-    func `FileInfo decodes older metadata without identity or link count`() throws {
-        let legacy = Data(#"{"path":"/file","kind":"file","size":4,"permissions":{"rawValue":420}}"#.utf8)
-        let info = try JSONDecoder().decode(FileInfo.self, from: legacy)
-        #expect(info.path == "/file")
-        #expect(info.size == 4)
-        #expect(info.identity == nil)
-        #expect(info.linkCount == nil)
-    }
-
-    @Test
     func `preexisting disk hard links charge every path and replacement breaks sharing`() async throws {
         let root = try TestSupport.temporaryDirectory("LimitedDiskAliases")
         defer { TestSupport.remove(root) }

@@ -18,7 +18,6 @@ final class CoarseFileSystem: FileSystem, FileSystemChangeSource, Sendable {
     }
     func signal(_ s: FileSystemChangeSignal) { continuation.yield(s) }
     func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> { stream }
-    func changes() async throws -> AsyncStream<Void> { unscopedChanges(stream) }
     func coarse(_ info: FileInfo) -> FileInfo {
         var i = info
         i.identity = mode == .coarse ? nil : FileIdentity(device: 1, inode: info.path == "/a" ? 1 : 2)
@@ -315,7 +314,6 @@ final class FailingSignalFS: FileSystem, FileSystemChangeSource, @unchecked Send
     func failNext() { lock.withLock { fail = true } }
     func signal(_ s: FileSystemChangeSignal) { continuation.yield(s) }
     func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> { stream }
-    func changes() async throws -> AsyncStream<Void> { unscopedChanges(stream) }
     func stat(path: WorkspacePath) async throws -> FileInfo {
         if lock.withLock({ let f = fail; fail = false; return f }) { throw TestFileSystemError.injected }
         return try await base.stat(path: path)

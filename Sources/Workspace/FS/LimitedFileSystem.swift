@@ -732,7 +732,7 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
 }
 
 // Prefer backend-owned resolution so physical parents and absolute targets retain their
-// backend meaning, including through decorators. Older backends use the heuristic below.
+// backend meaning, including through decorators. Backends without this capability use the heuristic below.
 struct FileSystemPathResolver: Sendable {
     private let base: any FileSystem
 
@@ -811,10 +811,6 @@ struct FileSystemPathResolver: Sendable {
 
 extension LimitedFileSystem: CompleteFileSystemChangeSource {
     package var changeSignalsAreComplete: Bool { get async { await base.changeSignalsAreComplete } }
-    public func changes() async throws -> AsyncStream<Void> {
-        unscopedChanges(try await changeSignals())
-    }
-
     public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
         guard let source = base as? any FileSystemChangeSource else {
             throw WorkspaceError.unsupported("filesystem change notifications are not supported")

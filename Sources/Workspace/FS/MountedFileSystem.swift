@@ -513,10 +513,6 @@ extension MountedFileSystem: CompleteFileSystemChangeSource {
             return true
         }
     }
-    public func changes() async throws -> AsyncStream<Void> {
-        unscopedChanges(try await changeSignals())
-    }
-
     public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
         let id = UUID()
         let (topology, updates) = AsyncStream<[Mount]>.makeStream(bufferingPolicy: .bufferingNewest(1))

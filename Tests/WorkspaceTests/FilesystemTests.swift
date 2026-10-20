@@ -971,7 +971,7 @@ struct FilesystemTests {
         let root = try FilesystemTestSupport.makeTempDirectory(prefix: "SandboxURL")
         defer { FilesystemTestSupport.removeDirectory(root) }
 
-        let filesystem = try SandboxFilesystem(root: .url(root))
+        let filesystem = try SandboxFileSystem(root: .url(root))
 
         try await filesystem.writeFile(path: "/note.txt", data: FilesystemTestSupport.data("hello"), append: false)
         try await filesystem.createDirectory(path: "/dir", recursive: true)
@@ -995,18 +995,18 @@ struct FilesystemTests {
 
     @Test(.tags(.sandbox))
     func `sandbox filesystem supports standard roots configuration and app-group validation`() async throws {
-        let temporary = try SandboxFilesystem(root: .temporary)
+        let temporary = try SandboxFileSystem(root: .temporary)
         #expect(await temporary.exists(path: "/"))
 
         #if os(macOS)
-        let documents = try SandboxFilesystem(root: .documents)
-        let caches = try SandboxFilesystem(root: .caches)
+        let documents = try SandboxFileSystem(root: .documents)
+        let caches = try SandboxFileSystem(root: .caches)
         #expect(await documents.exists(path: "/"))
         #expect(await caches.exists(path: "/"))
         #endif
 
         do {
-            _ = try SandboxFilesystem(root: .appGroup("invalid-group"))
+            _ = try SandboxFileSystem(root: .appGroup("invalid-group"))
             Issue.record("expected invalid app group identifier rejection")
         } catch let error as WorkspaceError {
             #expect(error.description.contains("invalid app group identifier"))
@@ -1014,7 +1014,7 @@ struct FilesystemTests {
 
         #if canImport(Darwin)
         do {
-            _ = try SandboxFilesystem(
+            _ = try SandboxFileSystem(
                 root: .appGroup("group.workspace.tests.missing"),
                 fileManager: NilAppGroupFileManager()
             )
@@ -1024,7 +1024,7 @@ struct FilesystemTests {
         }
         #else
         do {
-            _ = try SandboxFilesystem(root: .appGroup("group.workspace.tests.missing"))
+            _ = try SandboxFileSystem(root: .appGroup("group.workspace.tests.missing"))
             Issue.record("expected unavailable app group rejection")
         } catch let error as WorkspaceError {
             #expect(error.description.contains("app group container unavailable"))
@@ -1037,7 +1037,7 @@ struct FilesystemTests {
         let secondRoot = try FilesystemTestSupport.makeTempDirectory(prefix: "SandboxSecond")
         defer { FilesystemTestSupport.removeDirectory(secondRoot) }
 
-        let filesystem = try SandboxFilesystem(root: .url(firstRoot))
+        let filesystem = try SandboxFileSystem(root: .url(firstRoot))
         try await filesystem.writeFile(path: "/configured.txt", data: FilesystemTestSupport.data("configured"), append: false)
 
         #expect(FileManager.default.fileExists(atPath: firstRoot.appendingPathComponent("configured.txt").path))
@@ -1082,7 +1082,7 @@ struct FilesystemTests {
         let secondRoot = try FilesystemTestSupport.makeTempDirectory(prefix: "SecurityScopedSecond")
         defer { FilesystemTestSupport.removeDirectory(secondRoot) }
 
-        let filesystem = try SecurityScopedFilesystem(url: firstRoot, mode: .readWrite)
+        let filesystem = try SecurityScopedFileSystem(url: firstRoot, mode: .readWrite)
 
         try await filesystem.writeFile(path: "/note.txt", data: FilesystemTestSupport.data("hello"), append: false)
         try await filesystem.createDirectory(path: "/dir", recursive: true)
@@ -1109,7 +1109,7 @@ struct FilesystemTests {
         try await filesystem.writeFile(path: "/fresh.txt", data: FilesystemTestSupport.data("fresh"), append: false)
         #expect(FileManager.default.fileExists(atPath: secondRoot.appendingPathComponent("fresh.txt").path))
 
-        let readOnly = try SecurityScopedFilesystem(url: secondRoot, mode: .readOnly)
+        let readOnly = try SecurityScopedFileSystem(url: secondRoot, mode: .readOnly)
         #expect(try await readOnly.readFile(path: "/fresh.txt") == FilesystemTestSupport.data("fresh"))
 
         do {
@@ -1128,7 +1128,7 @@ struct FilesystemTests {
         let store = UserDefaultsBookmarkStore(suiteName: suiteName, keyPrefix: "workspace.tests.")
 
         do {
-            _ = try await SecurityScopedFilesystem.loadBookmark(id: "missing", store: store)
+            _ = try await SecurityScopedFileSystem.loadBookmark(id: "missing", store: store)
             Issue.record("expected missing bookmark rejection")
         } catch let error as WorkspaceError {
             #expect(error.description.contains("bookmark not found"))
@@ -1144,7 +1144,7 @@ struct FilesystemTests {
         try await store.saveBookmark(FilesystemTestSupport.data("not-a-bookmark"), for: "invalid")
 
         do {
-            _ = try await SecurityScopedFilesystem.loadBookmark(id: "invalid", store: store)
+            _ = try await SecurityScopedFileSystem.loadBookmark(id: "invalid", store: store)
             Issue.record("expected invalid bookmark rejection")
         } catch let error as NSError {
             #expect(error.domain == NSCocoaErrorDomain)
@@ -1161,7 +1161,7 @@ struct FilesystemTests {
         let suiteName = FilesystemTestSupport.uniqueSuiteName()
         defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
 
-        let filesystem = try SecurityScopedFilesystem(url: root, mode: .readWrite)
+        let filesystem = try SecurityScopedFileSystem(url: root, mode: .readWrite)
         let store = UserDefaultsBookmarkStore(suiteName: suiteName, keyPrefix: "workspace.tests.")
 
         do {

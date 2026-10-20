@@ -4,68 +4,6 @@ import Testing
 
 @Suite("Checkpoint tree format")
 struct CheckpointFormatTests {
-    // This fixture was emitted by the original v1 FileCheckpointStore, including
-    // its mutation log and sequence sidecar. It is deliberately not re-encoded here.
-    @Test func `v1 fixture remains readable compactable and appendable with a v2 writer fence`() async throws {
-        let directory = try TestSupport.temporaryDirectory("LegacyStore")
-        defer { TestSupport.remove(directory) }
-        let source = try #require(Bundle.module.url(forResource: "v1", withExtension: nil, subdirectory: "Fixtures"))
-        let root = directory.appendingPathComponent("store")
-        try FileManager.default.copyItem(at: source, to: root)
-        let id = UUID(uuidString: "10000000-0000-0000-0000-000000000001")!
-        let store = FileCheckpointStore(rootDirectory: root)
-        let old = try await store.listCheckpoints(workspaceId: id)
-        #expect(old.count == 2)
-        let legacyFile = try await store.resolveSnapshotFile(id: old[1].snapshotId, workspaceId: id, path: "/link")
-        #expect(legacyFile.path == "/nested/deep/file")
-        #expect(try await store.readSnapshotFile(id: old[1].snapshotId, workspaceId: id, path: legacyFile.path, offset: 0, length: nil) == Data("nested legacy\n".utf8))
-
-        #expect(try await store.readSnapshotFile(id: old[0].snapshotId, workspaceId: id, path: "/note", offset: 0, length: nil) == Data("legacy checkpoint\n".utf8))
-        #expect(try await store.readSnapshotFile(id: old[1].snapshotId, workspaceId: id, path: "/note", offset: 0, length: nil) == Data("legacy updated\n".utf8))
-        let dry = try await store.compact(workspaceId: id, retaining: .latest(1, preservingLabeled: false), dryRun: true)
-        let compacted = try await store.compact(workspaceId: id, retaining: .latest(1, preservingLabeled: false), dryRun: false)
-        #expect(dry.report.after == compacted.report.after)
-        #expect(compacted.checkpoints.first?.parentID == nil)
-        // Legacy nil directory permissions mean defaultDirectory, not a modification.
-        let legacyURL = root.appendingPathComponent(id.uuidString).appendingPathComponent("snapshots/\(old[1].snapshotId).json")
-        var legacyJSON = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: legacyURL)) as? [String: Any])
-        var legacyRoot = try #require(legacyJSON["root"] as? [String: Any])
-        legacyRoot.removeValue(forKey: "permissions")
-        legacyJSON["root"] = legacyRoot
-        try JSONSerialization.data(withJSONObject: legacyJSON).write(to: legacyURL)
-        let restored = InMemoryFileSystem()
-        let legacySnapshot = try #require(await store.loadSnapshot(id: old[1].snapshotId, workspaceId: id))
-        try await Snapshot.restore(legacySnapshot, to: restored)
-        let unchanged = try await store.captureRevision(from: restored, draft: draft(id, parent: old[1].id))
-        #expect(unchanged.summary.changedPathCount == 0)
-
-        let next = try await store.saveRevision(snapshot(count: 4), draft: draft(id, parent: old[1].id))
-        #expect(next.mutationCursor == 2)
-        let mutation = try await store.appendMutation(Mutation(sequence: 0, workspaceID: id, operation: .edit, changes: ChangeSet()))
-        #expect(mutation.sequence == 3)
-        let reopened = FileCheckpointStore(rootDirectory: root)
-        #expect(try await reopened.readSnapshotFile(id: old[1].snapshotId, workspaceId: id, path: "/note", offset: 0, length: nil) == Data("legacy updated\n".utf8))
-        #expect(try await reopened.loadSnapshot(id: next.snapshotId, workspaceId: id)?.entry == snapshot(count: 4).entry)
-        let format = root.appendingPathComponent(id.uuidString).appendingPathComponent("format.json")
-        // The v1 writer's actual admission rule: refuse any version other than 1,
-        // before creating or changing checkpoint/mutation artifacts.
-        struct V1Format: Decodable { var version: Int }
-        func v1WriterAdmission() throws {
-            let value = try JSONDecoder().decode(V1Format.self, from: Data(contentsOf: format))
-            guard value.version == 1 else { throw WorkspaceError.storageCorrupted("unsupported store format version \(value.version)") }
-        }
-        #expect(throws: WorkspaceError.self) { try v1WriterAdmission() }
-        let newManifest = root.appendingPathComponent(id.uuidString).appendingPathComponent("snapshots/\(next.snapshotId).json")
-        #expect(throws: DecodingError.self) {
-            _ = try JSONDecoder().decode(V1SnapshotManifest.self, from: Data(contentsOf: newManifest))
-        }
-        // The copied legacy decoder also succeeds on the real legacy fixture.
-        let oldManifest = root.appendingPathComponent(id.uuidString).appendingPathComponent("snapshots/\(old[1].snapshotId).json")
-        #expect(try JSONDecoder().decode(V1SnapshotManifest.self, from: Data(contentsOf: oldManifest)).version == 2)
-
-        #expect(try await reopened.listMutations(workspaceId: id).map(\.sequence) == [1, 2, 3])
-    }
-
     @Test func `one changed leaf writes only its ancestor trees and reopens correctly`() async throws {
         let root = try TestSupport.temporaryDirectory("TreeReuse")
         let files = try TestSupport.temporaryDirectory("TreeReuseFiles")
@@ -98,7 +36,7 @@ struct CheckpointFormatTests {
         // is still reported by operations that need the complete snapshot.
         let manifestURL = root.appendingPathComponent(id.uuidString).appendingPathComponent("snapshots/\(third.snapshotId.uuidString).json")
         let manifest = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
-        let rootNode = try #require(manifest["treeRoot"] as? [String: Any])
+        let rootNode = try #require(manifest["root"] as? [String: Any])
         let rootHash = try #require(rootNode["treeHash"] as? String)
         let children = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: trees.appendingPathComponent(rootHash))) as? [[String: Any]])
         let unrelated = try #require(children.first { ($0["name"] as? String) == "dir11" })
@@ -198,14 +136,14 @@ struct CheckpointFormatTests {
         try Data(oldIndex.replacingOccurrences(of: oldID, with: newID).utf8).write(to: packs.appendingPathComponent(newID + ".json"))
         let manifestURL = directory.appendingPathComponent("snapshots/\(second.snapshotId.uuidString).json")
         var manifest = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
-        var node = try #require(manifest["treeRoot"] as? [String: Any])
+        var node = try #require(manifest["root"] as? [String: Any])
         let treeID = try #require(node["treeHash"] as? String)
         let oldTree = try String(contentsOf: directory.appendingPathComponent("trees/" + treeID), encoding: .utf8)
         let newTree = Data(oldTree.replacingOccurrences(of: oldID, with: newID).utf8)
         let newTreeID = SHA256.hexDigest(of: newTree)
         try newTree.write(to: directory.appendingPathComponent("trees/" + newTreeID))
         node["treeHash"] = newTreeID
-        manifest["treeRoot"] = node
+        manifest["root"] = node
         try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
         let reopened = FileCheckpointStore(rootDirectory: root)
         let dry = try await reopened.compact(workspaceId: id, retaining: .all, dryRun: true)
@@ -253,7 +191,7 @@ struct CheckpointFormatTests {
         #expect(try await reader.loadSnapshot(id: recovered.snapshotId, workspaceId: id)?.entry == snapshot(count: 100).entry)
     }
 
-    @Test func `name trees deduplicate relocated subtrees and reject invalid names`() async throws {
+    @Test func `name trees deduplicate relocated subtrees and reject invalid entries`() async throws {
         let root = try TestSupport.temporaryDirectory("RelativeTrees")
         defer { TestSupport.remove(root) }
         let id = UUID()
@@ -288,16 +226,20 @@ struct CheckpointFormatTests {
             let path = WorkspacePath(normalizing: "/\(name)/deep/file")
             #expect(try await store.readSnapshotFile(id: checkpoint.snapshotId, workspaceId: id, path: path, offset: 0, length: nil) == Data("same".utf8))
         }
-        // Independent malformed tree objects: each hash is valid, only the name is invalid.
+        // Each object has a valid hash but an invalid name or child kind.
         let manifestURL = directory.appendingPathComponent("snapshots/\(second.snapshotId).json")
         var manifest = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
-        var node = try #require(manifest["treeRoot"] as? [String: Any])
-        for name in ["", ".", "..", "a/b", "a/\u{301}b", "a\0b"] {
-            let bytes = try JSONSerialization.data(withJSONObject: [["name": name, "kind": "directory"]])
+        var node = try #require(manifest["root"] as? [String: Any])
+        let invalidEntries = ["", ".", "..", "a/b", "a/\u{301}b", "a\0b"].map { ($0, "directory") }
+            + [("absent", "missing")]
+        for (name, kind) in invalidEntries {
+            let bytes = try JSONSerialization.data(withJSONObject: [[
+                "name": name, "kind": kind, "permissions": ["rawValue": 493]
+            ]])
             let hash = SHA256.hexDigest(of: bytes)
             try bytes.write(to: trees.appendingPathComponent(hash))
             node["treeHash"] = hash
-            manifest["treeRoot"] = node
+            manifest["root"] = node
             try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
             await #expect(throws: WorkspaceError.self) {
                 _ = try await store.snapshotEntry(id: second.snapshotId, workspaceId: id, path: .root, includeChildren: true)
@@ -451,7 +393,7 @@ struct CheckpointFormatTests {
             ])))
         }
         let store = FileCheckpointStore(rootDirectory: root)
-        // Independent saved roots exercise persistence without the legacy snapshot
+        // Independent saved roots exercise persistence without the materialized snapshot
         // diff's String-keyed map, which is fixed by the separate security track.
         let first = try await store.saveRevision(snapshot(Data([0, 2])), draft: draft(id))
         let second = try await store.saveRevision(snapshot(Data([0, 2])), draft: draft(id))
@@ -559,31 +501,6 @@ struct CheckpointFormatTests {
     }
     private func draft(_ id: UUID, parent: UUID? = nil) -> CheckpointDraft {
         CheckpointDraft(workspaceID: id, label: nil, preferredParentID: parent, origin: .manual)
-    }
-
-    // Verbatim cad29c4 manifest types; only the outer type name differs.
-    private struct V1SnapshotManifest: Codable, Sendable {
-        struct Node: Codable, Sendable {
-            enum Kind: String, Codable {
-                case file, directory, symlink, missing
-            }
-
-            var kind: Kind
-            var path: WorkspacePath
-            var permissions: POSIXPermissions?
-            var contentHash: String?
-            var contentSize: UInt64? = nil
-            var modificationDate: Date? = nil
-            var symlinkTarget: String?
-            var children: [Node]?
-        }
-
-        var version: Int
-        var id: UUID
-        var rootPath: WorkspacePath
-        var root: Node
-        // Older manifests and materialized snapshots have no trustworthy capture timestamp.
-        var captureStartedAt: Date? = nil
     }
 
 }

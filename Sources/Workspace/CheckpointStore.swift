@@ -441,9 +441,7 @@ actor FileCheckpointStore: CheckpointStore {
         }
     }
 
-    /// Schemas 1/2 inline the recursive tree and reference loose blobs. Schema 3
-    /// stores a small root, content-addressed directory references, and optional pack ranges.
-    /// The outer store format is version 2, fencing writers that only understand inline trees.
+    /// A small root with content-addressed directory references and optional pack ranges.
     struct SnapshotManifest: Codable, Sendable {
         struct Node: Codable, Sendable, Equatable {
             enum Kind: String, Codable {
@@ -452,13 +450,12 @@ actor FileCheckpointStore: CheckpointStore {
 
             var kind: Kind
             var path: WorkspacePath
-            var permissions: POSIXPermissions?
+            var permissions: POSIXPermissions = .defaultFile
             var contentHash: String?
             var contentSize: UInt64? = nil
             var modificationDate: Date? = nil
             var identity: FileIdentity? = nil
             var symlinkTarget: String?
-            var children: [Node]?
             var treeHash: String? = nil
             var packed: PackedBlob? = nil
 
@@ -468,59 +465,23 @@ actor FileCheckpointStore: CheckpointStore {
                 lhs.contentSize == rhs.contentSize && lhs.modificationDate == rhs.modificationDate &&
                 FileIdentity.matchesForMetadataReuse(lhs.identity, rhs.identity) &&
                 lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init) &&
-                lhs.children == rhs.children && lhs.treeHash == rhs.treeHash && lhs.packed == rhs.packed
+                lhs.treeHash == rhs.treeHash && lhs.packed == rhs.packed
             }
         }
 
-        var version: Int
         var id: UUID
         var rootPath: WorkspacePath
         var root: Node
-        // Older manifests and materialized snapshots have no trustworthy capture timestamp.
+        // Materialized snapshots have no trustworthy capture timestamp.
         var captureStartedAt: Date? = nil
-        var exactContentTimestamps: Bool? = nil
-
-        private enum CodingKeys: String, CodingKey {
-            case version, id, rootPath, root, treeRoot, captureStartedAt, exactContentTimestamps
-        }
-
-        init(version: Int, id: UUID, rootPath: WorkspacePath, root: Node, captureStartedAt: Date? = nil, exactContentTimestamps: Bool? = nil) {
-            self.version = version
-            self.id = id
-            self.rootPath = rootPath
-            self.root = root
-            self.captureStartedAt = captureStartedAt
-            self.exactContentTimestamps = exactContentTimestamps
-        }
-
-        init(from decoder: any Decoder) throws {
-            let values = try decoder.container(keyedBy: CodingKeys.self)
-            version = try values.decode(Int.self, forKey: .version)
-            id = try values.decode(UUID.self, forKey: .id)
-            rootPath = try values.decode(WorkspacePath.self, forKey: .rootPath)
-            root = try values.decode(Node.self, forKey: version >= 3 ? .treeRoot : .root)
-            captureStartedAt = try values.decodeIfPresent(Date.self, forKey: .captureStartedAt)
-            exactContentTimestamps = try values.decodeIfPresent(Bool.self, forKey: .exactContentTimestamps)
-        }
-
-        func encode(to encoder: any Encoder) throws {
-            var values = encoder.container(keyedBy: CodingKeys.self)
-            try values.encode(version, forKey: .version)
-            try values.encode(id, forKey: .id)
-            try values.encode(rootPath, forKey: .rootPath)
-            // Deliberately omit v1's required root key: even an already-admitted
-            // legacy operation must fail decoding before it can sweep live blobs.
-            try values.encode(root, forKey: version >= 3 ? .treeRoot : .root)
-            try values.encodeIfPresent(captureStartedAt, forKey: .captureStartedAt)
-            try values.encodeIfPresent(exactContentTimestamps, forKey: .exactContentTimestamps)
-        }
+        var exactContentTimestamps: Bool = false
     }
 
     /// Names are validated before entering the cache; no absolute paths are persisted.
     private struct TreeEntry: Codable, Sendable, Equatable {
         var name: String
         var kind: SnapshotManifest.Node.Kind
-        var permissions: POSIXPermissions?
+        var permissions: POSIXPermissions
         var contentHash: String?
         var contentSize: UInt64?
         var modificationDate: Date?
@@ -532,6 +493,9 @@ actor FileCheckpointStore: CheckpointStore {
         init(_ node: SnapshotManifest.Node, name: String? = nil) throws {
             self.init(metadataOf: node, name: name ?? node.path.name)
             try Self.validate(self.name)
+            guard kind != .missing else {
+                throw WorkspaceError.storageCorrupted("missing entries cannot be stored in a directory tree")
+            }
         }
 
         /// Prior leaf metadata can also represent a file at the snapshot root.
@@ -615,7 +579,6 @@ actor FileCheckpointStore: CheckpointStore {
             } else {
                 parentManifest = nil
             }
-            try self.requireCurrentFormatUnlocked(workspaceId: draft.workspaceID)
             let batch = try self.makeBlobBatch(workspaceId: draft.workspaceID)
             defer { batch.close() }
             batch.summarizeInsertions = parentManifest == nil
@@ -630,7 +593,7 @@ actor FileCheckpointStore: CheckpointStore {
             )
             try self.finish(batch, workspaceId: draft.workspaceID)
             let manifest = SnapshotManifest(
-                version: 3, id: snapshotID, rootPath: .root, root: root, captureStartedAt: captureStartedAt,
+                id: snapshotID, rootPath: .root, root: root, captureStartedAt: captureStartedAt,
                 exactContentTimestamps: await filesystem.supportsExactContentTimestamps
             )
             let summary: ChangeSet.Summary
@@ -658,13 +621,11 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     private func writeSnapshotUnlocked(_ snapshot: Snapshot, workspaceId: UUID, reusing previous: SnapshotManifest.Node?) throws {
-        try requireCurrentFormatUnlocked(workspaceId: workspaceId)
         let batch = try makeBlobBatch(workspaceId: workspaceId)
         defer { batch.close() }
         let root = try writeManifestNode(snapshot.entry, workspaceId: workspaceId, batch: batch, reusing: previous)
         try finish(batch, workspaceId: workspaceId)
         let manifest = SnapshotManifest(
-            version: 3,
             id: snapshot.id,
             rootPath: snapshot.rootPath,
             root: root
@@ -676,21 +637,19 @@ actor FileCheckpointStore: CheckpointStore {
         let url = snapshotURL(id: id, workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         let manifest = try decoder.decode(SnapshotManifest.self, from: Data(contentsOf: url))
-        guard (1...3).contains(manifest.version), manifest.id == id else {
+        guard manifest.id == id else {
             throw WorkspaceError.storageCorrupted("snapshot manifest id does not match \(id)")
         }
         return manifest
     }
 
-    /// A frame keeps cached name-only entries intact. Only a requested old child
-    /// becomes a Node; legacy recursive manifests retain their embedded children.
+    /// A frame keeps cached name-only entries intact. Only a requested child becomes a Node.
     private struct CaptureDirectory {
         var path: WorkspacePath
         var name: String
         var childOffset: Int
         var previous: SnapshotManifest.Node?
         var previousEntries: [TreeEntry]
-        var legacyChildren: [SnapshotManifest.Node]?
         var children: [TreeEntry] = []
 
         func previousEntry(named name: String) -> TreeEntry? {
@@ -700,7 +659,7 @@ actor FileCheckpointStore: CheckpointStore {
 
         func previousNode(named name: String, at path: WorkspacePath) -> SnapshotManifest.Node? {
             guard let index = TreeEntry.index(of: name, in: previousEntries) else { return nil }
-            return legacyChildren?[index] ?? previousEntries[index].node(at: path)
+            return previousEntries[index].node(at: path)
         }
     }
 
@@ -783,23 +742,11 @@ actor FileCheckpointStore: CheckpointStore {
         reusing previous: SnapshotManifest.Node?, at path: WorkspacePath, name: String, workspaceId: UUID
     ) throws -> CaptureDirectory {
         let entries: [TreeEntry]
-        let legacy: [SnapshotManifest.Node]?
         if let previous, previous.kind == .directory {
-            if let hash = previous.treeHash {
-                entries = try treeEntries(hash: hash, workspaceId: workspaceId, capturing: true)
-                legacy = nil
-            } else {
-                legacy = (previous.children ?? []).sorted { PathName($0.path.name) < PathName($1.path.name) }
-                entries = try legacy!.map { try TreeEntry($0) }
-                for index in entries.indices.dropFirst() {
-                    guard PathName(entries[index - 1].name) < PathName(entries[index].name) else {
-                        throw WorkspaceError.storageCorrupted("snapshot directory \(path) contains duplicate child \(entries[index].name)")
-                    }
-                }
-            }
-        } else { entries = []; legacy = nil }
+            entries = try treeEntries(hash: directoryHash(previous), workspaceId: workspaceId, capturing: true)
+        } else { entries = [] }
         return CaptureDirectory(path: path, name: name, childOffset: path.isRoot ? 1 : path.string.utf8.count + 1,
-                                previous: previous, previousEntries: entries, legacyChildren: legacy)
+                                previous: previous, previousEntries: entries)
     }
 
     private func finishCaptureDirectory(
@@ -871,8 +818,7 @@ actor FileCheckpointStore: CheckpointStore {
                modificationDate.addingTimeInterval(2) < previousCaptureStartedAt,
                previous?.kind == .file,
                previous?.contentSize == info.size,
-               (previous?.identity == nil || info.identity == nil
-                    || FileIdentity.matchesForMetadataReuse(previous?.identity, info.identity)),
+               FileIdentity.matchesForMetadataReuse(previous?.identity, info.identity),
                previous?.modificationDate != nil,
                previous?.modificationDate == info.modificationDate,
                let hash = previous?.contentHash,
@@ -969,28 +915,31 @@ actor FileCheckpointStore: CheckpointStore {
         case .missing:
             return .missing(path: node.path)
         case .file:
-            guard let hash = node.contentHash, Self.isValidContentHash(hash) else {
+            guard let hash = node.contentHash, Self.isValidContentHash(hash), let size = node.contentSize else {
                 throw WorkspaceError.storageCorrupted("snapshot file node \(node.path) has an invalid content hash")
             }
             return .file(
                 path: node.path,
-                size: node.contentSize ?? 0,
-                permissions: node.permissions ?? .defaultFile,
+                size: size,
+                permissions: node.permissions,
                 contentID: hash
             )
         case .directory:
             return .directory(
                 path: node.path,
-                permissions: node.permissions ?? .defaultDirectory,
+                permissions: node.permissions,
                 children: depth == 0 ? [] : try children(of: node, workspaceId: workspaceId, capturing: capturing).map {
                     try revisionEntry(from: $0, workspaceId: workspaceId, depth: depth.map { $0 - 1 }, capturing: capturing)
                 }
             )
         case .symlink:
+            guard let target = node.symlinkTarget else {
+                throw WorkspaceError.storageCorrupted("symlink \(node.path) has no target")
+            }
             return .symbolicLink(
                 path: node.path,
-                target: node.symlinkTarget ?? "",
-                permissions: node.permissions ?? POSIXPermissions(0o777)
+                target: target,
+                permissions: node.permissions
             )
         }
     }
@@ -1001,17 +950,10 @@ actor FileCheckpointStore: CheckpointStore {
         let prefix = root.path.components
         var node = root
         for component in components.dropFirst(prefix.count) {
-            let name = PathName(component)
             guard node.kind == .directory else { return nil }
-            if let hash = node.treeHash {
-                let entries = try treeEntries(hash: hash, workspaceId: workspaceId)
-                guard let index = TreeEntry.index(of: component, in: entries) else { return nil }
-                node = entries[index].node(in: node.path)
-            } else {
-                // Legacy manifests already contain absolute child nodes.
-                guard let child = node.children?.first(where: { PathName($0.path.name) == name }) else { return nil }
-                node = child
-            }
+            let entries = try treeEntries(hash: directoryHash(node), workspaceId: workspaceId)
+            guard let index = TreeEntry.index(of: component, in: entries) else { return nil }
+            node = entries[index].node(in: node.path)
         }
         return node
     }
@@ -1063,8 +1005,8 @@ actor FileCheckpointStore: CheckpointStore {
                 return reused
             }
             return try persistDirectory(SnapshotManifest.Node(
-                kind: .directory, path: directory.path, permissions: directory.permissions, children: entries
-            ), workspaceId: workspaceId)
+                kind: .directory, path: directory.path, permissions: directory.permissions
+            ), children: entries, workspaceId: workspaceId)
         }
     }
 
@@ -1084,23 +1026,26 @@ actor FileCheckpointStore: CheckpointStore {
                 Snapshot.File(
                     path: node.path,
                     data: try materializedBlob(node, workspaceId: workspaceId, cache: cache),
-                    permissions: node.permissions ?? POSIXPermissions(0o644),
+                    permissions: node.permissions,
                     contentID: hash
                 )
             )
         case .symlink:
+            guard let target = node.symlinkTarget else {
+                throw WorkspaceError.storageCorrupted("symlink \(node.path) has no target")
+            }
             return .symlink(
                 Snapshot.Symlink(
                     path: node.path,
-                    target: node.symlinkTarget ?? "",
-                    permissions: node.permissions ?? POSIXPermissions(0o777)
+                    target: target,
+                    permissions: node.permissions
                 )
             )
         case .directory:
             return .directory(
                 Snapshot.Directory(
                     path: node.path,
-                    permissions: node.permissions ?? POSIXPermissions(0o755),
+                    permissions: node.permissions,
                     children: try children(of: node, workspaceId: workspaceId).map {
                         try snapshotEntry(from: $0, workspaceId: workspaceId, cache: cache)
                     }
@@ -1293,7 +1238,6 @@ actor FileCheckpointStore: CheckpointStore {
                 let root = try relocating(manifest.root, blobs: relocated, workspaceId: workspaceId)
                 if root != manifest.root {
                     manifest.root = root
-                    manifest.version = 3
                     try write(manifest, to: snapshotURL(id: id, workspaceId: workspaceId), durability: .publication)
                 }
                 try collectArtifacts(from: manifest.root, workspaceId: workspaceId, blobs: &retainedBlobHashes,
@@ -1525,8 +1469,7 @@ actor FileCheckpointStore: CheckpointStore {
             let old = try children(of: node, workspaceId: workspaceId)
             let new = try old.map { try relocating($0, blobs: blobs, workspaceId: workspaceId) }
             if old != new {
-                result.children = new
-                result = try persistDirectory(result, workspaceId: workspaceId, syncParent: true)
+                result = try persistDirectory(result, children: new, workspaceId: workspaceId, syncParent: true)
             }
         }
         return result
@@ -1780,34 +1723,21 @@ actor FileCheckpointStore: CheckpointStore {
     func ensureWorkspaceDirectories(for workspaceId: UUID) async throws {
         try ensureDirectory(rootDirectory)
         try await withExclusiveLock(at: formatLockURL(workspaceId: workspaceId)) {
-            let version = try ensureWorkspaceDirectoriesLocked(for: workspaceId)
-            if version == 1 {
-                try await withExclusiveLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
-                    try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
-                        try upgradeFormatUnlocked(workspaceId: workspaceId)
-                    }
-                }
-            }
+            try ensureWorkspaceDirectoriesLocked(for: workspaceId)
         }
     }
 
-    private func ensureWorkspaceDirectoriesLocked(for workspaceId: UUID) throws -> Int {
+    private func ensureWorkspaceDirectoriesLocked(for workspaceId: UUID) throws {
         let workspaceURL = workspaceDirectoryURL(workspaceId: workspaceId)
         let existed = fileManager.fileExists(atPath: workspaceURL.path)
-        try ensureDirectory(workspaceURL)
-        let formatURL = workspaceURL.appendingPathComponent("format.json")
-        let version: Int
-        if fileManager.fileExists(atPath: formatURL.path) {
-            version = try validateWorkspaceFormatLocked(workspaceId)
+        if existed {
+            try validateWorkspaceFormatLocked(workspaceId)
         } else {
-            if existed,
-               !(try fileManager.contentsOfDirectory(at: workspaceURL, includingPropertiesForKeys: nil)).isEmpty
-            {
-                throw WorkspaceError.storageCorrupted("workspace store has no format version")
-            }
-            try Self.durableWrite(encoder.encode(StoreFormat(version: StoreFormat.currentVersion)), to: formatURL)
-            version = StoreFormat.currentVersion
+            try ensureDirectory(workspaceURL)
+            try Self.durableWrite(encoder.encode(StoreFormat()),
+                                  to: workspaceURL.appendingPathComponent("format.json"))
         }
+        // A prior initialization may have stopped after publishing the marker.
         let newObjects = !fileManager.fileExists(atPath: treesDirectoryURL(workspaceId: workspaceId).path)
         try ensureDirectory(checkpointsDirectoryURL(workspaceId: workspaceId))
         try ensureDirectory(snapshotsDirectoryURL(workspaceId: workspaceId))
@@ -1819,28 +1749,24 @@ actor FileCheckpointStore: CheckpointStore {
             try Self.syncDirectory(rootDirectory)
             try Self.syncDirectory(rootDirectory.deletingLastPathComponent())
         }
-        return version
     }
 
     func validateWorkspaceFormatIfPresent(_ workspaceId: UUID) async throws {
         let workspaceURL = workspaceDirectoryURL(workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: workspaceURL.path) else { return }
-        try await withExclusiveLock(at: formatLockURL(workspaceId: workspaceId)) {
-            _ = try validateWorkspaceFormatLocked(workspaceId)
+        try await withSharedLock(at: formatLockURL(workspaceId: workspaceId)) {
+            try validateWorkspaceFormatLocked(workspaceId)
         }
     }
 
-    private func validateWorkspaceFormatLocked(_ workspaceId: UUID) throws -> Int {
+    private func validateWorkspaceFormatLocked(_ workspaceId: UUID) throws {
         let workspaceURL = workspaceDirectoryURL(workspaceId: workspaceId)
         let formatURL = workspaceURL.appendingPathComponent("format.json")
-        guard fileManager.fileExists(atPath: formatURL.path) else {
-            throw WorkspaceError.storageCorrupted("workspace store has no format version")
+        let data = fileManager.fileExists(atPath: formatURL.path) ? try Data(contentsOf: formatURL) : nil
+        guard let data, let format = try? decoder.decode(StoreFormat.self, from: data),
+              format == StoreFormat() else {
+            throw WorkspaceError.storageCorrupted("unsupported or missing format marker; delete the history directory at \(workspaceURL.path)")
         }
-        let format = try decoder.decode(StoreFormat.self, from: Data(contentsOf: formatURL))
-        guard (1...StoreFormat.currentVersion).contains(format.version) else {
-            throw WorkspaceError.storageCorrupted("unsupported store format version \(format.version)")
-        }
-        return format.version
     }
 
     func workspaceDirectoryURL(workspaceId: UUID) -> URL {
@@ -1887,17 +1813,12 @@ actor FileCheckpointStore: CheckpointStore {
         }
     }
 
-    /// Reads legacy bare-Int sidecars as epoch zero. Must hold the mutations lock.
+    /// Must hold the mutations lock.
     private func readMutationSequenceState(workspaceId: UUID) throws -> MutationSequenceState {
         let url = mutationSequenceURL(workspaceId: workspaceId)
         guard fileManager.fileExists(atPath: url.path) else { return MutationSequenceState() }
         let data = try Data(contentsOf: url)
-        let state: MutationSequenceState
-        if let legacy = try? decoder.decode(Int.self, from: data) {
-            state = MutationSequenceState(highWaterMark: legacy)
-        } else {
-            state = try decoder.decode(MutationSequenceState.self, from: data)
-        }
+        let state = try decoder.decode(MutationSequenceState.self, from: data)
         guard state.highWaterMark >= 0, state.retractionEpoch >= 0 else {
             throw WorkspaceError.storageCorrupted("negative mutation sequence or retraction epoch")
         }
@@ -1934,6 +1855,7 @@ actor FileCheckpointStore: CheckpointStore {
         workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("lifecycle.lock", isDirectory: false)
     }
 
+    /// Serializes first-time directory and marker publication across processes.
     private func formatLockURL(workspaceId: UUID) -> URL {
         rootDirectory.appendingPathComponent(".\(workspaceId.uuidString).format.lock", isDirectory: false)
     }
@@ -1958,11 +1880,9 @@ actor FileCheckpointStore: CheckpointStore {
         var message: String
     }
 
-    private struct StoreFormat: Codable {
-        // Existing v1 manifests and sequence sidecars remain readable. The v2 writer
-        // fence is published before new directory objects or packs (see README).
-        static let currentVersion = 2
-        var version: Int
+    private struct StoreFormat: Codable, Equatable {
+        var format = "workspace-history"
+        var version = 1
     }
 
     // One combined estimated-decoded budget per store, split between nodes and write catalog.
@@ -2136,8 +2056,15 @@ actor FileCheckpointStore: CheckpointStore {
 
     func children(of node: SnapshotManifest.Node, workspaceId: UUID, capturing: Bool = false) throws -> [SnapshotManifest.Node] {
         guard node.kind == .directory else { return [] }
-        guard let hash = node.treeHash else { return (node.children ?? []).sorted { PathName($0.path.name) < PathName($1.path.name) } }
+        let hash = try directoryHash(node)
         return try treeEntries(hash: hash, workspaceId: workspaceId, capturing: capturing).map { $0.node(in: node.path) }
+    }
+
+    private func directoryHash(_ node: SnapshotManifest.Node) throws -> String {
+        guard let hash = node.treeHash else {
+            throw WorkspaceError.storageCorrupted("directory \(node.path) has no tree hash")
+        }
+        return hash
     }
 
     private func treeEntries(hash: String, workspaceId: UUID, capturing: Bool = false) throws -> [TreeEntry] {
@@ -2154,6 +2081,9 @@ actor FileCheckpointStore: CheckpointStore {
             var previous: PathName?
             for entry in entries {
                 try TreeEntry.validate(entry.name)
+                guard entry.kind != .missing else {
+                    throw WorkspaceError.storageCorrupted("missing entries cannot be stored in a directory tree")
+                }
                 guard previous.map({ $0 < PathName(entry.name) }) ?? true else {
                     throw WorkspaceError.storageCorrupted("unsorted or duplicate tree child")
                 }
@@ -2165,9 +2095,9 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func persistDirectory(
-        _ node: SnapshotManifest.Node, workspaceId: UUID, syncParent: Bool = false
+        _ node: SnapshotManifest.Node, children: [SnapshotManifest.Node], workspaceId: UUID, syncParent: Bool = false
     ) throws -> SnapshotManifest.Node {
-        let entries = try (node.children ?? []).sorted {
+        let entries = try children.sorted {
             PathName($0.path.name) < PathName($1.path.name)
         }.map { try TreeEntry($0) }
         return try persistDirectory(node, entries: entries, workspaceId: workspaceId, syncParent: syncParent)
@@ -2185,7 +2115,6 @@ actor FileCheckpointStore: CheckpointStore {
         }
         cacheTree(entries, hash: hash, workspaceId: workspaceId, capturing: capturing)
         var reference = node
-        reference.children = nil
         reference.treeHash = hash
         return reference
     }
@@ -2202,7 +2131,10 @@ actor FileCheckpointStore: CheckpointStore {
             return (packsDirectoryURL(workspaceId: workspaceId).appendingPathComponent(packed.pack + ".pack"), packed.offset, packed.size)
         }
         let url = blobURL(hash: hash, workspaceId: workspaceId)
-        return (url, 0, try node.contentSize ?? fileSize(at: url))
+        guard let size = node.contentSize else {
+            throw WorkspaceError.storageCorrupted("file \(node.path) has no content size")
+        }
+        return (url, 0, size)
     }
 
     private func blobExists(_ node: SnapshotManifest.Node, workspaceId: UUID, batch: BlobBatch) -> Bool {
@@ -2295,7 +2227,7 @@ actor FileCheckpointStore: CheckpointStore {
                 guard let node = try manifestNode(at: current, in: manifest.root, workspaceId: workspaceId) else { return nil }
                 if node.kind == .file {
                     return .file(path: current, size: try blobLocation(node, workspaceId: workspaceId).size,
-                                 permissions: node.permissions ?? .defaultFile, contentID: node.contentHash ?? "")
+                                 permissions: node.permissions, contentID: node.contentHash ?? "")
                 }
                 return try revisionEntry(from: node, workspaceId: workspaceId, depth: 0)
             }
@@ -2335,7 +2267,7 @@ actor FileCheckpointStore: CheckpointStore {
     func compareNodes(_ old: SnapshotManifest.Node, _ new: SnapshotManifest.Node, workspaceId: UUID, capturing: Bool = false) async throws -> ChangeSet {
         if old == new { return ChangeSet(changes: []) }
         if old.kind == .directory, new.kind == .directory {
-            var changes: [FileChange] = (old.permissions ?? .defaultDirectory) == (new.permissions ?? .defaultDirectory) ? [] : [.init(path: new.path, kind: .directory, effect: .modified)]
+            var changes: [FileChange] = (old.permissions) == (new.permissions) ? [] : [.init(path: new.path, kind: .directory, effect: .modified)]
             var omissions: [TextDiffOmission] = []
             if old.treeHash != nil, old.treeHash == new.treeHash { return ChangeSet(changes: changes) }
             let before = Dictionary(uniqueKeysWithValues: try children(of: old, workspaceId: workspaceId, capturing: capturing).map { (PathName($0.path.name), $0) })
@@ -2364,26 +2296,6 @@ actor FileCheckpointStore: CheckpointStore {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
         }
         return try readBlob(node, workspaceId: workspaceId)
-    }
-
-    func requireCurrentFormatUnlocked(workspaceId: UUID) throws {
-        let url = workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("format.json")
-        guard try read(StoreFormat.self, from: url).version == StoreFormat.currentVersion else {
-            throw WorkspaceError.storageCorrupted("store format changed after preparation")
-        }
-    }
-
-    /// v1 manifests remain readable. Publish the writer fence before any v2 objects.
-    /// Migration runs under format -> lifecycle -> mutation locks, in that order.
-    private func upgradeFormatUnlocked(workspaceId: UUID) throws {
-        let url = workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("format.json")
-        let format = try read(StoreFormat.self, from: url)
-        guard (1...StoreFormat.currentVersion).contains(format.version) else {
-            throw WorkspaceError.storageCorrupted("unsupported store format version \(format.version)")
-        }
-        if format.version < StoreFormat.currentVersion {
-            try Self.durableWrite(encoder.encode(StoreFormat(version: StoreFormat.currentVersion)), to: url)
-        }
     }
 
     private nonisolated static func durableWrite(

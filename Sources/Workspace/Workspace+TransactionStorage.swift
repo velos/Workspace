@@ -33,7 +33,7 @@ extension Workspace {
 
     func storedTransactionTree(_ checkpoint: Checkpoint, in store: any CheckpointStore) async throws -> TransactionTree {
         if usesMemoryPersistence,
-           let snapshot = try await store.loadSnapshot(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceId) {
+           let snapshot = try await store.loadSnapshot(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceID) {
             var nodes: [WorkspacePath: MergeNode] = [:]
             Self.flattenMergeNodes(snapshot.entry, into: &nodes)
             var tree = TransactionTree(nodes: nodes, load: { _ in throw WorkspaceError.readOnly })
@@ -42,7 +42,7 @@ extension Workspace {
         }
         return try await TransactionRevisionGate.shared.withLock {
             let content = TransactionRevisionContent(checkpoint: checkpoint, store: store)
-            guard let index = try await store.loadRevisionIndex(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceId) else {
+            guard let index = try await store.loadRevisionIndex(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceID) else {
                 throw WorkspaceError.revisionDataNotFound(checkpoint.snapshotId)
             }
             var tree = TransactionTree(index: index, load: { try await content.read($0) })

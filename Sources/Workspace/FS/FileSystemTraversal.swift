@@ -16,8 +16,8 @@ import Glibc
 /// when the replacement link points inside the root. Very deep local subtrees fall
 /// back to ordinary per-path operations with a root identity check at the handoff.
 ///
-/// This optional package capability keeps custom backends source-compatible and lets
-/// authorization decorators retain per-entry checks through the per-path fallback.
+/// This optional package capability accelerates traversal while authorization
+/// decorators retain per-entry checks through per-path operations.
 package protocol TraversingFileSystem: FileSystem {
     /// Forwarders return false when their base needs the per-path fallback.
     var supportsScopedWalk: Bool { get }

@@ -181,20 +181,11 @@ Compaction rebases retained checkpoints to their nearest retained ancestor and r
 
 Directory-backed stores serialize checkpoint commits, revision reads, and compaction with a persistent lifecycle lock. Mutation history is independent and is not pruned by checkpoint retention.
 
-New directory stores use format version 2. Preparing an existing v1 store upgrades
-`format.json` under the format, lifecycle, and mutation locks before publishing any new-format
-checkpoint. Existing recursive manifests and loose blobs remain readable; migration does not
-rewrite checkpoint history. The first new checkpoint over a v1 parent creates its directory
-objects; historical v1 reads keep their original full-manifest decoding cost. New v1 operations
-reject the v2 format marker. Schema-3 roots use the required `treeRoot` key instead of legacy
-`root`, so an old operation admitted before migration fails decoding a new root: it cannot read
-it as an empty tree, capture against it, or sweep its blobs during compaction. An admitted old
-operation that only accesses legacy roots (or appends mutations) can still complete; migration
-cannot cancel old code already running. Stop old processes before upgrading to avoid mixed-version
-operation failures.
-Do not downgrade the format marker.
+Directory stores use the marker `{"format":"workspace-history","version":1}` in `format.json`.
+An existing store directory must have that marker; a missing, malformed, or unsupported marker is an error instructing the
+caller to delete the history directory. Store creation is serialized across instances and processes.
 
-New snapshots use manifest schema 3: a small snapshot root points to SHA-256-addressed directory
+A small snapshot root points to SHA-256-addressed directory
 objects in `trees/`. Each object contains byte-sorted immediate child names (never absolute paths), with child directories
 referenced by hash. An incremental capture writes only changed directories and their ancestors;
 unchanged objects remain shared. File reads decode only directories on the requested path.
@@ -228,20 +219,20 @@ that honors these synchronization requests. If `F_FULLFSYNC` fails other than in
 publication retains the completed file and directory `fsync`; power-loss protection is best-effort
 on such volumes. Other POSIX platforms use file and directory `fsync`.
 Failed captures can leave unreachable objects, but publish no checkpoint referencing incomplete content. Compaction
-sweeps both formats, rewrites partially live packs, durably replaces affected snapshot roots,
+sweeps unreachable objects, rewrites partially live packs, durably replaces affected snapshot roots,
 and only then removes old objects. Interrupted compaction can be resumed; dry-run blob counts
 and byte totals include reclaimable pack entries and incomplete orphan packs.
 
 All writers preserve the mutation sequence high-water mark and retraction epoch in
-`mutations.sequence.json`; legacy bare-integer sidecars remain readable. Retractions and failed
+`mutations.sequence.json`. Retractions and failed
 append reservations can leave sequence gaps. History refreshes invalidate cached records when
 another instance retracts or prunes mutations.
 
 Directory-backed checkpoint capture also reuses existing CAS blobs when a file's size and available
 modification timestamp are unchanged and the timestamp is more than two seconds older than the
 previous capture's start. Entries within that timestamp-granularity window are rehashed. It still
-walks directory metadata for correctness. Filesystems without modification timestamps, and older
-manifests without a capture timestamp, safely fall back to reading those files.
+walks directory metadata for correctness. Filesystems without modification timestamps and
+materialized snapshots without capture hints require content reads.
 
 For tools that preserve older timestamps while changing content, pass
 `checkpointCapture: .verifyContents` to `Workspace` to read and hash every file at each checkpoint.
@@ -251,7 +242,7 @@ network filesystems whose clock may differ. This policy affects only `.directory
 
 ## Transactions
 
-Transactions replace separate branch and merge APIs:
+Begin an isolated transaction:
 
 ```swift
 let transaction = try await workspace.beginTransaction(label: "agent draft")
@@ -315,7 +306,7 @@ file during directory checkpoint capture.
 Checkpoint-to-current diffs and `restore(to:)` use one bulk metadata walk and compare against the
 checkpoint's persisted capture hints and revision hashes. They read only suspect files (changed
 metadata, missing hints, or timestamps inside the same two-second window). Identity is compared
-when both captures provide it; exact-timestamp backends skip the window. Older revisions without
+when both captures provide it; exact-timestamp backends skip the window. Revisions without
 capture hints conservatively require content reads. Memory persistence retains hints for only the
 four most recently captured or restored revisions; older revisions also fall back to content reads.
 As with transactions, writes that preserve
@@ -350,7 +341,7 @@ let mutations = try await workspace.history()
 Change events, returned edit results, and mutation history all carry the same `ChangeSet` representation. Checkpoint events share the same stream.
 
 `LocalFileSystem` also pushes out-of-band filesystem invalidations through FSEvents on macOS and
-inotify on Linux. `events()` and the path-focused `watchChanges(at:recursive:)` turn those
+inotify on Linux. `events(_:)`, with an optional path filter, turns those
 invalidations into structured `ChangeSet` values. External changes remain unrecorded in mutation
 history, matching the direct-filesystem contract above. Directory-backed checkpoint stores use the
 same push model for cross-instance checkpoint events; there is no periodic polling loop.
@@ -598,12 +589,6 @@ Apply always completes the full atomic edit operation before bounding its respon
 an apply call to retrieve omitted detail. Use `workspace_read` to inspect omitted files, or create
 a checkpoint before applying and diff from it. If response encoding fails after commit, apply
 returns a minimal success envelope with empty `changes`, full statistics, and `truncated: true`.
-
-Beta compatibility: glob tool results now use an object instead of a bare array. Apply and diff
-retain their existing keys and add budget/paging metadata; large results can contain less detail.
-Direct Workspace method signatures are unchanged. Public adapter budget constants and
-`TextDiffOmission.Reason.outputBudgetExceeded` are additive; exhaustive switches on the reason
-must handle the new case.
 
 ## Testing
 

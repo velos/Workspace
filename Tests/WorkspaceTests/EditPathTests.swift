@@ -177,7 +177,7 @@ struct EditPathTests {
         try await fs.createDirectory(path: "/dir", recursive: true)
         try await fs.createSymlink(path: "/alias", target: "dir")
         let workspace = Workspace(fileSystem: fs)
-        let events = await workspace.watchChanges()
+        let events = await workspace.events(.init(path: .root, includeCheckpoints: false))
         let changes = try await workspace.writeText("/alias/new", "new")
         #expect(changes.touchedPaths == ["/dir/new"])
         #expect(await nextEditEvent(in: events) == .changes(changes))

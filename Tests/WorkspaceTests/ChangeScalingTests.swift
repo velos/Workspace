@@ -250,7 +250,6 @@ final class SignallingFileSystem: FileSystemChangeSource, ExactTimestampFileSyst
         if let source { return try await source.changeSignals() }
         return stream
     }
-    func changes() async throws -> AsyncStream<Void> { unscopedChanges(stream) }
     func stat(path: WorkspacePath) async throws -> FileInfo { try await base.stat(path: path) }
     func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] { try await base.listDirectory(path: path) }
     func readFile(path: WorkspacePath) async throws -> Data { try await base.readFile(path: path) }

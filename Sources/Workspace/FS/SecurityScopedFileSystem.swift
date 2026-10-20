@@ -297,14 +297,8 @@ public final class SecurityScopedFileSystem: FileSystem, TraversingFileSystem, P
     #endif
 }
 
-typealias SecurityScopedFilesystem = SecurityScopedFileSystem
-
 extension SecurityScopedFileSystem: CompleteFileSystemChangeSource {
     package var changeSignalsAreComplete: Bool { get async { await (backing as any FileSystem).changeSignalsAreComplete } }
-    public func changes() async throws -> AsyncStream<Void> {
-        unscopedChanges(try await changeSignals())
-    }
-
     public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
         guard let source = (backing as any FileSystem) as? any FileSystemChangeSource else {
             throw WorkspaceError.unsupported("filesystem change notifications are not supported")

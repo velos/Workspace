@@ -228,7 +228,7 @@ struct UnicodePathRegressionTests {
     func recursiveEventsIncludeUnicodeDescendants() async throws {
         let workspace = Workspace()
         try await workspace.createDirectory("/d")
-        let stream = await workspace.watchChanges(at: "/d")
+        let stream = await workspace.events(.init(path: "/d", includeCheckpoints: false))
         let expected = try await workspace.writeText("/d/\u{301}x", "first")
         // A second matching event makes an omitted first event observable without
         // timing assumptions or an indefinitely suspended iterator on the baseline.

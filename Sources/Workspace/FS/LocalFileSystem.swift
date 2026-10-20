@@ -1095,12 +1095,6 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
 
 #if os(macOS)
 extension LocalFileSystem: FileSystemChangeSource {
-    /// See ``FileSystemChangeSource/changes()``.
-    public func changes() async throws -> AsyncStream<Void> {
-        let root = try requireConfiguration().rootURL
-        return try FSEventsChangeStream.observe(root)
-    }
-
     public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
         let configuration = try requireConfiguration()
         return try FSEventsChangeStream.observeSignals(configuration.rootURL, resolvedRootPath: configuration.resolvedRootPath)
@@ -1273,11 +1267,6 @@ enum FSEventsChangeStream {
 }
 #elseif os(Linux)
 extension LocalFileSystem: FileSystemChangeSource {
-    /// See ``FileSystemChangeSource/changes()``.
-    public func changes() async throws -> AsyncStream<Void> {
-        try DirectoryChangeStream.observe(requireConfiguration().rootURL, recursive: true)
-    }
-
     public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
         try DirectoryChangeStream.observeSignals(requireConfiguration().rootURL, recursive: true)
     }

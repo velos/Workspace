@@ -65,7 +65,7 @@ extension Workspace {
             try await ensureLoaded()
             try await reconcileCheckpointsWithStore()
             let checkpoint = try checkpointOrThrow(id: id)
-            return try await loadSnapshotOrThrow(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceId)
+            return try await loadSnapshotOrThrow(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceID)
         }
     }
 
@@ -103,7 +103,7 @@ extension Workspace {
         case let .checkpoint(id):
             let access = try await checkpointAccess(id)
             guard let index = try await store.loadRevisionIndex(
-                id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceId
+                id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceID
             ) else { throw WorkspaceError.revisionDataNotFound(access.checkpoint.snapshotId) }
             return ResolvedRevision(index: index, readRange: access.readRange)
         }
@@ -140,7 +140,7 @@ extension Workspace {
         case let .checkpoint(id):
             let access = try await checkpointAccess(id)
             let file = try await store.resolveSnapshotFile(
-                id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceId, path: path
+                id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceID, path: path
             )
             return ResolvedReadableFile(size: file.size, readRange: { offset, length in
                 try await access.readRange(file.path, offset, length)
@@ -160,7 +160,7 @@ extension Workspace {
         let store = store
         return CheckpointAccess(checkpoint: checkpoint, readRange: { path, offset, length in
             guard let data = try await store.readSnapshotFile(
-                id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceId,
+                id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceID,
                 path: path, offset: offset, length: length
             ) else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)) }
             return data
@@ -170,7 +170,7 @@ extension Workspace {
     private func checkpointEntry(_ id: UUID, at path: WorkspacePath, includeChildren: Bool) async throws -> RevisionIndex.Entry? {
         let access = try await checkpointAccess(id)
         return try await store.snapshotEntry(
-            id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceId,
+            id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceID,
             path: path, includeChildren: includeChildren
         )
     }

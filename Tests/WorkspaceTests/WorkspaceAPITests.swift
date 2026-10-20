@@ -16,12 +16,12 @@ struct WorkspaceAPITests {
     }
 
     @Test
-    func `external local filesystem mutations reach watchChanges without entering history`() async throws {
+    func `external local filesystem mutations reach events without entering history`() async throws {
         let root = try TestSupport.temporaryDirectory("ExternalEvents")
         defer { TestSupport.remove(root) }
         let files = try LocalFileSystem(root: root)
         let workspace = Workspace(fileSystem: files)
-        let stream = await workspace.watchChanges()
+        let stream = await workspace.events(.init(path: .root, includeCheckpoints: false))
 
         try await files.writeFile(path: "/external.txt", data: Data("outside".utf8), append: false)
 
@@ -38,7 +38,7 @@ struct WorkspaceAPITests {
         let root = try TestSupport.temporaryDirectory("EventDeduplication")
         defer { TestSupport.remove(root) }
         let workspace = Workspace(fileSystem: try LocalFileSystem(root: root))
-        let stream = await workspace.watchChanges()
+        let stream = await workspace.events(.init(path: .root, includeCheckpoints: false))
 
         let expected = try await workspace.writeText("/note", "once")
 

@@ -79,7 +79,7 @@ struct ReviewRevisionTests {
         let checkpoint = try await ws.createCheckpoint()
         // Simulate a newer revision arriving through the store without re-seeding this instance.
         _ = try await ws.store.saveRevision(Snapshot.capture(from: fs.base), draft: .init(
-            workspaceID: checkpoint.workspaceId, label: nil, preferredParentID: checkpoint.id, origin: .manual))
+            workspaceID: checkpoint.workspaceID, label: nil, preferredParentID: checkpoint.id, origin: .manual))
         let reads = await fs.reads.count
         _ = try await ws.compact(retaining: .latest(1, preservingLabeled: false), dryRun: true)
         try await ws.beginTransaction().discard()

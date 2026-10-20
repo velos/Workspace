@@ -536,10 +536,6 @@ extension AuthorizedFileSystem: CompleteFileSystemChangeSource {
     /// Signals for paths the authorizer hides are dropped, and decisions can change over time, so
     /// consumers must not treat this stream as complete coverage of the base.
     package var changeSignalsAreComplete: Bool { get async { false } }
-    public func changes() async throws -> AsyncStream<Void> {
-        unscopedChanges(try await changeSignals())
-    }
-
     public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
         guard let source = base as? any FileSystemChangeSource else {
             throw WorkspaceError.unsupported("filesystem change notifications are not supported")

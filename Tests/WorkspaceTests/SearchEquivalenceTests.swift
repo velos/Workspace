@@ -82,7 +82,7 @@ struct SearchEquivalenceTests {
     }
 
     // Frozen pre-optimization algorithm from cad29c4. This intentionally uses
-    // independent line Strings and Foundation matching as the compatibility oracle,
+    // independent line Strings and Foundation matching as the reference implementation,
     // including pagination, byte budgets, skipped files and context serialization.
     static func referenceSearch(_ request: SearchRequest, on fileSystem: any FileSystem) async throws -> SearchResult {
         guard request.contextLines >= 0, request.limits.maxFiles >= 0,
