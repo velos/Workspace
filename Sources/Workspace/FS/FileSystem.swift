@@ -112,9 +112,9 @@ public struct FileInfo: Sendable, Codable {
 }
 
 /// Opaque identity of a filesystem entry, shared by aliases across backend instances.
-/// Device and inode values must distinguish different entries across instances and remain
-/// stable during an entry's lifetime; replacements receive a new identity. Independent
-/// in-memory backends need distinct device tokens; disk backends can use st_dev and st_ino.
+/// Device and inode values must distinguish live entries across backend instances;
+/// replacements receive a new identity. Device numbers may change across remounts.
+/// Independent in-memory backends need distinct device tokens; disk backends can use st_dev and st_ino.
 public struct FileIdentity: Hashable, Sendable, Codable {
     private let device: UInt64
     private let inode: UInt64
@@ -122,6 +122,14 @@ public struct FileIdentity: Hashable, Sendable, Codable {
     public init(device: UInt64, inode: UInt64) {
         self.device = device
         self.inode = inode
+    }
+
+    /// Only for persisted/cached metadata comparisons, never live alias detection.
+    /// Equal inodes with different devices may reflect a remount: identity is then
+    /// unknown, leaving size, mtime and the racy window to decide content reuse.
+    /// Missing identities compare equal only to each other here.
+    static func matchesForMetadataReuse(_ lhs: Self?, _ rhs: Self?) -> Bool {
+        lhs?.inode == rhs?.inode
     }
 }
 

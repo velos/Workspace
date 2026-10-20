@@ -465,7 +465,8 @@ actor FileCheckpointStore: CheckpointStore {
             static func == (lhs: Self, rhs: Self) -> Bool {
                 lhs.kind == rhs.kind && lhs.path == rhs.path &&
                 lhs.permissions == rhs.permissions && lhs.contentHash == rhs.contentHash &&
-                lhs.contentSize == rhs.contentSize && lhs.modificationDate == rhs.modificationDate && lhs.identity == rhs.identity &&
+                lhs.contentSize == rhs.contentSize && lhs.modificationDate == rhs.modificationDate &&
+                FileIdentity.matchesForMetadataReuse(lhs.identity, rhs.identity) &&
                 lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init) &&
                 lhs.children == rhs.children && lhs.treeHash == rhs.treeHash && lhs.packed == rhs.packed
             }
@@ -568,7 +569,8 @@ actor FileCheckpointStore: CheckpointStore {
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.name.utf8.elementsEqual(rhs.name.utf8) && lhs.kind == rhs.kind &&
                 lhs.permissions == rhs.permissions && lhs.contentHash == rhs.contentHash &&
-                lhs.contentSize == rhs.contentSize && lhs.modificationDate == rhs.modificationDate && lhs.identity == rhs.identity &&
+                lhs.contentSize == rhs.contentSize && lhs.modificationDate == rhs.modificationDate &&
+                FileIdentity.matchesForMetadataReuse(lhs.identity, rhs.identity) &&
                 lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init) &&
                 lhs.treeHash == rhs.treeHash && lhs.packed == rhs.packed
         }
@@ -869,7 +871,8 @@ actor FileCheckpointStore: CheckpointStore {
                modificationDate.addingTimeInterval(2) < previousCaptureStartedAt,
                previous?.kind == .file,
                previous?.contentSize == info.size,
-               (previous?.identity == nil || info.identity == nil || previous?.identity == info.identity),
+               (previous?.identity == nil || info.identity == nil
+                    || FileIdentity.matchesForMetadataReuse(previous?.identity, info.identity)),
                previous?.modificationDate != nil,
                previous?.modificationDate == info.modificationDate,
                let hash = previous?.contentHash,

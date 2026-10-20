@@ -9,7 +9,8 @@ struct MetadataIndex: Sendable {
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.info.kind == rhs.info.kind && lhs.info.size == rhs.info.size
                 && lhs.info.modificationDate == rhs.info.modificationDate
-                && lhs.info.identity == rhs.info.identity && lhs.info.permissions == rhs.info.permissions
+                && FileIdentity.matchesForMetadataReuse(lhs.info.identity, rhs.info.identity)
+                && lhs.info.permissions == rhs.info.permissions
                 && lhs.target.map(PathName.init) == rhs.target.map(PathName.init)
         }
 
@@ -17,7 +18,8 @@ struct MetadataIndex: Sendable {
             info.kind == .file && old.info.kind == .file
                 && old.info.modificationDate.map { exactTimestamps || $0.addingTimeInterval(2) < capturedAt } == true
                 && info.size == old.info.size && info.modificationDate == old.info.modificationDate
-                && (info.identity == nil || old.info.identity == nil || info.identity == old.info.identity)
+                && (info.identity == nil || old.info.identity == nil
+                    || FileIdentity.matchesForMetadataReuse(info.identity, old.info.identity))
         }
     }
     var entries: [WorkspacePath: Entry] = [:]
