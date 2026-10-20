@@ -168,7 +168,8 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
                             } else { unknown = true }
                         }
                     } else { reconcile = true; unknown = true }
-                    if isDirectory && structural {
+                    // A directory can become watchable after a permission change.
+                    if isDirectory && (structural || event.mask & UInt32(IN_ATTRIB) != 0) {
                         reconcile = true
                     }
                     if event.mask & UInt32(IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF) != 0 {
@@ -234,6 +235,11 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
             let watch = path.withCString { inotify_add_watch(descriptor, $0, mask) }
             if watch < 0 {
                 let code = errno
+                // Resource exhaustion means coverage is incomplete, even if the root
+                // watch succeeded. End observation so accounting falls back to walks.
+                if code == ENOSPC || code == EMFILE || code == ENFILE || code == ENOMEM {
+                    throw POSIXError(.init(rawValue: code) ?? .EIO)
+                }
                 if path.utf8.elementsEqual(directory.path.utf8), requireRoot || (code != ENOENT && code != ENOTDIR) {
                     throw POSIXError(.init(rawValue: code) ?? .EIO)
                 }
@@ -256,6 +262,9 @@ private final class LinuxDirectoryObservation: @unchecked Sendable {
             // The parent may grant traversal without read access (for example 0711).
             // Its watch improves root-recreation coverage but cannot disable a valid root.
             if watch >= 0 { parentWatch = watch }
+            else if errno == ENOSPC || errno == EMFILE || errno == ENFILE || errno == ENOMEM {
+                throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            }
         }
     }
 }

@@ -1185,6 +1185,7 @@ enum FSEventsChangeStream {
     private final class Observation: @unchecked Sendable {
         private let stream: FSEventStreamRef
         private let box: Unmanaged<Box>
+        private let queue = DispatchQueue(label: "Workspace.FSEvents", qos: .utility)
 
         init(root: URL, resolvedRootPath: String, continuation: AsyncStream<FileSystemChangeSignal>.Continuation) throws {
             box = .passRetained(Box(continuation, resolvedRootPath: resolvedRootPath))
@@ -1220,20 +1221,27 @@ enum FSEventsChangeStream {
                 throw WorkspaceError.unsupported("could not create an FSEvents stream")
             }
             self.stream = stream
-            FSEventStreamSetDispatchQueue(stream, .global(qos: .utility))
+            FSEventStreamSetDispatchQueue(stream, queue)
             guard FSEventStreamStart(stream) else {
-                FSEventStreamInvalidate(stream)
-                FSEventStreamRelease(stream)
-                box.release()
+                queue.sync {
+                    FSEventStreamInvalidate(stream)
+                    FSEventStreamRelease(stream)
+                    box.release()
+                }
                 throw WorkspaceError.unsupported("could not start an FSEvents stream")
             }
         }
 
         func cancel() {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            box.release()
+            // The context is unretained during callbacks. Release it only after all
+            // callbacks on this serial queue finish, including when cancellation is
+            // triggered by the consumer while a callback is yielding an event.
+            queue.async { [self] in
+                FSEventStreamStop(stream)
+                FSEventStreamInvalidate(stream)
+                FSEventStreamRelease(stream)
+                box.release()
+            }
         }
     }
 
