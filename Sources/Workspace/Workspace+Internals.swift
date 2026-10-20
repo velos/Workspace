@@ -89,29 +89,6 @@ extension Workspace {
         return snapshot
     }
 
-    func persistCheckpoint(
-        snapshot: Snapshot,
-        label: String?,
-        parentCheckpointId: UUID?,
-        origin: Checkpoint.Origin
-    ) async throws -> Checkpoint {
-        let checkpoint = try await store.saveRevision(
-            snapshot,
-            draft: CheckpointDraft(
-                workspaceID: workspaceId,
-                label: label,
-                preferredParentID: parentCheckpointId,
-                origin: origin
-            )
-        )
-        checkpoints.removeAll { $0.id == checkpoint.id }
-        checkpoints.append(checkpoint)
-        checkpoints.sort(by: checkpointSort)
-        headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
-        emitWorkspaceEvent(.checkpoint(checkpoint))
-        return checkpoint
-    }
-
     @discardableResult
     func appendMutation(operation: Mutation.Operation, changes: ChangeSet) async throws -> Mutation? {
         guard recording != .off else { return nil }
@@ -123,17 +100,6 @@ extension Workspace {
             historyRefreshSequence = persisted.sequence
         }
         return persisted
-    }
-
-    func persistMutationCheckpoint(
-        snapshot: Snapshot, label: String?, origin: Checkpoint.Origin,
-        operation: Mutation.Operation, changes: ChangeSet
-    ) async throws -> Checkpoint {
-        try await withMutationCheckpoint(operation: operation, changes: changes) {
-            try await persistCheckpoint(
-                snapshot: snapshot, label: label, parentCheckpointId: headCheckpointId, origin: origin
-            )
-        }
     }
 
     // If checkpoint persistence fails after the history append, retract exactly

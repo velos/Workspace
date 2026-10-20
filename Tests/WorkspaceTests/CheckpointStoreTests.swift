@@ -200,6 +200,58 @@ struct CheckpointStoreTests {
         }
     }
 
+    @Test(arguments: ["empty directory", "temporary marker", "completed marker"])
+    func `interrupted first open leaves only recoverable staging`(crashPoint: String) async throws {
+        let root = try TestSupport.temporaryDirectory("StoreFirstOpen")
+        defer { TestSupport.remove(root) }
+        let id = UUID()
+        let staging = root.appendingPathComponent(".\(id.uuidString).pending", isDirectory: true)
+        let published = root.appendingPathComponent(id.uuidString, isDirectory: true)
+        // Another workspace may be initializing under its own lock.
+        let otherStaging = root.appendingPathComponent(".\(UUID().uuidString).pending", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherStaging, withIntermediateDirectories: false)
+        let interrupted = FileCheckpointStore(rootDirectory: root,
+            fileManager: FirstOpenCrashManager(staging: staging, crashPoint: crashPoint))
+        await #expect(throws: TestFileSystemError.self) { try await interrupted.prepare(workspaceId: id) }
+        #expect(!FileManager.default.fileExists(atPath: published.path))
+        #expect(FileManager.default.fileExists(atPath: staging.path))
+        if crashPoint == "completed marker" {
+            #expect(FileManager.default.fileExists(atPath: staging.appendingPathComponent("format.json").path))
+        }
+
+        let recovered = FileCheckpointStore(rootDirectory: root)
+        let snapshot = Self.sampleSnapshot()
+        let checkpoint = try await recovered.saveRevision(snapshot, draft: Self.sampleDraft(workspaceID: id))
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(FileManager.default.fileExists(atPath: otherStaging.path))
+        let reopened = FileCheckpointStore(rootDirectory: root)
+        #expect(try await reopened.loadSnapshot(id: checkpoint.snapshotId, workspaceId: id) == snapshot)
+    }
+
+    private final class FirstOpenCrashManager: FileManager, @unchecked Sendable {
+        let staging: URL
+        let crashPoint: String
+        init(staging: URL, crashPoint: String) {
+            self.staging = staging
+            self.crashPoint = crashPoint
+            super.init()
+        }
+        override func createDirectory(at url: URL, withIntermediateDirectories createIntermediates: Bool,
+                                      attributes: [FileAttributeKey: Any]? = nil) throws {
+            try super.createDirectory(at: url, withIntermediateDirectories: createIntermediates, attributes: attributes)
+            if url == staging, crashPoint != "completed marker" {
+                if crashPoint == "temporary marker" {
+                    try Data("{partial".utf8).write(to: url.appendingPathComponent(".pending-\(UUID().uuidString)-format.json"))
+                }
+                throw TestFileSystemError.injected
+            }
+        }
+        override func moveItem(at source: URL, to destination: URL) throws {
+            if source == staging { throw TestFileSystemError.injected }
+            try super.moveItem(at: source, to: destination)
+        }
+    }
+
     @Test(arguments: [nil, "{}", "not JSON", #"{"version":1}"#,
                       #"{"format":"other","version":1}"#,
                       #"{"format":"workspace-history","version":0}"#,

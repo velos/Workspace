@@ -38,8 +38,6 @@ struct CheckpointCaptureTraversalTests {
         try await unicode.createFile(path: unicodeRoot.appending("cafe\u{301}"), data: Data([2]))
         let source: any FileSystem = inMemory ? local :
             MountedFileSystem(base: local, mounts: [.init(mountPoint: "/unicode", fileSystem: unicode)])
-        let bulk = CaptureSource(source, scoped: true)
-        let paths = CaptureSource(source, scoped: false)
         let id = UUID()
         let roots = [container.appendingPathComponent("bulk"), container.appendingPathComponent("paths")]
         let stores = roots.map { FileCheckpointStore(rootDirectory: $0, checkpointCapture: policy) }
@@ -60,8 +58,20 @@ struct CheckpointCaptureTraversalTests {
                 try await local.remove(path: "/alias", recursive: false)
                 try await local.createSymlink(path: "/alias", target: "missing")
             }
-            bulk.reset()
-            paths.reset()
+            // Pin in-memory mtimes well outside the racy window on both routes,
+            // including the mounted in-memory subtree in the local variant.
+            // Advance only the rewritten file's timestamp so metadata reuse must
+            // still detect its same-size content change in phase 2.
+            let transformInfo: @Sendable (FileInfo) -> FileInfo = { info in
+                var info = info
+                if info.kind == .file, inMemory || info.path.isWithin("/unicode") {
+                    let changed = phase >= 2 && info.path == "/unicode/cafe\u{301}"
+                    info.modificationDate = old.addingTimeInterval(changed ? 1 : 0)
+                }
+                return info
+            }
+            let bulk = CaptureSource(source, scoped: true, transformInfo: transformInfo)
+            let paths = CaptureSource(source, scoped: false, transformInfo: transformInfo)
             var manifests: [Data] = []
             var summaries: [ChangeSet.Summary] = []
             for (i, fs) in [bulk, paths].enumerated() {
@@ -75,7 +85,7 @@ struct CheckpointCaptureTraversalTests {
                 for (path, entry) in expected.entries {
                     let hint = try #require(captured.metadata.entries[path])
                     #expect(hint.info.identity == entry.info.identity)
-                    #expect(hint.info.modificationDate == entry.info.modificationDate)
+                    #expect(hint.info.modificationDate == transformInfo(entry.info).modificationDate)
                     #expect(hint.info.permissions == entry.info.permissions)
                     #expect(hint.info.kind == entry.info.kind)
                     #expect(hint.target == entry.target)
@@ -101,13 +111,35 @@ struct CheckpointCaptureTraversalTests {
             #expect(bulk.walkCount == 1)
             #expect(bulk.statCount == 0 && bulk.listCount == 0)
             #expect(bulk.reads == paths.reads)
-            if phase == 1, policy == .trustMetadata, !inMemory {
-                #expect(!bulk.reads.contains("/a/file"))
-                #expect(!bulk.reads.contains("/hard"))
-                #expect(!bulk.reads.contains("/a-"))
+            if policy == .trustMetadata {
+                if phase == 1 { #expect(bulk.reads.isEmpty) }
+                if phase == 2 { #expect(bulk.reads == ["/a/new", "/unicode/cafe\u{301}"]) }
             }
             if policy == .verifyContents { #expect(bulk.reads.contains("/a/file")) }
         }
+    }
+
+    @Test
+    func materializedSaveOmitsChildrenThatVanishedDuringCapture() async throws {
+        let root = try TestSupport.temporaryDirectory("VanishedSnapshotChild")
+        defer { TestSupport.remove(root) }
+        let base = InMemoryFileSystem()
+        try await base.writeFile(path: "/present", data: Data("retained".utf8), append: false)
+        let snapshot = try await Snapshot.capture(from: GhostFileSystem(base: base, code: ENOENT))
+        guard case let .directory(directory) = snapshot.entry else {
+            Issue.record("expected a directory snapshot")
+            return
+        }
+        #expect(directory.children.contains { if case .missing = $0 { return true }; return false })
+        let id = UUID()
+        let store = FileCheckpointStore(rootDirectory: root)
+        let checkpoint = try await store.saveRevision(snapshot,
+            draft: .init(workspaceID: id, label: nil, preferredParentID: nil, origin: .manual))
+        let reopened = FileCheckpointStore(rootDirectory: root)
+        let saved = try #require(await reopened.loadSnapshot(id: checkpoint.snapshotId, workspaceId: id))
+        #expect(saved.entry == (try await Snapshot.capture(from: base)).entry)
+        #expect(try await reopened.snapshotEntry(id: checkpoint.snapshotId, workspaceId: id,
+                                               path: "/ghost", includeChildren: false) == nil)
     }
 
     @Test(arguments: [false, true])
@@ -297,6 +329,7 @@ private final class CaptureSource: FileSystem, TraversingFileSystem, ExactTimest
     let base: any FileSystem
     let supportsScopedWalk: Bool
     let failingRead: Bool
+    private let transformInfo: @Sendable (FileInfo) -> FileInfo
     private let lock = NSLock()
     private var recordedReads: [WorkspacePath] = []
     private var counts = (walk: 0, stat: 0, list: 0)
@@ -304,8 +337,10 @@ private final class CaptureSource: FileSystem, TraversingFileSystem, ExactTimest
     var walkCount: Int { lock.withLock { counts.walk } }
     var statCount: Int { lock.withLock { counts.stat } }
     var listCount: Int { lock.withLock { counts.list } }
-    init(_ base: any FileSystem, scoped: Bool, failingRead: Bool = false) {
+    init(_ base: any FileSystem, scoped: Bool, failingRead: Bool = false,
+         transformInfo: @escaping @Sendable (FileInfo) -> FileInfo = { $0 }) {
         self.base = base; supportsScopedWalk = scoped; self.failingRead = failingRead
+        self.transformInfo = transformInfo
     }
     func reset() { lock.withLock { recordedReads = []; counts = (0, 0, 0) } }
     private func record(_ path: WorkspacePath) throws {
@@ -319,7 +354,7 @@ private final class CaptureSource: FileSystem, TraversingFileSystem, ExactTimest
             skippingVanishedEntries: skippingVanishedEntries) { info, read, link in
             try await withoutActuallyEscaping(read) { read in
                 try await withoutActuallyEscaping(link) { link in
-                    try await visit(info, { length in
+                    try await visit(self.transformInfo(info), { length in
                         try self.record(info.path)
                         return try await read(length)
                     }, { try await link() })
@@ -329,11 +364,13 @@ private final class CaptureSource: FileSystem, TraversingFileSystem, ExactTimest
     }
     func stat(path: WorkspacePath) async throws -> FileInfo {
         lock.withLock { counts.stat += 1 }
-        return try await base.stat(path: path)
+        return transformInfo(try await base.stat(path: path))
     }
     func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         lock.withLock { counts.list += 1 }
-        return try await base.listDirectory(path: path)
+        return try await base.listDirectory(path: path).map {
+            DirectoryEntry(name: $0.name, info: transformInfo($0.info))
+        }
     }
     func readFile(path: WorkspacePath) async throws -> Data { try record(path); return try await base.readFile(path: path) }
     func readSymlink(path: WorkspacePath) async throws -> String { try await base.readSymlink(path: path) }

@@ -996,8 +996,9 @@ actor FileCheckpointStore: CheckpointStore {
         case let .directory(directory):
             let old = try previous.map { try children(of: $0, workspaceId: workspaceId) } ?? []
             let byPath = Dictionary(uniqueKeysWithValues: old.map { ($0.path, $0) })
-            let entries = try directory.children.map {
-                try writeManifestNode($0, workspaceId: workspaceId, batch: batch, reusing: byPath[$0.path])
+            let entries = try directory.children.compactMap { child -> SnapshotManifest.Node? in
+                if case .missing = child { return nil }
+                return try writeManifestNode(child, workspaceId: workspaceId, batch: batch, reusing: byPath[child.path])
             }.sorted { PathName($0.path.name) < PathName($1.path.name) }
             if let previous, previous.kind == .directory, previous.treeHash != nil, old == entries {
                 var reused = previous
@@ -1729,13 +1730,24 @@ actor FileCheckpointStore: CheckpointStore {
 
     private func ensureWorkspaceDirectoriesLocked(for workspaceId: UUID) throws {
         let workspaceURL = workspaceDirectoryURL(workspaceId: workspaceId)
+        // This workspace's format lock also owns its staging directory. Never sweep
+        // another workspace's staging: its first open may still be in progress.
+        let stagingURL = rootDirectory.appendingPathComponent(".\(workspaceId.uuidString).pending", isDirectory: true)
+        try removeIfPresent(stagingURL)
         let existed = fileManager.fileExists(atPath: workspaceURL.path)
         if existed {
             try validateWorkspaceFormatLocked(workspaceId)
         } else {
-            try ensureDirectory(workspaceURL)
+            try ensureDirectory(stagingURL)
             try Self.durableWrite(encoder.encode(StoreFormat()),
-                                  to: workspaceURL.appendingPathComponent("format.json"))
+                                  to: stagingURL.appendingPathComponent("format.json"))
+            // Both paths have the same parent, so publication is an atomic rename.
+            // A crash before it leaves only disposable staging; after it, the
+            // published directory always contains a complete, synchronized marker.
+            try fileManager.moveItem(at: stagingURL, to: workspaceURL)
+            // Persist the rename before anything is written inside the published
+            // directory; otherwise a crash could resurrect it as sweepable staging.
+            try Self.syncDirectory(rootDirectory)
         }
         // A prior initialization may have stopped after publishing the marker.
         let newObjects = !fileManager.fileExists(atPath: treesDirectoryURL(workspaceId: workspaceId).path)
