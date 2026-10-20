@@ -8,6 +8,74 @@ import Glibc
 #endif
 
 struct FileSystemTraversalTests {
+    @Test(arguments: [PermissionOperation.stat, .listDirectory, .readFile, .readSymlink],
+          ["snapshot", "checkpoint", "restore", "diff"])
+    func revisionOperationsPreservePerEntryAuthorization(operation: PermissionOperation, action: String) async throws {
+        let root = try TestSupport.temporaryDirectory("RevisionAuthorization")
+        defer { TestSupport.remove(root) }
+        for local in [false, true] {
+            for wrapper in ["direct", "limited", "mounted", "overlay"] {
+                let base: any FileSystem = local ? try LocalFileSystem(root: root) : InMemoryFileSystem()
+                try await base.createDirectory(path: "/private", recursive: true)
+                try await base.writeFile(path: "/private/file", data: Data("secret".utf8), append: false)
+                if await base.exists(path: "/private/link") { try await base.remove(path: "/private/link", recursive: false) }
+                try await base.createSymlink(path: "/private/link", target: "file")
+                let denial = TraversalDenial()
+                let authorized = AuthorizedFileSystem(base: wrapper == "overlay" ? OverlayFileSystem(over: base) : base, authorizer: PermissionAuthorizer { request in
+                    if await denial.enabled, request.operation == operation,
+                       request.path?.string.hasPrefix("/private") == true {
+                        return .deny(message: "per-entry denial")
+                    }
+                    return .allow
+                })
+                let fs: any FileSystem
+                switch wrapper {
+                case "limited": fs = LimitedFileSystem(base: authorized, limits: .init())
+                case "mounted": fs = MountedFileSystem(base: authorized, mounts: [
+                    .init(mountPoint: "/other", fileSystem: InMemoryFileSystem())
+                ])
+                default: fs = authorized
+                }
+                let workspace = Workspace(fileSystem: fs, checkpointCapture: .verifyContents)
+                let checkpoint = try await workspace.createCheckpoint()
+                try await base.writeFile(path: "/private/file", data: Data("changed".utf8), append: false)
+                let before = try await Snapshot.capture(from: base)
+                await denial.enable()
+                do {
+                    switch action {
+                    case "snapshot": _ = try await Snapshot.capture(from: fs)
+                    case "checkpoint": _ = try await workspace.createCheckpoint()
+                    case "restore": _ = try await workspace.restore(to: checkpoint)
+                    default: _ = try await workspace.diff(from: .checkpoint(checkpoint.id), to: .current)
+                    }
+                    Issue.record("\(action) through \(wrapper) must enforce \(operation)")
+                } catch let WorkspaceError.accessDenied(actual, message) {
+                    #expect(actual == operation.rawValue)
+                    #expect(message == "per-entry denial")
+                }
+                #expect(try await Snapshot.capture(from: base).entry == before.entry)
+            }
+        }
+    }
+
+    @Test
+    func perPathSnapshotRecordsVanishedChildrenAsMissing() async throws {
+        let base = InMemoryFileSystem()
+        try await base.writeFile(path: "/vanished", data: Data("old".utf8), append: false)
+        let fs = AuthorizedFileSystem(base: base, authorizer: PermissionAuthorizer { request in
+            if request.operation == .stat && request.path == "/vanished" {
+                do { try await base.remove(path: "/vanished", recursive: false) }
+                catch { Issue.record(error) }
+            }
+            return .allow
+        })
+        let snapshot = try await Snapshot.capture(from: fs)
+        guard case let .directory(directory) = snapshot.entry else {
+            Issue.record("expected root directory"); return
+        }
+        #expect(directory.children == [.missing(.init(path: "/vanished"))])
+    }
+
     @Test
     func mountedWalkRebasesPathsAndPreservesShadowing() async throws {
         let root = try TestSupport.temporaryDirectory("MountedWalk")
@@ -409,3 +477,8 @@ struct FileSystemTraversalTests {
 }
 
 private final class TraversalTestBundle: NSObject {}
+
+private actor TraversalDenial {
+    var enabled = false
+    func enable() { enabled = true }
+}

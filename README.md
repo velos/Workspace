@@ -298,6 +298,8 @@ metadata and read changed or unverifiable files; previews and merges materialize
 Metadata capture uses bulk traversal when available and per-path enumeration otherwise, including
 scoped subtree refreshes. Mounted traversal preserves virtual paths and shadowing; authorized
 traversal retains per-entry permission checks.
+Snapshot capture likewise stats each entry on its per-path route. InMemoryFileSystem has a native
+actor-owned traversal; after reentrant mutations it resolves pending paths and reads again.
 Checkpoint persistence still requires the store's metadata and manifest work. Checkpoints prime a
 transaction base only after that instance has begun a transaction. Directory commits replace the base
 with the new revision index, without retaining changed-file contents or revision read caches.
@@ -307,7 +309,23 @@ and the previous mtime is more than two seconds older than the start of the prev
 capture. Identity must also match when both entries provide it. Missing mtimes and recent timestamps
 require reads; InMemoryFileSystem's exact timestamps skip this racy window. Writes that preserve
 safely old metadata can evade the check. Use `.verifyContents` to read and compare every file during
-transaction begin and commit, and to read and hash every file during directory checkpoint capture.
+transaction begin and commit, checkpoint-to-current diff and restore, and to read and hash every
+file during directory checkpoint capture.
+
+Checkpoint-to-current diffs and `restore(to:)` use one bulk metadata walk and compare against the
+checkpoint's persisted capture hints and revision hashes. They read only suspect files (changed
+metadata, missing hints, or timestamps inside the same two-second window). Identity is compared
+when both captures provide it; exact-timestamp backends skip the window. Older revisions without
+capture hints conservatively require content reads. Memory persistence retains hints for only the
+four most recently captured or restored revisions; older revisions also fall back to content reads.
+As with transactions, writes that preserve
+safely old metadata can evade `.trustMetadata`; use `.verifyContents` when those writes must be
+detected and restored.
+
+Restore applies and recaptures only differing entries and necessary ancestor permissions. Its
+failure recovery and recorded changes use the same sparse scope. The new checkpoint reuses existing
+blobs and directory trees through the store's normal locked, durable publication path. Archive
+restore continues to capture its selected subtree in full.
 
 Transactions are logically atomic within cooperative workspace use. They are not crash-safe against
 an external process racing the commit. In-process `Workspace.compact` protects revisions referenced

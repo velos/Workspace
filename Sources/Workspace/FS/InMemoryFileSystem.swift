@@ -13,7 +13,7 @@ import Glibc
 ///
 /// Actor isolation serializes access to the tree so the filesystem can be shared safely across
 /// concurrent tasks.
-public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, ExactTimestampFileSystem {
+public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, ExactTimestampFileSystem, TraversingFileSystem {
     package nonisolated var hasExactContentTimestamps: Bool { true }
     private var lastTimestamp = Date().timeIntervalSinceReferenceDate
 
@@ -85,6 +85,104 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
     /// Clears the filesystem and recreates an empty root directory.
     public func reset() {
         root = makeNode(kind: .directory([:]), permissions: 0o755)
+    }
+
+    // Cursor frames and Node references stay on this actor. Visitors remain on their
+    // caller's executor; only immutable metadata/content values cross that boundary.
+    private final class WalkCursor {
+        enum Frame {
+            case entry(WorkspacePath, Node?, TimeInterval?)
+            case directory(FileInfo)
+        }
+        var frames: [Frame]
+        init(path: WorkspacePath) { frames = [.entry(path, nil, nil)] }
+    }
+    private struct WalkEntry: Sendable {
+        var info: FileInfo
+        var capturedAt: TimeInterval
+        var data: Data?
+        var target: String?
+    }
+    private var walkCursors: [UUID: WalkCursor] = [:]
+
+    nonisolated(nonsending) package func walk(
+        at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
+        visit: FileSystemWalkVisitor
+    ) async throws {
+        let id = await beginWalk(at: path)
+        do {
+            while let entry = try await nextWalkEntry(id, skippingVanishedEntries: skippingVanishedEntries) {
+                try await visit(entry.info, { length in
+                    try await self.readWalkFile(at: entry.info.path, capturedAt: entry.capturedAt,
+                                                data: entry.data, length: length)
+                }, {
+                    try await self.readWalkLink(at: entry.info.path, capturedAt: entry.capturedAt, target: entry.target)
+                })
+            }
+            await endWalk(id)
+        } catch {
+            await endWalk(id)
+            throw error
+        }
+    }
+
+    private func beginWalk(at path: WorkspacePath) -> UUID {
+        let id = UUID()
+        walkCursors[id] = WalkCursor(path: path)
+        return id
+    }
+
+    private func endWalk(_ id: UUID) { walkCursors.removeValue(forKey: id) }
+
+    private func nextWalkEntry(_ id: UUID, skippingVanishedEntries: Bool) throws -> WalkEntry? {
+        let cursor = walkCursors[id]!
+        while let frame = cursor.frames.popLast() {
+            try Task.checkCancellation()
+            switch frame {
+            case let .directory(info):
+                return WalkEntry(info: info, capturedAt: lastTimestamp)
+            case let .entry(path, listed, listedAt):
+                let entry: Node
+                do {
+                    // Every mutation advances lastTimestamp before yielding. After
+                    // reentrancy, resolve the listed path again, never detached nodes.
+                    if let listed, listedAt == lastTimestamp { entry = listed }
+                    else { entry = try node(at: path, followFinalSymlink: false) }
+                } catch {
+                    guard (listed == nil || skippingVanishedEntries), Snapshot.isMissingEntry(error) else { throw error }
+                    continue
+                }
+                let info = fileInfo(for: entry, path: path)
+                switch entry.kind {
+                case let .directory(children):
+                    cursor.frames.append(.directory(info))
+                    let ordered = children.map { name, child in
+                        (name, child, walkSortKey(name: name.string, isDirectory: child.isDirectory))
+                    }.sorted { $0.2.utf8.lexicographicallyPrecedes($1.2.utf8) }
+                    for (name, child, _) in ordered.reversed() {
+                        cursor.frames.append(.entry(path.appending(name.string), child, lastTimestamp))
+                    }
+                case let .file(data):
+                    return WalkEntry(info: info, capturedAt: lastTimestamp, data: data)
+                case let .symlink(target):
+                    return WalkEntry(info: info, capturedAt: lastTimestamp, target: target)
+                }
+            }
+        }
+        return nil
+    }
+
+    private func readWalkFile(at path: WorkspacePath, capturedAt: TimeInterval, data: Data?, length: Int?) async throws -> Data {
+        if let length, length < 0 { throw WorkspaceError.unsupported("read length must not be negative") }
+        guard capturedAt == lastTimestamp, let data else {
+            return try await readFile(path: path, offset: 0, length: length)
+        }
+        return length.map { Data(data.prefix($0)) } ?? data
+    }
+
+    private func readWalkLink(at path: WorkspacePath, capturedAt: TimeInterval, target: String?) async throws -> String {
+        guard capturedAt == lastTimestamp, let target else { return try await readSymlink(path: path) }
+        return target
     }
 
     /// See ``FileSystem/stat(path:)``.

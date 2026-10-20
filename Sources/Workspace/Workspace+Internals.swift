@@ -125,17 +125,26 @@ extension Workspace {
         return persisted
     }
 
-    // If checkpoint persistence fails after the history append, retract exactly
-    // our record. Other instances' mutations must not be removed by compensation.
     func persistMutationCheckpoint(
         snapshot: Snapshot, label: String?, origin: Checkpoint.Origin,
         operation: Mutation.Operation, changes: ChangeSet
     ) async throws -> Checkpoint {
-        let mutation = changes.isEmpty ? nil : try await appendMutation(operation: operation, changes: changes)
-        do {
-            return try await persistCheckpoint(
+        try await withMutationCheckpoint(operation: operation, changes: changes) {
+            try await persistCheckpoint(
                 snapshot: snapshot, label: label, parentCheckpointId: headCheckpointId, origin: origin
             )
+        }
+    }
+
+    // If checkpoint persistence fails after the history append, retract exactly
+    // our record. Other instances' mutations must not be removed by compensation.
+    func withMutationCheckpoint(
+        operation: Mutation.Operation, changes: ChangeSet,
+        publish: () async throws -> Checkpoint
+    ) async throws -> Checkpoint {
+        let mutation = changes.isEmpty ? nil : try await appendMutation(operation: operation, changes: changes)
+        do {
+            return try await publish()
         } catch {
             if let mutation {
                 do {

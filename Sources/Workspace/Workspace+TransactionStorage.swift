@@ -60,8 +60,7 @@ extension Workspace {
 
     func persistMutationCheckpoint(tree: TransactionTree, metadata previousMetadata: MetadataIndex, changedRoots: [WorkspacePath], label: String?, origin: Checkpoint.Origin,
                                    operation: Mutation.Operation, changes: ChangeSet) async throws -> Checkpoint {
-        let mutation = changes.isEmpty ? nil : try await appendMutation(operation: operation, changes: changes)
-        do {
+        try await withMutationCheckpoint(operation: operation, changes: changes) {
             var metadata = previousMetadata
             for root in changedRoots {
                 let replacement = try await MetadataIndex.capture(from: filesystem, at: root)
@@ -88,16 +87,6 @@ extension Workspace {
             coldTransactionBase = nil
             emitWorkspaceEvent(.checkpoint(checkpoint))
             return checkpoint
-        } catch {
-            if let mutation {
-                do {
-                    try await store.removeMutation(sequence: mutation.sequence, workspaceId: workspaceId)
-                    mutations.removeAll { $0.sequence == mutation.sequence }
-                } catch let cleanupError {
-                    throw WorkspaceRollbackError(originalError: error, rollbackError: cleanupError)
-                }
-            }
-            throw error
         }
     }
 }

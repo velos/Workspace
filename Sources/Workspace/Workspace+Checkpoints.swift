@@ -38,28 +38,54 @@ extension Workspace {
         try await prepareForMutation()
         try await reconcileCheckpointsWithStore()
         let checkpoint = try checkpointOrThrow(id: checkpointId)
-        let targetSnapshot = try await loadSnapshotOrThrow(
-            id: checkpoint.snapshotId,
-            workspaceId: checkpoint.workspaceId
-        )
-        let previousSnapshot = try await Snapshot.capture(from: filesystem)
+        let (comparison, pin) = try await checkpointComparison(checkpoint)
+        defer { withExtendedLifetime(pin) {} }
+        let directories = comparison.restoreScope()
+        let before = try await comparison.sparseSnapshot(in: comparison.current, preserving: directories)
+        let target = try await comparison.sparseSnapshot(in: comparison.checkpoint, preserving: directories)
         do {
-            try await Snapshot.restore(targetSnapshot, to: filesystem)
-            let restoredSnapshot = try await Snapshot.capture(from: filesystem)
-            let changes = changeSet(from: previousSnapshot, to: restoredSnapshot)
-            let result = try await persistMutationCheckpoint(
-                snapshot: restoredSnapshot,
-                label: label,
-                origin: .rollback(from: checkpoint.id),
-                operation: .rollback,
-                changes: recordingChanges(changes, from: previousSnapshot, to: restoredSnapshot)
-            )
-            await noteWorkspaceSnapshot(restoredSnapshot)
+            try await Snapshot.restore(target, to: filesystem, preservingDirectories: directories)
+            var metadata = comparison.metadata
+            let after = try await Snapshot.captureSparse(from: filesystem, template: target,
+                                                         preserving: directories, metadata: &metadata,
+                                                         previousChildren: comparison.current.children)
+            let changes = changeSet(from: before, to: after)
+            let recorded = recordingChanges(changes, from: before, to: after)
+            let result = try await withMutationCheckpoint(operation: .rollback, changes: recorded) {
+                try await store.publishRevision(
+                    reusing: checkpoint.snapshotId, patch: after, preservingDirectories: directories,
+                    metadata: metadata, draft: CheckpointDraft(workspaceID: workspaceId, label: label,
+                        preferredParentID: headCheckpointId, origin: .rollback(from: checkpoint.id)))
+            }
+            checkpoints.append(result)
+            checkpoints.sort(by: checkpointSort)
+            headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
+            if var observed = observedFilesystem {
+                observed.reconcileRestoration(after.entry, preserving: directories, metadata: metadata)
+                observedFilesystem = observed
+            }
+            emitWorkspaceEvent(.checkpoint(result))
             if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
             return result
         } catch {
-            try await restoreAfterFailure([previousSnapshot], originalError: error)
+            do { try await Snapshot.restore(before, to: filesystem, preservingDirectories: directories) }
+            catch let rollbackError { throw WorkspaceRollbackError(originalError: error, rollbackError: rollbackError) }
+            throw error
         }
+    }
+
+    func checkpointComparison(_ checkpoint: Checkpoint) async throws -> (RevisionComparison, TransactionRevisionPin) {
+        let store = store
+        let (revision, pin) = try await TransactionRevisionGate.shared.withLock {
+            guard let revision = try await store.loadCapturedRevision(id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceId) else {
+                throw WorkspaceError.revisionDataNotFound(checkpoint.snapshotId)
+            }
+            return (revision, TransactionRevisionPin(checkpoint))
+        }
+        let content = TransactionRevisionContent(checkpoint: checkpoint, store: store)
+        let comparison = try await RevisionComparison.capture(revision, from: filesystem,
+            policy: checkpointCapture, load: { try await content.read($0) })
+        return (comparison, pin)
     }
 
     /// Returns one checkpoint owned by this workspace when present.

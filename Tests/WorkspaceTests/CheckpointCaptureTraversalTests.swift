@@ -8,12 +8,12 @@ import Glibc
 #endif
 
 struct CheckpointCaptureTraversalTests {
-    @Test(arguments: [Workspace.CheckpointCapturePolicy.trustMetadata, .verifyContents])
-    func captureRoutesPersistIdenticalTrees(policy: Workspace.CheckpointCapturePolicy) async throws {
+    @Test(arguments: [Workspace.CheckpointCapturePolicy.trustMetadata, .verifyContents], [false, true])
+    func captureRoutesPersistIdenticalTrees(policy: Workspace.CheckpointCapturePolicy, inMemory: Bool) async throws {
         let container = try TestSupport.temporaryDirectory("CaptureRoutes")
         defer { TestSupport.remove(container) }
         let files = container.appendingPathComponent("files")
-        let local = try LocalFileSystem(root: files)
+        let local: any FileSystem = inMemory ? InMemoryFileSystem() : try LocalFileSystem(root: files)
         try await local.createDirectory(path: "/a/empty", recursive: true)
         try await local.createFile(path: "/a/file", data: Data([0, 1, 255]))
         try await local.createFile(path: "/a-", data: Data("ordering\n".utf8))
@@ -22,23 +22,29 @@ struct CheckpointCaptureTraversalTests {
         try await local.createHardLink(path: "/hard", target: "/a/file")
         for (name, target) in [("dangling", "missing"), ("cycle", "cycle"),
                                ("alias", "a"), ("escape", container.appendingPathComponent("outside").path)] {
-            try FileManager.default.createSymbolicLink(atPath: files.appendingPathComponent(name).path,
-                                                       withDestinationPath: target)
+            if inMemory { try await local.createSymlink(path: WorkspacePath("/" + name), target: target) }
+            else {
+                try FileManager.default.createSymbolicLink(atPath: files.appendingPathComponent(name).path,
+                                                           withDestinationPath: target)
+            }
         }
         try Data("outside".utf8).write(to: container.appendingPathComponent("outside"))
         // macOS volumes cannot host both spellings. A real mounted backend can,
         // and also exercises forwarding plus mixed bulk/per-path traversal.
-        let unicode = InMemoryFileSystem()
-        try await unicode.createFile(path: "/caf\u{e9}", data: Data([1]))
-        try await unicode.createFile(path: "/cafe\u{301}", data: Data([2]))
-        let source = MountedFileSystem(base: local, mounts: [.init(mountPoint: "/unicode", fileSystem: unicode)])
+        let unicode: any FileSystem = inMemory ? local : InMemoryFileSystem()
+        let unicodeRoot: WorkspacePath = inMemory ? "/unicode" : .root
+        if inMemory { try await unicode.createDirectory(path: unicodeRoot, recursive: true) }
+        try await unicode.createFile(path: unicodeRoot.appending("caf\u{e9}"), data: Data([1]))
+        try await unicode.createFile(path: unicodeRoot.appending("cafe\u{301}"), data: Data([2]))
+        let source: any FileSystem = inMemory ? local :
+            MountedFileSystem(base: local, mounts: [.init(mountPoint: "/unicode", fileSystem: unicode)])
         let bulk = CaptureSource(source, scoped: true)
         let paths = CaptureSource(source, scoped: false)
         let id = UUID()
         let roots = [container.appendingPathComponent("bulk"), container.appendingPathComponent("paths")]
         let stores = roots.map { FileCheckpointStore(rootDirectory: $0, checkpointCapture: policy) }
         let old = Date(timeIntervalSince1970: 1)
-        for name in ["a/file", "a-"] {
+        for name in inMemory ? [] : ["a/file", "a-"] {
             try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: files.appendingPathComponent(name).path)
         }
         var parents: [UUID?] = [nil, nil]
@@ -47,7 +53,7 @@ struct CheckpointCaptureTraversalTests {
             if phase == 2 {
                 try await local.createFile(path: "/a/new", data: Data("new\n".utf8))
                 try await local.setPermissions(path: "/a/file", permissions: POSIXPermissions(0o600))
-                try await unicode.writeFile(path: "/cafe\u{301}", data: Data([3]), append: false)
+                try await source.writeFile(path: "/unicode/cafe\u{301}", data: Data([3]), append: false)
             }
             if phase == 3 {
                 try await local.remove(path: "/a/new", recursive: false)
@@ -63,6 +69,20 @@ struct CheckpointCaptureTraversalTests {
                     workspaceID: id, label: nil, preferredParentID: parents[i], origin: .manual))
                 parents[i] = checkpoint.id
                 summaries.append(checkpoint.summary)
+                let captured = try #require(await stores[i].loadCapturedRevision(id: checkpoint.snapshotId, workspaceId: id))
+                let expected = try await MetadataIndex.capture(from: source)
+                #expect(Set(captured.metadata.entries.keys) == Set(expected.entries.keys))
+                for (path, entry) in expected.entries {
+                    let hint = try #require(captured.metadata.entries[path])
+                    #expect(hint.info.identity == entry.info.identity)
+                    #expect(hint.info.modificationDate == entry.info.modificationDate)
+                    #expect(hint.info.permissions == entry.info.permissions)
+                    #expect(hint.info.kind == entry.info.kind)
+                    #expect(hint.target == entry.target)
+                    if entry.info.kind == .file { #expect(hint.info.size == entry.info.size) }
+                }
+                #expect(captured.metadata.exactTimestamps == expected.exactTimestamps)
+                #expect(captured.metadata.exactTimestamps == inMemory)
                 let url = roots[i].appendingPathComponent(id.uuidString)
                     .appendingPathComponent("snapshots/\(checkpoint.snapshotId).json")
                 var manifest = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
@@ -81,7 +101,7 @@ struct CheckpointCaptureTraversalTests {
             #expect(bulk.walkCount == 1)
             #expect(bulk.statCount == 0 && bulk.listCount == 0)
             #expect(bulk.reads == paths.reads)
-            if phase == 1, policy == .trustMetadata {
+            if phase == 1, policy == .trustMetadata, !inMemory {
                 #expect(!bulk.reads.contains("/a/file"))
                 #expect(!bulk.reads.contains("/hard"))
                 #expect(!bulk.reads.contains("/a-"))
@@ -97,7 +117,7 @@ struct CheckpointCaptureTraversalTests {
         let files = container.appendingPathComponent("files")
         let local = try LocalFileSystem(root: files)
         let source = CaptureSource(local, scoped: scoped)
-        let dates = ["stable": Date(timeIntervalSince1970: 1), "racy": Date().addingTimeInterval(60)]
+        let dates = ["stable": Date(timeIntervalSince1970: 1), "replaced": Date(timeIntervalSince1970: 1), "racy": Date().addingTimeInterval(60)]
         for (name, date) in dates {
             try await local.createFile(path: WorkspacePath(normalizing: "/" + name), data: Data("old".utf8))
             try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: files.appendingPathComponent(name).path)
@@ -108,14 +128,22 @@ struct CheckpointCaptureTraversalTests {
         let first = try await store.captureRevision(from: source, draft: .init(
             workspaceID: id, label: nil, preferredParentID: nil, origin: .manual))
         for (name, date) in dates {
-            try await local.writeFile(path: WorkspacePath(normalizing: "/" + name), data: Data("new".utf8), append: false)
+            if name == "replaced" {
+                // Atomic replacement changes identity despite equal size and old mtime.
+                try await local.writeFile(path: WorkspacePath(normalizing: "/" + name), data: Data("new".utf8), append: false)
+            } else {
+                // Preserve identity to isolate the timestamp-window contract.
+                let handle = try FileHandle(forWritingTo: files.appendingPathComponent(name))
+                try handle.write(contentsOf: Data("new".utf8))
+                try handle.close()
+            }
             try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: files.appendingPathComponent(name).path)
         }
         source.reset()
         let second = try await store.captureRevision(from: source, draft: .init(
             workspaceID: id, label: nil, preferredParentID: first.id, origin: .manual))
-        #expect(source.reads == ["/racy"])
-        #expect(second.summary.touchedPaths == ["/racy"])
+        #expect(source.reads == ["/racy", "/replaced"])
+        #expect(second.summary.touchedPaths == ["/racy", "/replaced"])
         #expect(try await store.readSnapshotFile(id: second.snapshotId, workspaceId: id, path: "/racy", offset: 0, length: nil) == Data("new".utf8))
         // Repair an absent CAS object with the same bytes. A different payload
         // would still fail when the summary tries to read the damaged parent.
@@ -128,6 +156,40 @@ struct CheckpointCaptureTraversalTests {
             workspaceID: id, label: nil, preferredParentID: second.id, origin: .manual))
         #expect(source.reads == ["/racy", "/stable"])
         #expect(try await store.readSnapshotFile(id: repaired.snapshotId, workspaceId: id, path: "/stable", offset: 0, length: nil) == Data("old".utf8))
+    }
+
+    @Test(arguments: [false, true])
+    func identityOnlyReplacementRefreshesCaptureHints(scoped: Bool) async throws {
+        let container = try TestSupport.temporaryDirectory("CaptureIdentity")
+        defer { TestSupport.remove(container) }
+        let files = container.appendingPathComponent("files")
+        let local = try LocalFileSystem(root: files)
+        let source = CaptureSource(local, scoped: scoped)
+        let store = FileCheckpointStore(rootDirectory: container.appendingPathComponent("store"))
+        let id = UUID()
+        let old = Date(timeIntervalSince1970: 1)
+        var parent: UUID?
+        var previousIdentity: FileIdentity?
+        for phase in 0..<3 {
+            if phase < 2 {
+                try await local.writeFile(path: "/file", data: Data("same".utf8), append: false)
+                try FileManager.default.setAttributes([.modificationDate: old],
+                    ofItemAtPath: files.appendingPathComponent("file").path)
+            }
+            let info = try await local.stat(path: "/file")
+            if phase == 1 { #expect(info.identity != previousIdentity) }
+            source.reset()
+            let checkpoint = try await store.captureRevision(from: source, draft: .init(
+                workspaceID: id, label: nil, preferredParentID: parent, origin: .manual))
+            // An identity-only replacement must update the tree even though its
+            // content hash is unchanged, then allow the next capture to reuse it.
+            let captured = try #require(await store.loadCapturedRevision(id: checkpoint.snapshotId, workspaceId: id))
+            #expect(captured.metadata.entries["/file"]?.info.identity == info.identity)
+            #expect(source.reads == (phase < 2 ? ["/file"] : []))
+            if phase > 0 { #expect(checkpoint.summary.touchedPaths.isEmpty) }
+            previousIdentity = info.identity
+            parent = checkpoint.id
+        }
     }
 
     @Test(arguments: [Int32(ENOENT), Int32(ENOTDIR)])
@@ -157,11 +219,14 @@ struct CheckpointCaptureTraversalTests {
         #expect(trees[0] == trees[1])
     }
 
-    @Test
-    func captureRoutesProduceIdenticalPackLayout() async throws {
+    @Test(arguments: [false, true])
+    func captureRoutesProduceIdenticalPackLayout(inMemory: Bool) async throws {
         let container = try TestSupport.temporaryDirectory("CapturePacks")
         defer { TestSupport.remove(container) }
-        let local = try LocalFileSystem(root: container.appendingPathComponent("files"))
+        let local: any FileSystem = inMemory ? InMemoryFileSystem() : try LocalFileSystem(root: container.appendingPathComponent("files"))
+        for path: WorkspacePath in ["/a", "/a0"] {
+            try await local.createDirectory(path: path, recursive: true)
+        }
         for i in 0..<32 { try await local.createFile(path: WorkspacePath(normalizing: String(format: "/%02d", i)), data: Data([UInt8(i)])) }
         for name in ["a/leaf", "a-", "a0/leaf", "a0-", "z"] {
             try await local.createFile(path: WorkspacePath(normalizing: "/" + name), data: Data(name.utf8))
@@ -227,7 +292,8 @@ struct CheckpointCaptureTraversalTests {
 }
 
 /// Records reads on the actual descriptor callback as well as the per-path route.
-private final class CaptureSource: FileSystem, TraversingFileSystem, @unchecked Sendable {
+private final class CaptureSource: FileSystem, TraversingFileSystem, ExactTimestampFileSystem, @unchecked Sendable {
+    var hasExactContentTimestamps: Bool { get async { await base.supportsExactContentTimestamps } }
     let base: any FileSystem
     let supportsScopedWalk: Bool
     let failingRead: Bool

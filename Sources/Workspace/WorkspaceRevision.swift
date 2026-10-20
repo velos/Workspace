@@ -26,13 +26,27 @@ extension Workspace {
         if let maxTextBytes = options.maxTextBytes, maxTextBytes < 0 {
             throw WorkspaceError.unsupported("text diff byte limit must not be negative")
         }
-        let currentSnapshot: Snapshot? = if source == .current || destination == .current {
-            try await Snapshot.capture(from: filesystem)
-        } else {
-            nil
+        if source == .current && destination == .current {
+            return ChangeSet(changes: [])
         }
-        async let before = resolvedRevision(source, currentSnapshot: currentSnapshot)
-        async let after = resolvedRevision(destination, currentSnapshot: currentSnapshot)
+        if source == .current || destination == .current {
+            await acquireOperation()
+            defer { releaseOperation() }
+            let checkpointID: UUID
+            if case let .checkpoint(id) = source { checkpointID = id }
+            else if case let .checkpoint(id) = destination { checkpointID = id }
+            else { preconditionFailure("one revision must be a checkpoint") }
+            try await reconcileCheckpointsWithStore()
+            let (comparison, pin) = try await checkpointComparison(checkpointOrThrow(id: checkpointID))
+            defer { withExtendedLifetime(pin) {} }
+            let before = source == .current ? comparison.current : comparison.checkpoint
+            let after = destination == .current ? comparison.current : comparison.checkpoint
+            return try await ChangeSet.compare(before: before.revisionIndex(paths: comparison.changed), after: after.revisionIndex(paths: comparison.changed),
+                maxTextBytes: options.maxTextBytes, loadBefore: { try await before.data($0) },
+                loadAfter: { try await after.data($0) })
+        }
+        async let before = resolvedRevision(source)
+        async let after = resolvedRevision(destination)
         let (beforeRevision, afterRevision) = try await (before, after)
         return try await ChangeSet.compare(
             before: beforeRevision.index,

@@ -129,15 +129,28 @@ extension Snapshot {
         at path: WorkspacePath = .root,
         snapshotId: UUID = UUID()
     ) async throws -> Snapshot {
-        Snapshot(
-            id: snapshotId,
-            rootPath: path,
-            entry: try await captureEntry(from: target, at: path)
-        )
+        var metadata: MetadataIndex?
+        return try await capture(from: target, at: path, snapshotId: snapshotId, metadata: &metadata)
     }
 
-    static func restore(_ snapshot: Snapshot, to target: any FileSystem) async throws {
-        try await restoreEntry(snapshot.entry, to: target)
+    /// Pass a non-nil index to collect capture hints from the same entries and reads.
+    static func capture(
+        from target: any FileSystem,
+        at path: WorkspacePath = .root,
+        snapshotId: UUID = UUID(),
+        metadata: inout MetadataIndex?
+    ) async throws -> Snapshot {
+        if metadata != nil {
+            metadata = MetadataIndex()
+            metadata?.exactTimestamps = await target.supportsExactContentTimestamps
+        }
+        let entry = try await captureEntry(from: target, at: path, metadata: &metadata)
+        return Snapshot(id: snapshotId, rootPath: path, entry: entry)
+    }
+
+    static func restore(_ snapshot: Snapshot, to target: any FileSystem,
+                        preservingDirectories: Set<WorkspacePath> = []) async throws {
+        try await restoreEntry(snapshot.entry, to: target, preservingDirectories: preservingDirectories)
     }
 
     static func infoIfPresent(at path: WorkspacePath, on target: any FileSystem) async throws -> FileInfo? {
@@ -188,10 +201,14 @@ extension Snapshot {
         return false
     }
 
-    private static func captureTree(from target: any FileSystem, at path: WorkspacePath) async throws -> Entry {
+    private static func captureTree(
+        from target: any FileSystem, at path: WorkspacePath, metadata: inout MetadataIndex?
+    ) async throws -> Entry {
         var children: [WorkspacePath: [Entry]] = [:]
         var root: Entry = .missing(.init(path: path))
         try await target.walk(at: path) { info, read, readLink in
+            let link = info.kind == .symlink ? try await readLink() : nil
+            metadata?.entries[info.path] = .init(info: info, target: link)
             let entry: Entry
             switch info.kind {
             case .directory:
@@ -200,7 +217,7 @@ extension Snapshot {
             case .file:
                 entry = .file(.init(path: info.path, data: try await read(nil), permissions: info.permissions))
             case .symlink:
-                entry = .symlink(.init(path: info.path, target: try await readLink(), permissions: info.permissions))
+                entry = .symlink(.init(path: info.path, target: link!, permissions: info.permissions))
             }
             if info.path == path { root = entry }
             else { children[info.path.parent, default: []].append(entry) }
@@ -208,25 +225,33 @@ extension Snapshot {
         return root
     }
 
-    private static func captureEntry(from target: any FileSystem, at path: WorkspacePath) async throws -> Entry {
+    private static func captureEntry(
+        from target: any FileSystem, at path: WorkspacePath, metadata: inout MetadataIndex?
+    ) async throws -> Entry {
+        // Listings do not authorize stat access to each child. Preserve both the
+        // per-entry check and the missing-child behavior of the per-path route.
         guard let info = try await infoIfPresent(at: path, on: target) else {
             return .missing(.init(path: path))
         }
+        if info.kind == .directory && target.supportsScopedWalk {
+            return try await captureTree(from: target, at: path, metadata: &metadata)
+        }
+        let link = info.kind == .symlink ? try await target.readSymlink(path: path) : nil
+        metadata?.entries[path] = .init(info: info, target: link)
         switch info.kind {
         case .directory:
-            if target.supportsScopedWalk { return try await captureTree(from: target, at: path) }
             let entries = try await target.listDirectory(path: path)
-            let children = try await entries
-                .sorted { PathName($0.name) < PathName($1.name) }
-                .snapshotAsyncMap { entry in
-                    try await captureEntry(from: target, at: path.appending(entry.name))
-                }
+            var children: [Entry] = []
+            children.reserveCapacity(entries.count)
+            for entry in entries.sorted(by: { PathName($0.name) < PathName($1.name) }) {
+                children.append(try await captureEntry(from: target, at: path.appending(entry.name), metadata: &metadata))
+            }
             return .directory(.init(path: path, permissions: info.permissions, children: children))
         case .symlink:
             return .symlink(
                 .init(
                     path: path,
-                    target: try await target.readSymlink(path: path),
+                    target: link!,
                     permissions: info.permissions
                 )
             )
@@ -241,7 +266,8 @@ extension Snapshot {
         }
     }
 
-    private static func restoreEntry(_ entry: Entry, to target: any FileSystem) async throws {
+    private static func restoreEntry(_ entry: Entry, to target: any FileSystem,
+                                     preservingDirectories: Set<WorkspacePath>) async throws {
         switch entry {
         case let .missing(missing):
             try await removeEntryIfPresent(at: missing.path, on: target)
@@ -282,7 +308,8 @@ extension Snapshot {
         case let .directory(directory):
             try await ensureDirectory(at: directory.path, on: target)
             try await syncDirectoryChildren(
-                directory.children, under: directory.path, finalPermissions: directory.permissions, on: target
+                directory.children, under: directory.path, finalPermissions: directory.permissions, on: target,
+                preservingDirectories: preservingDirectories
             )
         }
     }
@@ -330,10 +357,11 @@ extension Snapshot {
         _ children: [Entry],
         under path: WorkspacePath,
         finalPermissions: POSIXPermissions? = nil,
-        on target: any FileSystem
+        on target: any FileSystem,
+        preservingDirectories: Set<WorkspacePath> = []
     ) async throws {
         do {
-            try await syncChildren(children, under: path, on: target)
+            try await syncChildren(children, under: path, on: target, preservingDirectories: preservingDirectories)
         } catch let deniedError {
             guard isPermissionDenied(deniedError) else { throw deniedError }
             let original = try await target.stat(path: path).permissions
@@ -347,7 +375,7 @@ extension Snapshot {
             }
             do {
                 // Synchronization is idempotent even if the first attempt made progress.
-                try await syncChildren(children, under: path, on: target)
+                try await syncChildren(children, under: path, on: target, preservingDirectories: preservingDirectories)
                 try await setPermissionsIfNeeded(finalPermissions ?? original, at: path, on: target)
             } catch {
                 do {
@@ -367,17 +395,19 @@ extension Snapshot {
     private static func syncChildren(
         _ expectedChildren: [Entry],
         under parentPath: WorkspacePath,
-        on target: any FileSystem
+        on target: any FileSystem,
+        preservingDirectories: Set<WorkspacePath>
     ) async throws {
-        let expectedNames = Set(expectedChildren.map { PathName($0.path.basename) })
-        let existingEntries = try await target.listDirectory(path: parentPath)
-
-        for entry in existingEntries where !expectedNames.contains(PathName(entry.name)) {
-            try await removeRecursively(at: parentPath.appending(entry.name), on: target)
+        if !preservingDirectories.contains(parentPath) {
+            let expectedNames = Set(expectedChildren.map { PathName($0.path.basename) })
+            let existingEntries = try await target.listDirectory(path: parentPath)
+            for entry in existingEntries where !expectedNames.contains(PathName(entry.name)) {
+                try await removeRecursively(at: parentPath.appending(entry.name), on: target)
+            }
         }
 
         for child in expectedChildren.sorted(by: { $0.path < $1.path }) {
-            try await restoreEntry(child, to: target)
+            try await restoreEntry(child, to: target, preservingDirectories: preservingDirectories)
         }
     }
 
@@ -401,19 +431,6 @@ extension Snapshot {
         if !path.isRoot {
             try await target.remove(path: path, recursive: true)
         }
-    }
-}
-
-private extension Array {
-    func snapshotAsyncMap<T: Sendable>(
-        _ transform: @escaping @Sendable (Element) async throws -> T
-    ) async throws -> [T] {
-        var values: [T] = []
-        values.reserveCapacity(count)
-        for element in self {
-            values.append(try await transform(element))
-        }
-        return values
     }
 }
 

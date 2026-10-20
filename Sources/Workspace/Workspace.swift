@@ -8,11 +8,11 @@ public actor Workspace {
         case directory(URL)
     }
 
-    /// Controls content verification for transactions and directory checkpoint capture.
+    /// Controls content verification for transactions, checkpoint comparisons/restores, and directory checkpoint capture.
     public enum CheckpointCapturePolicy: Sendable, Equatable {
         /// Reuse matching size and mtime when mtime is over two seconds older than the prior
         /// capture, comparing identity when both entries provide it. Exact-timestamp backends
-        /// skip the transaction racy window. Missing mtimes always require reading contents.
+        /// skip the racy window. Missing mtimes always require reading contents.
         case trustMetadata
         /// Read and verify every file, including changes that preserve older timestamps.
         case verifyContents
