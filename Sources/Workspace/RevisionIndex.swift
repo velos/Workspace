@@ -77,7 +77,7 @@ struct RevisionIndex: Sendable, Equatable {
                 path: value.path,
                 size: UInt64(value.data.count),
                 permissions: value.permissions,
-                contentID: SHA256.hexDigest(of: value.data)
+                contentID: value.contentID ?? SHA256.hexDigest(of: value.data)
             )
         case let .directory(value):
             .directory(path: value.path, permissions: value.permissions, children: value.children.map(index))
@@ -92,13 +92,20 @@ struct RevisionIndex: Sendable, Equatable {
 
     /// Resolve each component in the revision namespace, including directory symlinks.
     func readableFile(at path: WorkspacePath) throws -> (path: WorkspacePath, size: UInt64) {
+        try Self.resolveReadableFile(at: path) { entry(at: $0) }
+    }
+
+    /// Shared by tree-backed and materialized revisions; keep symlink semantics in one place.
+    static func resolveReadableFile(
+        at path: WorkspacePath, lookup: (WorkspacePath) throws -> Entry?
+    ) throws -> (path: WorkspacePath, size: UInt64) {
         var pending = path.components
         var current = WorkspacePath.root
         var hops = 0
         while !pending.isEmpty {
             let component = pending.removeFirst()
             current = current.appending(component)
-            guard let entry = entry(at: current) else {
+            guard let entry = try lookup(current) else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
             }
             switch entry {
@@ -121,11 +128,15 @@ struct RevisionIndex: Sendable, Equatable {
     }
 
     private static func entry(at path: WorkspacePath, in entry: Entry) -> Entry? {
-        if entry.path == path { return entry }
-        guard case let .directory(_, _, children) = entry else { return nil }
-        for child in children where path.isWithin(child.path) {
-            return self.entry(at: path, in: child)
+        let components = path.components
+        guard path.isWithin(entry.path) else { return nil }
+        let prefix = entry.path.components
+        var current = entry
+        for component in components.dropFirst(prefix.count) {
+            guard case let .directory(_, _, children) = current,
+                  let child = children.first(where: { PathName($0.path.name) == PathName(component) }) else { return nil }
+            current = child
         }
-        return nil
+        return current
     }
 }

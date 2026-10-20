@@ -177,7 +177,59 @@ Compaction rebases retained checkpoints to their nearest retained ancestor and r
 
 Directory-backed stores serialize checkpoint commits, revision reads, and compaction with a persistent lifecycle lock. Mutation history is independent and is not pruned by checkpoint retention.
 
-Store format version 1 is retained so existing stores remain readable. Once a store contains `mutations.sequence.json`, do not use older library versions that ignore this file to write to that store, including through concurrent instances or after a downgrade: those writers can reuse retracted mutation sequence numbers. All writers must preserve the sequence high-water mark and retraction epoch. The sidecar now stores both fields; legacy bare-integer sidecars remain readable. Retractions and failed append reservations can leave sequence gaps. History refreshes invalidate cached records when another instance retracts or prunes mutations.
+New directory stores use format version 2. Preparing an existing v1 store upgrades
+`format.json` under the format, lifecycle, and mutation locks before publishing any new-format
+checkpoint. Existing recursive manifests and loose blobs remain readable; migration does not
+rewrite checkpoint history. The first new checkpoint over a v1 parent creates its directory
+objects; historical v1 reads keep their original full-manifest decoding cost. New v1 operations
+reject the v2 format marker. Schema-3 roots use the required `treeRoot` key instead of legacy
+`root`, so an old operation admitted before migration fails decoding a new root: it cannot read
+it as an empty tree, capture against it, or sweep its blobs during compaction. An admitted old
+operation that only accesses legacy roots (or appends mutations) can still complete; migration
+cannot cancel old code already running. Stop old processes before upgrading to avoid mixed-version
+operation failures.
+Do not downgrade the format marker.
+
+New snapshots use manifest schema 3: a small snapshot root points to SHA-256-addressed directory
+objects in `trees/`. Each object contains byte-sorted immediate child names (never absolute paths), with child directories
+referenced by hash. An incremental capture writes only changed directories and their ancestors;
+unchanged objects remain shared. File reads decode only directories on the requested path.
+Decoded trees and the write catalog share a **32 MiB estimated decoded-storage budget** per
+store (24 MiB for trees, 8 MiB for the catalog). Both use O(1) LRU eviction and refresh recency on
+hits. Estimates include entry, string-buffer and bookkeeping costs; this is not a process-RSS cap.
+File metadata and directory listings also use path-only lookup. Full revision indexes are still materialized
+when a whole-tree operation requests them. Metadata capture still walks the filesystem.
+
+Blobs retain their SHA-256 identities. Small captures use loose `blobs/<hash>` files; after the
+first 32 new unique blobs in a capture, remaining blobs go into immutable `packs/<uuid>.pack`
+files with adjacent JSON hash/range indexes. Packs target 16 MiB and use a 1 MiB write buffer;
+a single larger file may exceed the target. Tree file entries carry their pack/range, so reads
+need no global pack-index decode. Full snapshot materialization maps at most four packs at a
+time and copies only the required file ranges; those mappings do not escape the locked load.
+The bounded write-side pack catalog is cached for one workspace. A constant-size `packs.generation`
+token invalidates other writers' catalogs before compaction removes packs, without depending on
+directory mtimes or enumerating historical pack files on warm writes. Hashes captured with in-memory
+checkpoints are reused by revision indexes and unchanged files in subsequent checkpoints.
+
+Publication orders durable blob/pack writes and directory objects before the snapshot root,
+and the snapshot root before checkpoint metadata. Files are synchronized before atomic rename,
+and containing directories are synchronized before advancing publication. Tree-directory syncs
+are batched at capture completion; compaction synchronizes each relocated tree before replacing
+roots. On Darwin, snapshot-root and checkpoint-metadata publication additionally use `F_FULLFSYNC`
+after syncing the containing directory, flushing the drive cache including preceding writes.
+A successfully published checkpoint therefore survives process crashes and power loss on storage
+that honors these synchronization requests. If `F_FULLFSYNC` fails other than interruption,
+publication retains the completed file and directory `fsync`; power-loss protection is best-effort
+on such volumes. Other POSIX platforms use file and directory `fsync`.
+Failed captures can leave unreachable objects, but publish no checkpoint referencing incomplete content. Compaction
+sweeps both formats, rewrites partially live packs, durably replaces affected snapshot roots,
+and only then removes old objects. Interrupted compaction can be resumed; dry-run blob counts
+and byte totals include reclaimable pack entries and incomplete orphan packs.
+
+All writers preserve the mutation sequence high-water mark and retraction epoch in
+`mutations.sequence.json`; legacy bare-integer sidecars remain readable. Retractions and failed
+append reservations can leave sequence gaps. History refreshes invalidate cached records when
+another instance retracts or prunes mutations.
 
 Directory-backed checkpoint capture also reuses existing CAS blobs when a file's size and available
 modification timestamp are unchanged and the timestamp is more than two seconds older than the

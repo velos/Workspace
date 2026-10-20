@@ -87,33 +87,11 @@ extension Workspace {
                 }
             )
         case let .checkpoint(id):
-            try await ensureLoaded()
-            try await reconcileCheckpointsWithStore()
-            let checkpoint = try checkpointOrThrow(id: id)
+            let access = try await checkpointAccess(id)
             guard let index = try await store.loadRevisionIndex(
-                id: checkpoint.snapshotId,
-                workspaceId: checkpoint.workspaceId
-            ) else {
-                throw WorkspaceError.revisionDataNotFound(checkpoint.snapshotId)
-            }
-            let store = store
-            let workspaceID = checkpoint.workspaceId
-            let snapshotID = checkpoint.snapshotId
-            return ResolvedRevision(
-                index: index,
-                readRange: { path, offset, length in
-                    guard let data = try await store.readSnapshotFile(
-                        id: snapshotID,
-                        workspaceId: workspaceID,
-                        path: path,
-                        offset: offset,
-                        length: length
-                    ) else {
-                        throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
-                    }
-                    return data
-                }
-            )
+                id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceId
+            ) else { throw WorkspaceError.revisionDataNotFound(access.checkpoint.snapshotId) }
+            return ResolvedRevision(index: index, readRange: access.readRange)
         }
     }
 
@@ -145,22 +123,50 @@ extension Workspace {
             return ResolvedReadableFile(size: metadata.size, readRange: { offset, length in
                 try await filesystem.readFile(path: resolvedPath, offset: offset, length: length)
             })
-        case .checkpoint:
-            let resolved = try await resolvedRevision(revision)
-            let file = try resolved.index.readableFile(at: path)
+        case let .checkpoint(id):
+            let access = try await checkpointAccess(id)
+            let file = try await store.resolveSnapshotFile(
+                id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceId, path: path
+            )
             return ResolvedReadableFile(size: file.size, readRange: { offset, length in
-                try await resolved.readRange(file.path, offset, length)
+                try await access.readRange(file.path, offset, length)
             })
         }
+    }
+
+    private struct CheckpointAccess: Sendable {
+        var checkpoint: Checkpoint
+        var readRange: @Sendable (WorkspacePath, UInt64, Int?) async throws -> Data
+    }
+
+    private func checkpointAccess(_ id: UUID) async throws -> CheckpointAccess {
+        try await ensureLoaded()
+        try await reconcileCheckpointsWithStore()
+        let checkpoint = try checkpointOrThrow(id: id)
+        let store = store
+        return CheckpointAccess(checkpoint: checkpoint, readRange: { path, offset, length in
+            guard let data = try await store.readSnapshotFile(
+                id: checkpoint.snapshotId, workspaceId: checkpoint.workspaceId,
+                path: path, offset: offset, length: length
+            ) else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)) }
+            return data
+        })
+    }
+
+    private func checkpointEntry(_ id: UUID, at path: WorkspacePath, includeChildren: Bool) async throws -> RevisionIndex.Entry? {
+        let access = try await checkpointAccess(id)
+        return try await store.snapshotEntry(
+            id: access.checkpoint.snapshotId, workspaceId: access.checkpoint.workspaceId,
+            path: path, includeChildren: includeChildren
+        )
     }
 
     public func info(_ path: WorkspacePath, at revision: Revision = .current) async throws -> FileInfo {
         switch revision {
         case .current:
             return try await filesystem.stat(path: path)
-        case .checkpoint:
-            let resolved = try await resolvedRevision(revision)
-            guard let entry = resolved.index.entry(at: path) else {
+        case let .checkpoint(id):
+            guard let entry = try await checkpointEntry(id, at: path, includeChildren: false) else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
             }
             return Self.info(for: entry)
@@ -171,9 +177,8 @@ extension Workspace {
         switch revision {
         case .current:
             return try await filesystem.listDirectory(path: path)
-        case .checkpoint:
-            let resolved = try await resolvedRevision(revision)
-            guard let entry = resolved.index.entry(at: path),
+        case let .checkpoint(id):
+            guard let entry = try await checkpointEntry(id, at: path, includeChildren: true),
                   case let .directory(_, _, children) = entry
             else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR))

@@ -45,14 +45,24 @@ struct Snapshot: Sendable, Codable, Equatable {
         /// The captured path.
         var path: WorkspacePath
         /// The file's contents at the time of capture.
-        var data: Data
+        var data: Data { didSet { contentID = nil } }
         /// The file's POSIX permissions at the time of capture.
         var permissions: POSIXPermissions
 
+        // Captured once with the bytes; excluded from value equality and persistence.
+        var contentID: String? = nil
+
+        private enum CodingKeys: String, CodingKey { case path, data, permissions }
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.path == rhs.path && lhs.permissions == rhs.permissions && lhs.data == rhs.data
+        }
+
         /// Creates a file entry.
-        init(path: WorkspacePath, data: Data, permissions: POSIXPermissions) {
+        init(path: WorkspacePath, data: Data, permissions: POSIXPermissions, contentID: String? = nil) {
             self.path = path
             self.data = data
+            self.contentID = contentID
             self.permissions = permissions
         }
     }

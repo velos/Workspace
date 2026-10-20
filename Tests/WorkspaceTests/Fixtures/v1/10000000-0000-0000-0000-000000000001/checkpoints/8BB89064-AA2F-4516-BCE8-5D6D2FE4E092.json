@@ -1,0 +1,28 @@
+{
+  "createdAt" : 814174270.213568,
+  "firstMutationSequence" : 2,
+  "id" : "8BB89064-AA2F-4516-BCE8-5D6D2FE4E092",
+  "lastMutationSequence" : 2,
+  "mutationCursor" : 2,
+  "origin" : {
+    "manual" : {
+
+    }
+  },
+  "parentID" : "669D476B-6EFC-46E0-A1FB-8155C3DA8121",
+  "snapshotId" : "EC4895B2-725C-4EDF-B0B9-E22C4B6F6C76",
+  "summary" : {
+    "changedPathCount" : 1,
+    "hasTextChanges" : true,
+    "statistics" : {
+      "additions" : 1,
+      "changedFileCount" : 1,
+      "changedPathCount" : 1,
+      "deletions" : 1
+    },
+    "touchedPaths" : [
+      "\/note"
+    ]
+  },
+  "workspaceID" : "10000000-0000-0000-0000-000000000001"
+}

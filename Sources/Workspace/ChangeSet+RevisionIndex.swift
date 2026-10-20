@@ -111,7 +111,7 @@ extension ChangeSet {
             let data = try await loader(path)
             let old = effect == .created ? Data() : data
             let new = effect == .created ? data : Data()
-            guard !old.contains(0), !new.contains(0),
+            guard !old.withUnsafeBytes({ $0.contains(0) }), !new.withUnsafeBytes({ $0.contains(0) }),
                   let oldText = String(data: old, encoding: .utf8),
                   let newText = String(data: new, encoding: .utf8)
             else {
@@ -148,7 +148,7 @@ extension ChangeSet {
         async let old = loadBefore(oldPath)
         async let new = loadAfter(newPath)
         let (oldData, newData) = try await (old, new)
-        guard !oldData.contains(0), !newData.contains(0),
+        guard !oldData.withUnsafeBytes({ $0.contains(0) }), !newData.withUnsafeBytes({ $0.contains(0) }),
               let oldText = String(data: oldData, encoding: .utf8),
               let newText = String(data: newData, encoding: .utf8)
         else {

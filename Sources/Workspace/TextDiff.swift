@@ -226,14 +226,17 @@ private func diffLineTokens(in text: String) -> [DiffLineToken] {
     var tokens: [DiffLineToken] = []
     // CRLF is one Swift Character. Split UTF-8 code units so LF alone is the delimiter,
     // preserving CR in the line's content and distinguishing a terminated final line.
-    let bytes = text.utf8
-    var start = bytes.startIndex
-    for index in bytes.indices where bytes[index] == 0x0A {
-        tokens.append(DiffLineToken(text: String(decoding: bytes[start..<index], as: UTF8.self), hasTrailingNewline: true))
-        start = bytes.index(after: index)
-    }
-    if start != bytes.endIndex {
-        tokens.append(DiffLineToken(text: String(decoding: bytes[start...], as: UTF8.self), hasTrailingNewline: false))
+    var contiguous = text
+    contiguous.makeContiguousUTF8()
+    contiguous.withUTF8 { bytes in
+        var start = 0
+        for index in bytes.indices where bytes[index] == 0x0A {
+            tokens.append(DiffLineToken(text: String(decoding: bytes[start..<index], as: UTF8.self), hasTrailingNewline: true))
+            start = index + 1
+        }
+        if start != bytes.count {
+            tokens.append(DiffLineToken(text: String(decoding: bytes[start...], as: UTF8.self), hasTrailingNewline: false))
+        }
     }
     return tokens
 }

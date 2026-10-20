@@ -200,9 +200,15 @@ struct PathIdentityRegressionTests {
         }
     }
 
-    @Test
-    func symlinkTargetChangesAreByteExact() async throws {
-        let workspace = Workspace()
+    @Test(arguments: [false, true])
+    func symlinkTargetChangesAreByteExact(diskStore: Bool) async throws {
+        let root = try TestSupport.temporaryDirectory("IdentitySymlink")
+        defer { TestSupport.remove(root) }
+        let workspace = Workspace(persistence: diskStore ? .directory(root) : .memory)
+        try await workspace.createDirectory(nfc)
+        try await workspace.createDirectory(nfd)
+        try await workspace.writeData(Data([1]), to: nfc.appending("\u{301}file"))
+        try await workspace.writeData(Data([2]), to: nfd.appending("\u{301}file"))
         try await workspace.createSymbolicLink("/alias", target: nfc.string)
         let before = try await workspace.createCheckpoint()
         try await workspace.remove("/alias")
@@ -210,6 +216,9 @@ struct PathIdentityRegressionTests {
         #expect(changed.touchedPaths == ["/alias"])
         let after = try await workspace.createCheckpoint()
         #expect(try await workspace.diff(from: .checkpoint(before.id), to: .checkpoint(after.id)).touchedPaths == ["/alias"])
+        for (checkpoint, byte) in [(before, UInt8(1)), (after, UInt8(2))] {
+            #expect(try await workspace.readData(from: "/alias/\u{301}file", at: .checkpoint(checkpoint.id)) == Data([byte]))
+        }
     }
 
     #if canImport(Darwin)

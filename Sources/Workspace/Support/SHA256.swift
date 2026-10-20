@@ -1,77 +1,93 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
-/// A minimal, dependency-free SHA-256 implementation (FIPS 180-4).
+/// SHA-256 via system CryptoKit on Apple platforms, with a dependency-free FIPS 180-4 fallback.
 ///
 /// Used to content-address snapshot blobs in ``FileCheckpointStore``. Kept internal: it is not a
 /// general-purpose cryptography API.
 enum SHA256 {
     /// Returns the lowercase hex digest of `data`.
     static func hexDigest(of data: Data) -> String {
-        digest(of: data).map { String(format: "%02x", $0) }.joined()
+        let digits = Array("0123456789abcdef".utf8)
+        var hex = [UInt8](repeating: 0, count: 64)
+        for (index, byte) in digest(of: data).enumerated() {
+            hex[index * 2] = digits[Int(byte >> 4)]
+            hex[index * 2 + 1] = digits[Int(byte & 15)]
+        }
+        return String(decoding: hex, as: UTF8.self)
     }
 
     /// Returns the 32-byte SHA-256 digest of `data`.
     static func digest(of data: Data) -> [UInt8] {
+#if canImport(CryptoKit)
+        return Array(CryptoKit.SHA256.hash(data: data))
+#else
         var h: [UInt32] = [
             0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a,
             0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19,
         ]
 
-        // Padding: append 0x80, zeros, then the 64-bit big-endian bit length.
-        var message = [UInt8](data)
-        let bitLength = UInt64(message.count) * 8
-        message.append(0x80)
-        while message.count % 64 != 56 {
-            message.append(0)
-        }
-        for shift in stride(from: 56, through: 0, by: -8) {
-            message.append(UInt8(truncatingIfNeeded: bitLength >> UInt64(shift)))
-        }
-
+        // Process the input in place. Only the final (at most two) blocks need padding.
         var w = [UInt32](repeating: 0, count: 64)
-        for blockStart in stride(from: 0, to: message.count, by: 64) {
-            for index in 0..<16 {
-                let offset = blockStart + index * 4
-                w[index] = UInt32(message[offset]) << 24
-                    | UInt32(message[offset + 1]) << 16
-                    | UInt32(message[offset + 2]) << 8
-                    | UInt32(message[offset + 3])
+        data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            let fullBytes = bytes.count / 64 * 64
+            var tail = Array(bytes[fullBytes...])
+            tail.append(0x80)
+            while tail.count % 64 != 56 { tail.append(0) }
+            let bitLength = UInt64(bytes.count) * 8
+            for shift in stride(from: 56, through: 0, by: -8) {
+                tail.append(UInt8(truncatingIfNeeded: bitLength >> UInt64(shift)))
             }
-            for index in 16..<64 {
-                let s0 = rotr(w[index - 15], 7) ^ rotr(w[index - 15], 18) ^ (w[index - 15] >> 3)
-                let s1 = rotr(w[index - 2], 17) ^ rotr(w[index - 2], 19) ^ (w[index - 2] >> 10)
-                w[index] = w[index - 16] &+ s0 &+ w[index - 7] &+ s1
+            for blockStart in stride(from: 0, to: fullBytes + tail.count, by: 64) {
+                for index in 0..<16 {
+                    let offset = blockStart + index * 4
+                    if blockStart < fullBytes {
+                        w[index] = UInt32(bigEndian: bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+                    } else {
+                        let offset = offset - fullBytes
+                        w[index] = UInt32(tail[offset]) << 24 | UInt32(tail[offset + 1]) << 16
+                            | UInt32(tail[offset + 2]) << 8 | UInt32(tail[offset + 3])
+                    }
+                }
+                for index in 16..<64 {
+                    let s0 = rotr(w[index - 15], 7) ^ rotr(w[index - 15], 18) ^ (w[index - 15] >> 3)
+                    let s1 = rotr(w[index - 2], 17) ^ rotr(w[index - 2], 19) ^ (w[index - 2] >> 10)
+                    w[index] = w[index - 16] &+ s0 &+ w[index - 7] &+ s1
+                }
+
+                var a = h[0], b = h[1], c = h[2], d = h[3]
+                var e = h[4], f = h[5], g = h[6], hh = h[7]
+
+                for index in 0..<64 {
+                    let s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
+                    let ch = (e & f) ^ (~e & g)
+                    let temp1 = hh &+ s1 &+ ch &+ Self.k[index] &+ w[index]
+                    let s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
+                    let maj = (a & b) ^ (a & c) ^ (b & c)
+                    let temp2 = s0 &+ maj
+
+                    hh = g
+                    g = f
+                    f = e
+                    e = d &+ temp1
+                    d = c
+                    c = b
+                    b = a
+                    a = temp1 &+ temp2
+                }
+
+                h[0] &+= a
+                h[1] &+= b
+                h[2] &+= c
+                h[3] &+= d
+                h[4] &+= e
+                h[5] &+= f
+                h[6] &+= g
+                h[7] &+= hh
             }
 
-            var a = h[0], b = h[1], c = h[2], d = h[3]
-            var e = h[4], f = h[5], g = h[6], hh = h[7]
-
-            for index in 0..<64 {
-                let s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
-                let ch = (e & f) ^ (~e & g)
-                let temp1 = hh &+ s1 &+ ch &+ Self.k[index] &+ w[index]
-                let s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
-                let maj = (a & b) ^ (a & c) ^ (b & c)
-                let temp2 = s0 &+ maj
-
-                hh = g
-                g = f
-                f = e
-                e = d &+ temp1
-                d = c
-                c = b
-                b = a
-                a = temp1 &+ temp2
-            }
-
-            h[0] &+= a
-            h[1] &+= b
-            h[2] &+= c
-            h[3] &+= d
-            h[4] &+= e
-            h[5] &+= f
-            h[6] &+= g
-            h[7] &+= hh
         }
 
         var out: [UInt8] = []
@@ -83,6 +99,7 @@ enum SHA256 {
             out.append(UInt8(truncatingIfNeeded: word))
         }
         return out
+#endif
     }
 
     private static func rotr(_ value: UInt32, _ amount: UInt32) -> UInt32 {
