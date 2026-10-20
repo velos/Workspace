@@ -532,7 +532,10 @@ public final class AuthorizedFileSystem: FileSystem, PreviewSemanticsFileSystem,
 }
 
 
-extension AuthorizedFileSystem: FileSystemChangeSource {
+extension AuthorizedFileSystem: CompleteFileSystemChangeSource {
+    /// Signals for paths the authorizer hides are dropped, and decisions can change over time, so
+    /// consumers must not treat this stream as complete coverage of the base.
+    package var changeSignalsAreComplete: Bool { get async { false } }
     public func changes() async throws -> AsyncStream<Void> {
         unscopedChanges(try await changeSignals())
     }

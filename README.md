@@ -491,6 +491,50 @@ let authorized = AuthorizedFileSystem(base: limited, authorizer: rules)
 let workspace = Workspace(fileSystem: authorized)
 ```
 
+`LimitedFileSystem` serializes its own preflight and mutation with a FIFO gate. Quotas
+count logical regular-file bytes per visible path (including hard-link aliases), and
+all non-root entries, including dangling symlinks. Appends charge aliases by identity
+and link count; unknown aliases are charged conservatively. Already over-quota trees
+may shrink or preserve usage, but cannot increase an exceeded quota. Accounting reads
+metadata only and resolves symlinks in the backend's namespace, including mounts.
+
+When the base declares complete change-signal coverage, Limited caches totals, compact
+per-path accounting metadata (kind, size, identity and link count), children,
+and alias indexes. Successful mutations refresh their affected metadata under the gate;
+a failed or uncertain mutation discards the cache. File and directory identities are
+needed to rule out unrecognized aliases through compositions (even for single-link
+files); missing identities make the mutation uncertain and force a fresh walk on the
+next preflight. External `.entry`, `.shallow`, and
+`.recursive` signals invalidate those scopes for lazy reconciliation on the next
+preflight. Removed/replaced directories invalidate their former descendants; hard-link
+aliases are refreshed together. `.rescan` discards all cached accounting. A failed or
+ended subscription falls back to a full metadata walk on every preflight, unless an
+exact mutation generation is available. Coverage is checked at every preflight; Mounted
+declares complete coverage only when its base and every mount do, including later mounts.
+Incomplete or undeclared coverage uses full walks (or the exact generation capability).
+Each Limited over Local registers its own recursive inotify watcher on Linux; large trees
+can exhaust the watch limit (ENOSPC), at which point accounting safely falls back to walks.
+The retained cache is capped at 250,000 entries (25,000 on iOS/watchOS); above that cap,
+accounting is discarded after the operation and every preflight walks the tree.
+
+**Consistency:** a quota decision incorporates signals processed by this Limited actor
+before its projection finishes. Signals buffered in the backend or stream, or queued
+for actor processing, may arrive after a decision, so external writes can temporarily make accounting stale and
+can exceed quotas. `try await limited.revalidate()` forces a fresh metadata walk under
+the gate without waiting for signals. With external writers quiescent, it closes the
+notification-delivery gap. Neither revalidation nor the gate makes preflight atomic
+with writers using another wrapper or the base directly. The package-level `changeSignalsAreComplete`
+capability is an explicit guarantee of coverage for all visible children; sources that
+only provide a partial stream cannot enable notification-based accounting reuse.
+
+Without complete change signals, each preflight walks the whole tree. The package's optional
+exact mutation-generation capability lets InMemoryFileSystem reuse accounting when
+unchanged; direct mutations, reset, and partial failures change its generation and
+force a new walk. Generation changes during a scan or this wrapper's mutation prevent
+reuse of that potentially inconsistent snapshot.
+Accounting retains strict bulk-walk semantics: a listed entry vanishing before metadata
+lookup fails the preflight and invalidates partial accounting; the next preflight scans anew.
+
 Authorization supports one-shot, duration-limited, and session approvals plus bounded audit records. Prefix rules use path-component boundaries and require both paths to match for copy and move.
 
 Local scans record symlinks without descending into them and retain per-entry authorization
@@ -594,7 +638,7 @@ deadlines (30 minutes per child by default).
 
 | Scenario | What's timed | Setup excluded | Counter blind spots |
 | --- | --- | --- | --- |
-| `writeText`, `apply50`, `limitedWrite` | One recorded write, 50 edits, quota-limited write | No-op preparation, file reset | Checkpoint store; Limited metadata traversal is visible |
+| `writeText`, `apply50`, `limitedWrite` | One recorded write, 50 edits, quota-limited write with warm accounting | No-op preparation, file reset, Limited accounting priming | Checkpoint store; Limited metadata traversal is visible |
 | `transaction` / `transactionFirst` | Begin, one draft write, commit | Preparation; initial begin/discard and baseline checkpoint for steady-state `transaction` only | Draft filesystem, checkpoint store |
 | `preview` | One edit preview | Preparation | Draft filesystem |
 | `checkpointFirst` / `checkpointIncremental` | First capture / capture after one change | Preparation; baseline and change for incremental | Checkpoint store |

@@ -13,8 +13,24 @@ struct IOCounts: Codable, Equatable, Sendable {
 }
 
 /// A lock only protects counter updates; no lock is held across an await.
-class CountingFileSystem: FileSystem, TraversingFileSystem, ExactTimestampFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+class CountingFileSystem: CompleteFileSystemChangeSource, MutationGenerationFileSystem, TraversingFileSystem, ExactTimestampFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+    var changeSignalsAreComplete: Bool { get async { await base.changeSignalsAreComplete } }
     var hasExactContentTimestamps: Bool { get async { await base.supportsExactContentTimestamps } }
+    var mutationGeneration: UInt64? {
+        get async { await (base as? any MutationGenerationFileSystem)?.mutationGeneration }
+    }
+    func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        guard let source = base as? any FileSystemChangeSource else {
+            throw BenchmarkError.message("backend does not provide filesystem notifications")
+        }
+        return try await source.changeSignals()
+    }
+    func changes() async throws -> AsyncStream<Void> {
+        guard let source = base as? any FileSystemChangeSource else {
+            throw BenchmarkError.message("backend does not provide filesystem notifications")
+        }
+        return try await source.changes()
+    }
     let base: any FileSystem
     private let lock = NSLock()
     private var counts = IOCounts()
@@ -167,18 +183,18 @@ class CountingFileSystem: FileSystem, TraversingFileSystem, ExactTimestampFileSy
     }
 }
 
-/// Only Local advertises observation; all filesystem forwarding is inherited.
-final class ObservedCountingFileSystem: CountingFileSystem, FileSystemChangeSource,
+/// Adds observation-call counters for watcher scenarios; forwarding remains unchanged.
+final class ObservedCountingFileSystem: CountingFileSystem,
     @unchecked Sendable
 {
-    func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+    override func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
         call("changeSignals")
         guard let source = base as? any FileSystemChangeSource else {
             throw BenchmarkError.message("backend does not provide filesystem notifications")
         }
         return try await source.changeSignals()
     }
-    func changes() async throws -> AsyncStream<Void> {
+    override func changes() async throws -> AsyncStream<Void> {
         call("changes")
         guard let source = base as? any FileSystemChangeSource else {
             throw BenchmarkError.message("backend does not provide filesystem notifications")

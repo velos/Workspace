@@ -38,6 +38,8 @@ public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewS
     private let stateLock = NSLock()
     private var mounts: [Mount]
     private var mountObservers: [UUID: AsyncStream<[Mount]>.Continuation] = [:]
+    private let syntheticDevice = UInt64.random(in: 1...UInt64.max)
+    private var syntheticInodes: [WorkspacePath: UInt64] = [:]
 
     private func withLock<R>(_ body: () throws -> R) rethrows -> R {
         stateLock.lock()
@@ -143,7 +145,7 @@ public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewS
         } catch {
             guard Self.isMissing(error),
                   path.isRoot || !syntheticChildMountNames(under: path, mounts: mounts).isEmpty else { throw error }
-            return Self.syntheticInfo(at: path)
+            return syntheticInfo(at: path)
         }
     }
 
@@ -436,8 +438,15 @@ public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewS
         return adjusted
     }
 
-    private static func syntheticInfo(at path: WorkspacePath) -> FileInfo {
-        FileInfo(path: path, kind: .directory, size: 0, permissions: .defaultDirectory, modificationDate: nil)
+    private func syntheticInfo(at path: WorkspacePath) -> FileInfo {
+        let inode = withLock {
+            if let existing = syntheticInodes[path] { return existing }
+            let next = UInt64(syntheticInodes.count) + 1
+            syntheticInodes[path] = next
+            return next
+        }
+        return FileInfo(path: path, kind: .directory, size: 0, permissions: .defaultDirectory,
+                        modificationDate: nil, identity: FileIdentity(device: syntheticDevice, inode: inode))
     }
 
     private static func isMissing(_ error: Error) -> Bool {
@@ -495,7 +504,15 @@ public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewS
     }
 }
 
-extension MountedFileSystem: FileSystemChangeSource {
+extension MountedFileSystem: CompleteFileSystemChangeSource {
+    package var changeSignalsAreComplete: Bool {
+        get async {
+            let mounts = mountsSnapshot()
+            guard await base.changeSignalsAreComplete else { return false }
+            for mount in mounts where await !mount.fileSystem.changeSignalsAreComplete { return false }
+            return true
+        }
+    }
     public func changes() async throws -> AsyncStream<Void> {
         unscopedChanges(try await changeSignals())
     }
@@ -516,8 +533,10 @@ extension MountedFileSystem: FileSystemChangeSource {
                     subscriptions.removeAll()
                     let sources = [Mount(mountPoint: .root, fileSystem: self.base)] + mounts
                     for mount in sources {
-                        guard let source = mount.fileSystem as? any FileSystemChangeSource,
-                              let signals = try? await source.changeSignals() else { continue }
+                        guard let source = mount.fileSystem as? any FileSystemChangeSource else { continue }
+                        let signals: AsyncStream<FileSystemChangeSignal>
+                        do { signals = try await source.changeSignals() }
+                        catch { continuation.finish(); return }
                         subscriptions.append(Task {
                             for await signal in signals where !Task.isCancelled {
                                 switch signal {
@@ -534,6 +553,8 @@ extension MountedFileSystem: FileSystemChangeSource {
                                     if !visible.isEmpty { continuation.yield(.paths(visible)) }
                                 }
                             }
+                            // A failed child must not leave a live, silently incomplete stream.
+                            if !Task.isCancelled { continuation.finish() }
                         })
                     }
                     // Reconcile changes during subscription setup and any new mount.

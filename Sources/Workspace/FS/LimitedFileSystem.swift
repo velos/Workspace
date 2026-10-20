@@ -34,11 +34,30 @@ public enum FileSystemLimitError: Error, Sendable, Equatable, CustomStringConver
     }
 }
 
+// Retained accounting omits timestamps, permissions and the duplicate path.
+struct LimitedAccountingEntry: Sendable {
+    let kind: FileTree.Kind
+    let size: UInt64
+    let identity: FileIdentity?
+    let linkCount: UInt64?
+
+    init(_ info: FileInfo) {
+        kind = info.kind
+        size = info.size
+        identity = info.identity
+        linkCount = info.linkCount
+    }
+}
+
 /// A serializing filesystem decorator that rejects mutations exceeding projected limits.
 ///
 /// All mutations through this instance share a FIFO gate. Mutations made directly to the base,
-/// or through another decorator, are outside that gate. Accounting scans metadata, never content,
-/// on each mutation so sequential external changes are reflected without a stale usage cache.
+/// or through another decorator, are outside that gate. Accounting uses metadata, never content.
+/// With complete change notifications, preflights reconcile signals consumed before projection finishes;
+/// undelivered external changes may remain invisible. `revalidate()` forces a fresh metadata
+/// walk without waiting for notifications. Neither notifications nor revalidation make a
+/// preflight atomic with external writers. Without notifications or an exact mutation generation,
+/// every preflight walks the whole tree. Successful mutations reconcile only affected metadata.
 /// Append accounting uses metadata identities and link counts. Unknown aliases are charged
 /// conservatively as all regular files of the target's size. Without the replacement feature,
 /// non-appending writes are projected as replacing the final link itself; this is conservative
@@ -50,6 +69,20 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
     private let base: any FileSystem
     private let pathResolver: FileSystemPathResolver
     public let limits: FileSystemLimits
+    // Above this bound the same projection runs on an ephemeral full walk.
+    #if os(iOS) || os(watchOS)
+    static let accountingCacheEntryLimit = 25_000
+    #else
+    static let accountingCacheEntryLimit = 250_000
+    #endif
+    private var accounting = Accounting()
+    private var cacheValid = false
+    private var cachedGeneration: UInt64?
+    private var observationStarted = false
+    private var observationAvailable = false
+    private var observationTask: Task<Void, Never>?
+    private var invalidations: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
+    private var rescan = false
     private var mutationActive = false
     private var mutationWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -57,6 +90,17 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
         self.base = base
         pathResolver = FileSystemPathResolver(base: base)
         self.limits = limits
+    }
+
+    deinit { observationTask?.cancel() }
+
+    /// Forces fresh metadata accounting under the mutation gate. External writers must be
+    /// quiescent for a coherent result; this does not wait for backend notification delivery.
+    public func revalidate() async throws {
+        await acquireMutation()
+        defer { discardOversizedAccounting(); releaseMutation() }
+        cacheValid = false
+        _ = try await prepareAccounting()
     }
 
     nonisolated package var supportsScopedWalk: Bool { base.supportsScopedWalk }
@@ -147,9 +191,34 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
 
     public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
         await acquireMutation()
-        defer { releaseMutation() }
+        defer { discardOversizedAccounting(); releaseMutation() }
         try Task.checkCancellation()
-        try await base.setPermissions(path: path, permissions: permissions)
+        let generation = cachedGeneration
+        do {
+            let behavior = await base.previewBehavior(at: path)
+            let target = try await pathResolver.resolve(path, features: await base.capabilities(),
+                                                        followFinal: behavior.followsPermissionSymlinks)
+            try await base.setPermissions(path: path, permissions: permissions)
+            guard cacheValid else { return }
+            do {
+                // Permissions may change traversal of this subtree, including its aliases.
+                try await reconcile([target: .recursive])
+                let after = await (base as? any MutationGenerationFileSystem)?.mutationGeneration
+                if let generation { cacheValid = after == generation &+ 1 }
+                cachedGeneration = after
+                if accounting.unidentifiedEntries > 0 { cacheValid = false }
+            } catch { cacheValid = false }
+        } catch {
+            cacheValid = false
+            throw error
+        }
+    }
+
+    private func discardOversizedAccounting() {
+        if accounting.tree.count > Self.accountingCacheEntryLimit {
+            accounting = Accounting()
+            cacheValid = false
+        }
     }
 
     private func acquireMutation() async {
@@ -181,12 +250,40 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
 
     private func mutate(_ mutation: Mutation, operation: () async throws -> Void) async throws {
         await acquireMutation()
-        defer { releaseMutation() }
+        defer { discardOversizedAccounting(); releaseMutation() }
         try Task.checkCancellation()
-        if limits.maxTotalBytes != nil || limits.maxEntryCount != nil {
-            try await preflight(mutation)
+        guard limits.maxTotalBytes != nil || limits.maxEntryCount != nil else {
+            try await operation()
+            return
         }
-        try await operation()
+        let retain = try await prepareAccounting()
+        let affected = try await preflight(mutation)
+        // Missing identities can hide aliases exposed through a composition, even
+        // when a file has a single physical link. Treat that effect as uncertain.
+        let uncertain = accounting.unidentifiedEntries > 0
+        let generation = cachedGeneration
+        do {
+            try await operation()
+        } catch {
+            cacheValid = false // Includes partial mutation and cancellation after backend work.
+            throw error
+        }
+        guard retain, !uncertain else { cacheValid = false; return }
+        do {
+            // Read back the projected scopes so identities, link counts, implicit parents and
+            // backend-specific copy/replacement behavior are exact, rather than invented.
+            try await reconcile(affected)
+            let after = await (base as? any MutationGenerationFileSystem)?.mutationGeneration
+            if let generation {
+                cacheValid = after == generation &+ 1
+            }
+            cachedGeneration = after
+            if accounting.unidentifiedEntries > 0 { cacheValid = false }
+        } catch {
+            // The mutation succeeded. A failed metadata refresh must not turn it into a
+            // reported mutation failure (and tempt the caller to retry it).
+            cacheValid = false
+        }
     }
 
     private func checkWrite(_ count: Int) throws {
@@ -196,51 +293,324 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
     }
 
     private struct Usage {
-        var bytes: UInt64 = 0
+        // Saturate only at the public quota boundary; subtraction must remain exact even
+        // when a backend reports logical sizes whose sum exceeds UInt64.max.
+        private var lowBytes: UInt64 = 0
+        private var highBytes: UInt64 = 0
+        var bytes: UInt64 { highBytes == 0 ? lowBytes : UInt64.max }
         var entries = 0
-
         mutating func add(bytes amount: UInt64) {
-            let sum = bytes.addingReportingOverflow(amount)
-            bytes = sum.overflow ? UInt64.max : sum.partialValue
+            let sum = lowBytes.addingReportingOverflow(amount)
+            lowBytes = sum.partialValue
+            if sum.overflow { highBytes += 1 }
+        }
+        mutating func add(_ other: Usage) {
+            add(bytes: other.lowBytes)
+            highBytes += other.highBytes
+            entries += other.entries
+        }
+        mutating func subtract(_ other: Usage) {
+            let difference = lowBytes.subtractingReportingOverflow(other.lowBytes)
+            lowBytes = difference.partialValue
+            highBytes -= other.highBytes + (difference.overflow ? 1 : 0)
+            entries -= other.entries
         }
     }
 
-    private func preflight(_ mutation: Mutation) async throws {
-        var tree: [WorkspacePath: FileInfo] = [:]
+    private struct Accounting {
+        var tree: [WorkspacePath: LimitedAccountingEntry] = [:]
+        var children: [WorkspacePath: Set<WorkspacePath>] = [:]
+        var identities: [FileIdentity: Set<WorkspacePath>] = [:]
+        var filesBySize: [UInt64: Set<WorkspacePath>] = [:]
+        var unknownFilesBySize: [UInt64: Set<WorkspacePath>] = [:]
+        var usage = Usage()
+        var unidentifiedEntries = 0
+
+        mutating func put(_ info: FileInfo) {
+            erase(info.path)
+            tree[info.path] = LimitedAccountingEntry(info)
+            if info.kind != .symlink, info.identity == nil { unidentifiedEntries += 1 }
+            if !info.path.isRoot {
+                children[info.path.dirname, default: []].insert(info.path)
+                usage.entries += 1
+            }
+            if let identity = info.identity { identities[identity, default: []].insert(info.path) }
+            if info.kind == .file {
+                filesBySize[info.size, default: []].insert(info.path)
+                if info.identity == nil, info.linkCount != 1 {
+                    unknownFilesBySize[info.size, default: []].insert(info.path)
+                }
+                usage.add(bytes: info.size)
+            }
+        }
+
+        mutating func erase(_ path: WorkspacePath) {
+            guard let old = tree.removeValue(forKey: path) else { return }
+            if old.kind != .symlink, old.identity == nil { unidentifiedEntries -= 1 }
+            if !path.isRoot {
+                children[path.dirname]?.remove(path)
+                if children[path.dirname]?.isEmpty == true { children.removeValue(forKey: path.dirname) }
+                usage.entries -= 1
+            }
+            if let identity = old.identity {
+                identities[identity]?.remove(path)
+                if identities[identity]?.isEmpty == true { identities.removeValue(forKey: identity) }
+            }
+            if old.kind == .file {
+                filesBySize[old.size]?.remove(path)
+                if filesBySize[old.size]?.isEmpty == true { filesBySize.removeValue(forKey: old.size) }
+                unknownFilesBySize[old.size]?.remove(path)
+                if unknownFilesBySize[old.size]?.isEmpty == true { unknownFilesBySize.removeValue(forKey: old.size) }
+                var removed = Usage()
+                removed.add(bytes: old.size)
+                usage.subtract(removed)
+            }
+        }
+
+        func subtree(_ path: WorkspacePath) -> Set<WorkspacePath> {
+            var result: Set<WorkspacePath> = []
+            var pending = [path]
+            while let next = pending.popLast() {
+                if tree[next] != nil { result.insert(next) }
+                pending.append(contentsOf: children[next] ?? [])
+            }
+            return result
+        }
+
+        func aliases(of path: WorkspacePath) -> Set<WorkspacePath> {
+            guard let info = tree[path] else { return [] }
+            if let identity = info.identity {
+                var result = identities[identity] ?? [path]
+                if info.kind == .file, info.linkCount != 1 {
+                    result.formUnion(unknownFilesBySize[info.size] ?? [])
+                }
+                return result
+            }
+            guard info.kind == .file, info.linkCount != 1 else { return [path] }
+            return Set((filesBySize[info.size] ?? []).filter { tree[$0]?.linkCount != 1 })
+        }
+    }
+
+    private func startObservation() async {
+        guard !observationStarted else { return }
+        observationStarted = true
+        guard let source = base as? any FileSystemChangeSource else { return }
+        do {
+            let stream = try await source.changeSignals()
+            observationAvailable = true
+            observationTask = Task { [weak self] in
+                for await signal in stream {
+                    guard !Task.isCancelled else { return }
+                    await self?.receive(signal)
+                }
+                await self?.observationEnded()
+            }
+        } catch {
+            observationEnded()
+        }
+    }
+
+    private func receive(_ signal: FileSystemChangeSignal) {
+        switch signal {
+        case .rescan:
+            rescan = true
+            invalidations.removeAll()
+        case let .paths(paths):
+            guard !rescan else { return }
+            for (path, scope) in paths { invalidations[path] = max(invalidations[path] ?? .entry, scope) }
+        }
+    }
+
+    private func observationEnded() {
+        observationAvailable = false
+        rescan = true
+        invalidations.removeAll()
+    }
+
+    private func prepareAccounting() async throws -> Bool {
+        await startObservation()
+        while true {
+            try Task.checkCancellation()
+            let generation = await (base as? any MutationGenerationFileSystem)?.mutationGeneration
+            // Mounted coverage can change after a later mount. A live stream alone
+            // does not guarantee notifications from every child.
+            let complete = await base.changeSignalsAreComplete
+            let retain = (observationAvailable && complete) || generation != nil
+            if !retain || generation != cachedGeneration { cacheValid = false }
+            let full = !cacheValid || rescan
+            let dirty = invalidations
+            invalidations.removeAll()
+            rescan = false
+            do {
+                if full {
+                    accounting = Accounting()
+                    try await capture(.root)
+                    cacheValid = true
+                } else {
+                    try await reconcile(dirty)
+                }
+            } catch {
+                cacheValid = false
+                throw error
+            }
+            let after = await (base as? any MutationGenerationFileSystem)?.mutationGeneration
+            if generation != after { cacheValid = false; continue }
+            cachedGeneration = after
+            if rescan || !invalidations.isEmpty { continue }
+            return retain && accounting.tree.count <= Self.accountingCacheEntryLimit
+        }
+    }
+
+    private func capture(_ path: WorkspacePath, info: FileInfo? = nil) async throws {
         if base.supportsScopedWalk {
-            try await base.walk { info, _, _ in tree[info.path] = info }
+            // Preserve strict accounting-walk failures for vanished listed entries.
+            // Callers invalidate partial accounting before propagating the error.
+            try await base.walk(at: path, skippingVanishedEntries: false) { info, _, _ in self.accounting.put(info) }
         } else {
-            // Preserve metadata-only accounting for custom backends: listings already
-            // supply child metadata and need not permit separate child stat calls.
-            var pending = [try await base.stat(path: .root)]
-            while let info = pending.popLast() {
-                tree[info.path] = info
-                if info.kind == .directory {
-                    for child in try await base.listDirectory(path: info.path) {
+            // Listings supply metadata: no child stat or content-read requirement.
+            let root: FileInfo?
+            if let info { root = info }
+            else if path.isRoot { root = try await base.stat(path: path) }
+            else { root = try await Snapshot.infoIfPresent(at: path, on: base) }
+            guard let root else { return }
+            var pending = [root]
+            while let next = pending.popLast() {
+                accounting.put(next)
+                if next.kind == .directory {
+                    for child in try await base.listDirectory(path: next.path) {
                         var metadata = child.info
-                        metadata.path = info.path.appending(child.name)
+                        metadata.path = next.path.appending(child.name)
                         pending.append(metadata)
                     }
                 }
             }
         }
-        let current = Self.usage(tree)
+    }
+
+    private func reconcile(_ scopes: [WorkspacePath: FileSystemChangeSignal.Scope]) async throws {
+        // Expand old aliases before removing metadata. Directory aliases can expose a
+        // mutation at another mount point; file aliases can change size/link count too.
+        var expanded = scopes
+        for (path, scope) in scopes {
+            for alias in accounting.aliases(of: path) {
+                expanded[alias] = max(expanded[alias] ?? .entry, scope)
+            }
+        }
+        // Parents precede their descendants, including entry-scoped replacements.
+        for (path, scope) in expanded.sorted(by: { $0.key < $1.key }) {
+            var ancestor = path
+            var covered = false
+            while !ancestor.isRoot {
+                ancestor = ancestor.dirname
+                if expanded[ancestor] == .recursive { covered = true; break }
+            }
+            if !covered { try await refresh(path, scope: scope) }
+        }
+    }
+
+    private func refresh(_ path: WorkspacePath, scope: FileSystemChangeSignal.Scope,
+                         includingAliases: Bool = true, listedInfo: FileInfo? = nil) async throws {
+        // A delayed child event must not resurrect entries beneath a directory that
+        // has since become a symlink. Accounting walks never descend through links.
+        if !path.isRoot {
+            var parent = path.dirname
+            while true {
+                guard accounting.tree[parent]?.kind == .directory else { return }
+                if parent.isRoot { break }
+                parent = parent.dirname
+            }
+        }
+        let old = accounting.tree[path]
+        let info: FileInfo?
+        if let listedInfo { info = listedInfo }
+        else { info = try await Snapshot.infoIfPresent(at: path, on: base) }
+        let sameDirectory = old?.kind == .directory && info?.kind == .directory
+            && old?.identity != nil && old?.identity == info?.identity
+        if scope == .recursive || (old?.kind == .directory && !sameDirectory)
+            || (info?.kind == .directory && !sameDirectory) {
+            // Also refresh aliases outside a removed/replaced subtree: unlink changes
+            // their link counts and a later append must not use stale singleton data.
+            let removed = accounting.subtree(path)
+            var aliases: Set<WorkspacePath> = []
+            if includingAliases {
+                for entry in removed { aliases.formUnion(accounting.aliases(of: entry)) }
+            }
+            for entry in removed { accounting.erase(entry) }
+            if let info { try await capture(path, info: info) }
+            for alias in aliases.subtracting(removed) {
+                try await refresh(alias, scope: .entry, includingAliases: false)
+            }
+            return
+        }
+        if let info {
+            accounting.put(info)
+            if includingAliases, info.kind != .directory {
+                for alias in accounting.aliases(of: path) where alias != path {
+                    try await refresh(alias, scope: .entry, includingAliases: false)
+                }
+            }
+        } else { accounting.erase(path) }
+        if scope == .shallow, info?.kind == .directory {
+            var former = accounting.children[path] ?? []
+            for child in try await base.listDirectory(path: path) {
+                let childPath = path.appending(child.name)
+                former.remove(childPath)
+                // A shallow scope validates immediate children but retains unchanged
+                // directory interiors. Identity-less directories cannot prove reuse.
+                var metadata = child.info
+                metadata.path = childPath
+                try await refresh(childPath, scope: .entry, listedInfo: metadata)
+            }
+            for child in former { try await refresh(child, scope: .recursive) }
+        }
+    }
+
+    private func preflight(_ mutation: Mutation) async throws -> [WorkspacePath: FileSystemChangeSignal.Scope] {
+        while true {
+            do {
+                let affected = try await project(mutation)
+                if !rescan && invalidations.isEmpty { return affected }
+            } catch {
+                // Even an early projection rejection (e.g. EEXIST) may have raced a
+                // signal consumed during path resolution. Retry against fresh metadata.
+                if !rescan && invalidations.isEmpty { throw error }
+            }
+            _ = try await prepareAccounting()
+        }
+    }
+
+    private func project(_ mutation: Mutation) async throws -> [WorkspacePath: FileSystemChangeSignal.Scope] {
+        let tree = accounting.tree
+        let current = accounting.usage
         var projected = current
+        var affected: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
         let features = await base.capabilities()
 
-        func resolve(_ path: WorkspacePath, in tree: [WorkspacePath: FileInfo], followFinal: Bool) async throws -> WorkspacePath {
+        func resolve(_ path: WorkspacePath, in tree: [WorkspacePath: LimitedAccountingEntry], followFinal: Bool) async throws -> WorkspacePath {
             try await pathResolver.resolve(path, in: tree, features: features, followFinal: followFinal)
         }
 
         func subtract(_ path: WorkspacePath) {
-            let removed = Self.usage(tree.filter { Self.contains($0.key, in: path) })
-            projected.bytes -= removed.bytes
-            projected.entries -= removed.entries
+            let removed = usage(of: accounting.subtree(path))
+            projected.subtract(removed)
+            affected[path] = .recursive
         }
         func addParents(_ path: WorkspacePath) {
             var parent = path.dirname
-            while !parent.isRoot {
-                if tree[parent] == nil { projected.entries += 1 }
+            var changedRoot = path
+            while true {
+                if !parent.isRoot, tree[parent] == nil {
+                    projected.entries += 1
+                    affected[parent] = .recursive
+                    changedRoot = parent
+                }
+                // Translate only the changed suffix through directory aliases. Walking
+                // the entire aliased directory would make a leaf write scale with its tree.
+                for alias in accounting.aliases(of: parent) where alias != parent {
+                    let suffix = changedRoot.components.dropFirst(parent.components.count).joined(separator: "/")
+                    affected[alias.appending(suffix)] = .recursive
+                }
+                if parent.isRoot { break }
                 parent = parent.dirname
             }
         }
@@ -269,13 +639,15 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
                     let aliases: UInt64
                     if info.linkCount == 1, info.identity == nil {
                         aliases = 1
+                    } else if let identity = info.identity {
+                        let known = accounting.identities[identity]?.count ?? 1
+                        let uncertain = info.linkCount == 1 ? 0 : (accounting.unknownFilesBySize[info.size]?.count ?? 0)
+                        aliases = UInt64(known + uncertain)
                     } else {
-                        aliases = UInt64(tree.reduce(0) { count, entry in
-                            let candidate = entry.value
-                            guard candidate.kind == .file, candidate.size == info.size else { return count }
-                            if entry.key == target { return count + 1 }
+                        aliases = UInt64((accounting.filesBySize[info.size] ?? []).reduce(0) { count, path in
+                            guard let candidate = tree[path] else { return count }
+                            if path == target { return count + 1 }
                             if let identity = info.identity, let other = candidate.identity {
-                                // A mount can expose even a single-link inode at multiple paths.
                                 return identity == other ? count + 1 : count
                             }
                             if info.linkCount == 1 || candidate.linkCount == 1 { return count }
@@ -285,36 +657,39 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
                     let growth = size.multipliedReportingOverflow(by: aliases)
                     projected.add(bytes: growth.overflow ? UInt64.max : growth.partialValue)
                 }
+                affected[target] = .entry
             } else {
                 addLeaf(target, bytes: size)
             }
         case let .directory(path):
             let target = try await resolve(path, in: tree, followFinal: true)
             if tree[target] == nil { addLeaf(target, bytes: 0) }
+            else { affected[target] = .entry }
         case let .remove(path):
             let target = try await resolve(path, in: tree, followFinal: false)
             subtract(target)
+            addParents(target)
         case let .move(source, destination), let .copy(source, destination):
             let from = try await resolve(source, in: tree, followFinal: false)
             let to = try await resolve(destination, in: tree, followFinal: false)
             guard tree[from] != nil else { throw Self.posix(ENOENT) }
             if from == to { break }
-            let copied = Self.usage(tree.filter { Self.contains($0.key, in: from) })
+            let copied = usage(of: accounting.subtree(from))
+            affected[to] = .recursive
             if case .move = mutation {
                 if tree[from]?.kind == .directory, Self.contains(to, in: from) { throw Self.posix(EINVAL) }
                 // Source and destination subtrees can overlap on an invalid backend move.
                 // Subtract their union once; let the backend preserve its destination error.
-                let removed = Self.usage(tree.filter {
-                    Self.contains($0.key, in: to) || Self.contains($0.key, in: from)
-                })
-                projected.bytes -= removed.bytes
-                projected.entries -= removed.entries
+                let removed = usage(of: accounting.subtree(to).union(accounting.subtree(from)))
+                projected.subtract(removed)
+                affected[from] = .recursive
+                addParents(from)
             } else {
                 subtract(to)
             }
             addParents(to)
-            projected.add(bytes: copied.bytes)
-            projected.entries += copied.entries + (from.isRoot && !to.isRoot ? 1 : 0)
+            projected.add(copied)
+            projected.entries += (from.isRoot && !to.isRoot ? 1 : 0)
         case let .symlink(path):
             let target = try await resolve(path, in: tree, followFinal: false)
             if tree[target] != nil { throw Self.posix(EEXIST) }
@@ -326,6 +701,7 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
             guard let info = tree[from] else { throw Self.posix(ENOENT) }
             if info.kind == .directory { throw Self.posix(EPERM) }
             addLeaf(target, bytes: info.kind == .file ? info.size : 0)
+            affected[from] = .entry
         }
         if let limit = limits.maxTotalBytes, projected.bytes > limit, projected.bytes > current.bytes {
             throw FileSystemLimitError.totalBytes(attempted: projected.bytes, limit: limit)
@@ -333,11 +709,13 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
         if let limit = limits.maxEntryCount, projected.entries > limit, projected.entries > current.entries {
             throw FileSystemLimitError.entryCount(attempted: projected.entries, limit: limit)
         }
+        return affected
     }
 
-    private static func usage(_ tree: [WorkspacePath: FileInfo]) -> Usage {
+    private func usage(of paths: Set<WorkspacePath>) -> Usage {
         var result = Usage()
-        for (path, info) in tree {
+        for path in paths {
+            guard let info = accounting.tree[path] else { continue }
             if !path.isRoot { result.entries += 1 }
             if info.kind == .file { result.add(bytes: info.size) }
         }
@@ -363,7 +741,7 @@ struct FileSystemPathResolver: Sendable {
     }
 
     func resolve(
-        _ path: WorkspacePath, in tree: [WorkspacePath: FileInfo]? = nil,
+        _ path: WorkspacePath, in tree: [WorkspacePath: LimitedAccountingEntry]? = nil,
         features: FileSystemFeatures, followFinal: Bool, depth: Int = 0
     ) async throws -> WorkspacePath {
         guard depth < 64 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ELOOP)) }
@@ -403,10 +781,10 @@ struct FileSystemPathResolver: Sendable {
         var current = WorkspacePath.root
         for (index, component) in path.components.enumerated() {
             current = current.appending(component)
-            let info: FileInfo?
-            if let tree { info = tree[current] }
-            else { info = try? await base.stat(path: current) }
-            if info?.kind == .symlink {
+            let kind: FileTree.Kind?
+            if let tree { kind = tree[current]?.kind }
+            else { kind = try? await base.stat(path: current).kind }
+            if kind == .symlink {
                 let target = try await base.readSymlink(path: current)
                 let targetPath = try WorkspacePath(validating: target, relativeTo: current.dirname)
                 let suffix = path.components.dropFirst(index + 1).joined(separator: "/")
@@ -415,7 +793,7 @@ struct FileSystemPathResolver: Sendable {
                     features: features, followFinal: true, depth: depth + 1
                 )
             }
-            if index < path.components.count - 1, let info, info.kind != .directory {
+            if index < path.components.count - 1, let kind, kind != .directory {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOTDIR))
             }
         }
@@ -431,7 +809,8 @@ struct FileSystemPathResolver: Sendable {
 }
 
 
-extension LimitedFileSystem: FileSystemChangeSource {
+extension LimitedFileSystem: CompleteFileSystemChangeSource {
+    package var changeSignalsAreComplete: Bool { get async { await base.changeSignalsAreComplete } }
     public func changes() async throws -> AsyncStream<Void> {
         unscopedChanges(try await changeSignals())
     }

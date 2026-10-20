@@ -217,6 +217,24 @@ public protocol FileSystemChangeSource: FileSystem {
     func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal>
 }
 
+/// Opt-in guarantee that the stream covers every visible child. A composite must
+/// re-evaluate this after topology changes and terminate a stream if coverage fails.
+package protocol CompleteFileSystemChangeSource: FileSystemChangeSource {
+    var changeSignalsAreComplete: Bool { get async }
+}
+
+extension FileSystem {
+    package var changeSignalsAreComplete: Bool {
+        get async { await (self as? any CompleteFileSystemChangeSource)?.changeSignalsAreComplete ?? false }
+    }
+}
+
+#if os(macOS) || os(Linux)
+extension LocalFileSystem: CompleteFileSystemChangeSource {
+    package var changeSignalsAreComplete: Bool { true }
+}
+#endif
+
 /// Invalidates paths in the change source's own filesystem namespace.
 /// Include deleted or replaced ancestors so their former descendants are checked.
 /// Use `.rescan` when paths are unknown, events were dropped, or coverage is uncertain.

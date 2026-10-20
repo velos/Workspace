@@ -13,7 +13,10 @@ import Glibc
 ///
 /// Actor isolation serializes access to the tree so the filesystem can be shared safely across
 /// concurrent tasks.
-public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, ExactTimestampFileSystem, TraversingFileSystem {
+public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, ExactTimestampFileSystem, TraversingFileSystem, MutationGenerationFileSystem {
+    private var generation: UInt64 = 0
+    package var mutationGeneration: UInt64? { generation }
+
     package nonisolated var hasExactContentTimestamps: Bool { true }
     private var lastTimestamp = Date().timeIntervalSinceReferenceDate
 
@@ -78,12 +81,14 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
     /// See ``FileSystem/configure(rootDirectory:)``.
     func configure(rootDirectory: URL) async throws {
+        defer { generation &+= 1 }
         _ = rootDirectory
         root = makeNode(kind: .directory([:]), permissions: 0o755)
     }
 
     /// Clears the filesystem and recreates an empty root directory.
     public func reset() {
+        defer { generation &+= 1 }
         root = makeNode(kind: .directory([:]), permissions: 0o755)
     }
 
@@ -91,7 +96,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
     // caller's executor; only immutable metadata/content values cross that boundary.
     private final class WalkCursor {
         enum Frame {
-            case entry(WorkspacePath, Node?, TimeInterval?)
+            case entry(WorkspacePath, Node?, UInt64?)
             case directory(FileInfo)
         }
         var frames: [Frame]
@@ -99,7 +104,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
     }
     private struct WalkEntry: Sendable {
         var info: FileInfo
-        var capturedAt: TimeInterval
+        var capturedAt: UInt64
         var data: Data?
         var target: String?
     }
@@ -140,13 +145,13 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
             try Task.checkCancellation()
             switch frame {
             case let .directory(info):
-                return WalkEntry(info: info, capturedAt: lastTimestamp)
+                return WalkEntry(info: info, capturedAt: generation)
             case let .entry(path, listed, listedAt):
                 let entry: Node
                 do {
-                    // Every mutation advances lastTimestamp before yielding. After
+                    // Every mutation attempt advances generation before yielding. After
                     // reentrancy, resolve the listed path again, never detached nodes.
-                    if let listed, listedAt == lastTimestamp { entry = listed }
+                    if let listed, listedAt == generation { entry = listed }
                     else { entry = try node(at: path, followFinalSymlink: false) }
                 } catch {
                     guard (listed == nil || skippingVanishedEntries), Snapshot.isMissingEntry(error) else { throw error }
@@ -160,28 +165,28 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
                         (name, child, walkSortKey(name: name.string, isDirectory: child.isDirectory))
                     }.sorted { $0.2.utf8.lexicographicallyPrecedes($1.2.utf8) }
                     for (name, child, _) in ordered.reversed() {
-                        cursor.frames.append(.entry(path.appending(name.string), child, lastTimestamp))
+                        cursor.frames.append(.entry(path.appending(name.string), child, generation))
                     }
                 case let .file(data):
-                    return WalkEntry(info: info, capturedAt: lastTimestamp, data: data)
+                    return WalkEntry(info: info, capturedAt: generation, data: data)
                 case let .symlink(target):
-                    return WalkEntry(info: info, capturedAt: lastTimestamp, target: target)
+                    return WalkEntry(info: info, capturedAt: generation, target: target)
                 }
             }
         }
         return nil
     }
 
-    private func readWalkFile(at path: WorkspacePath, capturedAt: TimeInterval, data: Data?, length: Int?) async throws -> Data {
+    private func readWalkFile(at path: WorkspacePath, capturedAt: UInt64, data: Data?, length: Int?) async throws -> Data {
         if let length, length < 0 { throw WorkspaceError.unsupported("read length must not be negative") }
-        guard capturedAt == lastTimestamp, let data else {
+        guard capturedAt == generation, let data else {
             return try await readFile(path: path, offset: 0, length: length)
         }
         return length.map { Data(data.prefix($0)) } ?? data
     }
 
-    private func readWalkLink(at path: WorkspacePath, capturedAt: TimeInterval, target: String?) async throws -> String {
-        guard capturedAt == lastTimestamp, let target else { return try await readSymlink(path: path) }
+    private func readWalkLink(at path: WorkspacePath, capturedAt: UInt64, target: String?) async throws -> String {
+        guard capturedAt == generation, let target else { return try await readSymlink(path: path) }
         return target
     }
 
@@ -227,14 +232,20 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
     /// See ``FileSystem/createFile(path:data:)``. Actor isolation makes the existence check and
     /// write a single atomic step.
     public func createFile(path: WorkspacePath, data: Data) async throws {
+        defer { generation &+= 1 }
         if (try? node(at: path, followFinalSymlink: false)) != nil {
             throw posixError(EEXIST)
         }
-        try await writeFile(path: path, data: data, append: false)
+        try write(path: path, data: data, append: false)
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.
     public func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
+        defer { generation &+= 1 }
+        try write(path: path, data: data, append: append)
+    }
+
+    private func write(path: WorkspacePath, data: Data, append: Bool) throws {
         guard !path.isRoot else {
             throw posixError(EISDIR)
         }
@@ -266,6 +277,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
     /// See ``FileSystem/createDirectory(path:recursive:)``.
     public func createDirectory(path: WorkspacePath, recursive: Bool) async throws {
+        defer { generation &+= 1 }
         if path.isRoot {
             return
         }
@@ -303,6 +315,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
     /// See ``FileSystem/remove(path:recursive:)``.
     public func remove(path: WorkspacePath, recursive: Bool) async throws {
+        defer { generation &+= 1 }
         if path.isRoot {
             throw posixError(EPERM)
         }
@@ -324,6 +337,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
     /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
+        defer { generation &+= 1 }
         if sourcePath == destinationPath {
             return
         }
@@ -370,6 +384,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool)
         async throws
     {
+        defer { generation &+= 1 }
         let sourceNode = try node(at: sourcePath, followFinalSymlink: false)
         if sourceNode.isDirectory, !recursive {
             throw posixError(EISDIR)
@@ -388,6 +403,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
     /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
+        defer { generation &+= 1 }
         _ = try WorkspacePath(validating: target, relativeTo: path.dirname)
         guard !path.isRoot else {
             throw posixError(EEXIST)
@@ -406,6 +422,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
     /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
+        defer { generation &+= 1 }
         guard !path.isRoot else {
             throw posixError(EEXIST)
         }
@@ -440,6 +457,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
     /// See ``FileSystem/setPermissions(path:permissions:)``.
     public func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws {
+        defer { generation &+= 1 }
         let node = try node(at: path, followFinalSymlink: false)
         node.permissions = Int(permissions.rawValue)
         node.modificationDate = nextTimestamp()
@@ -673,4 +691,11 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
 extension InMemoryFileSystem: PreviewSemanticsFileSystem {
     package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics { .init() }
+}
+
+/// Optional exact revision for metadata accounting. Each attempted public mutation advances
+/// once, including failures; nil means unavailable. Forwarders must preserve that rule.
+/// Readers compare before/after a scan and before/after their own mutation.
+package protocol MutationGenerationFileSystem: FileSystem {
+    var mutationGeneration: UInt64? { get async }
 }

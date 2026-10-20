@@ -299,7 +299,8 @@ public final class SecurityScopedFileSystem: FileSystem, TraversingFileSystem, P
 
 typealias SecurityScopedFilesystem = SecurityScopedFileSystem
 
-extension SecurityScopedFileSystem: FileSystemChangeSource {
+extension SecurityScopedFileSystem: CompleteFileSystemChangeSource {
+    package var changeSignalsAreComplete: Bool { get async { await (backing as any FileSystem).changeSignalsAreComplete } }
     public func changes() async throws -> AsyncStream<Void> {
         unscopedChanges(try await changeSignals())
     }

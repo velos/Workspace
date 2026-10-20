@@ -113,6 +113,11 @@ struct ScenarioRunner {
                     maxTotalBytes: UInt64(fixture.bytes) * 2, maxEntryCount: fixture.fileCount * 3
                 )
             ) : counter
+        // limitedWrite measures a warm accounting cache. Workspace's no-op priming
+        // does not reach the filesystem mutation boundary, so prime it explicitly.
+        if operation == .limitedWrite {
+            try await filesystem.writeFile(path: path, data: original, append: false)
+        }
         let store = scratch.appendingPathComponent(storeName)
         defer { try? FileManager.default.removeItem(at: store) }
         let persistence: Workspace.Persistence =
