@@ -165,6 +165,36 @@ struct Fixture: Codable, Sendable {
         try JSONEncoder().encode(fixture).write(to: manifest, options: .atomic)
         return fixture
     }
+    /// Metadata-only guard between children; full content validation happens on initial reuse.
+    func validateCounts(at directory: URL) throws {
+        let manager = FileManager.default
+        let tree = directory.appendingPathComponent("tree")
+        guard (try manager.attributesOfItem(atPath: tree.path))[.type] as? FileAttributeType == .typeDirectory else {
+            throw BenchmarkError.message("missing fixture tree: \(tree.path)")
+        }
+        var enumerationError: Error?
+        guard let enumerator = manager.enumerator(at: tree,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            errorHandler: { _, error in enumerationError = error; return false }) else {
+            throw BenchmarkError.message("cannot enumerate fixture tree: \(tree.path)")
+        }
+        var actualFiles = 0
+        var actualBytes: Int64 = 0
+        for case let url as URL in enumerator {
+            try TemporaryCleanup.shared.checkInterrupt()
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if values.isRegularFile == true {
+                actualFiles += 1
+                actualBytes += Int64(values.fileSize ?? 0)
+            }
+        }
+        if let enumerationError { throw enumerationError }
+        guard actualFiles == fileCount, actualBytes == bytes else {
+            throw BenchmarkError.message(
+                "expected \(fileCount) regular files / \(bytes) bytes, found \(actualFiles) regular files / \(actualBytes) bytes")
+        }
+    }
+
     static func loadMemory(from tree: URL) async throws -> InMemoryFileSystem {
         let local = try LocalFileSystem(root: tree)
         let memory = InMemoryFileSystem()

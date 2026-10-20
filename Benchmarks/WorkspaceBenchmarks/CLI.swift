@@ -208,6 +208,14 @@ struct WorkspaceBenchmarks {
         )
         for (index, scenario) in scenarios.enumerated() {
             try TemporaryCleanup.shared.checkInterrupt()
+            do {
+                try fixture.validateCounts(at: directory)
+            } catch {
+                try TemporaryCleanup.shared.checkInterrupt()
+                let last = report.results.last?.scenario.id ?? "none (before first scenario)"
+                throw BenchmarkError.message(
+                    "fixture modified during run: \(error); last scenario: \(last); before scenario: \(scenario.id)")
+            }
             let resultURL = temporary.appendingPathComponent("result\(index).json")
             let child = Process()
             guard let executable = Bundle.main.executableURL else {
