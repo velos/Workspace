@@ -12,7 +12,8 @@ final class CoarseFileSystem: FileSystem, FileSystemChangeSource, Sendable {
     let timestamp: Date
     init(mode: Mode = .coarse, timestamp: Date? = nil) {
         self.mode = mode
-        self.timestamp = timestamp ?? (mode == .verified ? Date(timeIntervalSince1970: 1_000) : Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970)))
+        // Coarse/racy cases must stay inside the capture window regardless of scheduling.
+        self.timestamp = timestamp ?? (mode == .verified ? Date(timeIntervalSince1970: 1_000) : .distantFuture)
         (stream, continuation) = AsyncStream.makeStream()
     }
     func signal(_ s: FileSystemChangeSignal) { continuation.yield(s) }

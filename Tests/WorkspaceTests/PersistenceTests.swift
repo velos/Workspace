@@ -348,13 +348,18 @@ struct PersistenceTests {
         let workspace = Workspace(fileSystem: files, persistence: .directory(historyRoot))
         try await local.writeFile(path: "/note", data: Data("first".utf8), append: false)
         try FileManager.default.setAttributes(
-            [.modificationDate: Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))],
+            [.modificationDate: Date().addingTimeInterval(60)],
             ofItemAtPath: filesRoot.appendingPathComponent("note").path
         )
         let mtime = try #require(try await local.stat(path: "/note").modificationDate)
+        let identity = try #require(try await local.stat(path: "/note").identity)
         let before = try await workspace.createCheckpoint()
-        try await local.writeFile(path: "/note", data: Data("other".utf8), append: false)
+        // Keep the inode and size unchanged so only the racy window forces a read.
+        let handle = try FileHandle(forWritingTo: filesRoot.appendingPathComponent("note"))
+        try handle.write(contentsOf: Data("other".utf8))
+        try handle.close()
         try FileManager.default.setAttributes([.modificationDate: mtime], ofItemAtPath: filesRoot.appendingPathComponent("note").path)
+        #expect(try await local.stat(path: "/note").identity == identity)
         #expect(try await local.stat(path: "/note").modificationDate == mtime)
         await files.resetReadCount()
         let after = try await workspace.createCheckpoint()
