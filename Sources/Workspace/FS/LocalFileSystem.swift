@@ -18,7 +18,7 @@ private typealias LocalStat = Glibc.stat
 /// This is a safety layer, not a sandbox: a host process can relocate an already-open directory
 /// outside the root, change hard-linked data, or mutate entries during recursive operations.
 /// Watch subscriptions still use the configured URL and are not descriptor-pinned.
-public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem, TraversingFileSystem, @unchecked Sendable {
     /// Returns zero on success or a captured POSIX errno on failure. Injection is per-instance
     /// so unsupported filesystem behavior can be tested without mounts or global syscall hooks.
     typealias ExclusiveRename = @Sendable (Int32, String, Int32, String) -> Int32
@@ -28,6 +28,15 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     private let exclusiveRename: ExclusiveRename
     private let stateLock = NSLock()
     private var configuration: ConfigurationSnapshot?
+
+    #if DEBUG
+    private var spellingChecks = 0
+    var spellingCheckCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return spellingChecks
+    }
+    #endif
 
     private final class Descriptor: @unchecked Sendable {
         let value: Int32
@@ -60,10 +69,14 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         #endif
     }
 
-    private struct Entry {
+    private struct Entry: Sendable {
         let parent: Descriptor
         let name: String
-        let path: WorkspacePath
+        private var resolvedPath: WorkspacePath?
+        private var pathComponents: [String] = []
+        var path: WorkspacePath {
+            resolvedPath ?? WorkspacePath(unchecked: "/" + pathComponents.joined(separator: "/"))
+        }
         var isVerified = false
         var directoryInfo: LocalStat?
 
@@ -73,7 +86,23 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             try LocalFileSystem.validateEntryName(name)
             self.parent = parent
             self.name = name
-            self.path = path
+            self.resolvedPath = path
+        }
+
+        // Ancestor opens usually never consume the path. Retain components and
+        // construct it only for a returned target or diagnostic.
+        init(parent: Descriptor, name: String, components: [String]) throws {
+            try LocalFileSystem.validateEntryName(name)
+            self.parent = parent
+            self.name = name
+            self.pathComponents = components
+        }
+
+        func atPath(_ path: WorkspacePath) -> Entry {
+            var entry = self
+            entry.resolvedPath = path
+            entry.pathComponents = []
+            return entry
         }
 
         // Names emitted by readdir already have stored spelling. This initializer
@@ -91,7 +120,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         init(directory: Descriptor, path: WorkspacePath) {
             self.parent = directory
             self.name = "."
-            self.path = path
+            self.resolvedPath = path
             self.isVerified = true
             self.directoryInfo = directory.directoryInfo
         }
@@ -190,6 +219,11 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     }
 
     private func checkSpelling(_ entry: Entry, creating: Bool = false) throws {
+        #if DEBUG
+        stateLock.lock()
+        spellingChecks += 1
+        stateLock.unlock()
+        #endif
         try spelling.check(parent: entry.parent.value, name: entry.name,
                            policy: entry.parent.spellingPolicy, creating: creating)
     }
@@ -336,7 +370,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             }
             let final = pending.isEmpty
             var entry = try Entry(parent: current, name: name,
-                path: WorkspacePath(unchecked: "/" + (names + [name]).joined(separator: "/")))
+                components: names + [name])
             if missingAncestor {
                 // Only potential-path resolution consumes unverified entries, and
                 // only their path strings. I/O helpers require a verified Entry.
@@ -351,6 +385,28 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
                     entry = try verifiedEntry(entry, creating: creating)
                 }
                 return entry
+            }
+            // A no-follow directory open checks the type and pins an ancestor
+            // without a preceding lstat. APFS defers its spelling check to the
+            // same parent boundary as the metadata route below.
+            if !final {
+                let fd = openat(entry.parent.value, entry.name, Self.searchDirectoryFlags | O_NOFOLLOW | O_CLOEXEC)
+                if fd >= 0 {
+                    current = try directoryDescriptor(fd)
+                    if batchAPFS && current.spellingPolicy != .darwin {
+                        throw ResolutionRetry.componentChecks
+                    }
+                    names.append(entry.name)
+                    continue
+                }
+                let code = errno
+                guard code == ELOOP || code == ENOTDIR || code == ENOENT else {
+                    if batchAPFS {
+                        try verifyParent(current, names: names, configuration: config, batchAPFS: true)
+                        _ = try verifiedEntry(entry, creating: creating)
+                    }
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+                }
             }
             var info = LocalStat()
             let status = fstatat(entry.parent.value, entry.name, &info, AT_SYMLINK_NOFOLLOW)
@@ -396,10 +452,10 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             if info.st_mode & S_IFMT == S_IFDIR { entry.directoryInfo = info }
             if final { return entry }
             if batchAPFS && !entry.isVerified {
-                // This is the only open of an unverified Entry. It opens a directory
+                // Like the fast open above, this may open an unverified directory
                 // with O_NOFOLLOW, retains its mandatory policy, and cannot expose
                 // data or mutate it until verifyParent succeeds at the boundary.
-                let fd = openat(current.value, name, Self.searchDirectoryFlags | O_NOFOLLOW | O_CLOEXEC)
+                let fd = openat(entry.parent.value, entry.name, Self.searchDirectoryFlags | O_NOFOLLOW | O_CLOEXEC)
                 if fd < 0 {
                     let error = errno
                     try verifyParent(current, names: names, configuration: config, batchAPFS: true)
@@ -498,6 +554,120 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             linkCount: type == S_IFDIR ? nil : UInt64(info.st_nlink))
     }
 
+    /// Holds only the active directory ancestry, for this read-only call. Descents and
+    /// file opens use O_NOFOLLOW; metadata and link targets use the same parent fd.
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+                      visit: FileSystemWalkVisitor) async throws {
+        let entry: Entry
+        let info: LocalStat
+        do {
+            let resolved = try resolve(path, followFinal: false)
+            entry = resolved.atPath(path)
+            info = try metadata(entry)
+        } catch {
+            if Snapshot.isMissingEntry(error) { return }
+            throw error
+        }
+        try await walkEntry(entry, info: info, depth: 0, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+    }
+
+    nonisolated(nonsending) private func walkEntry(_ entry: Entry, info: LocalStat, depth: Int, skippingUnreadableDirectories: Bool,
+                           visit: FileSystemWalkVisitor) async throws {
+        try Task.checkCancellation()
+        // Bound this call's retained ancestry, leaving room for unrelated operations at
+        // the usual 256-descriptor soft limit. The fallback resolves each operation anew.
+        if depth == 32 {
+            let current = try self.metadata(resolve(entry.path, followFinal: false))
+            guard current.st_dev == info.st_dev, current.st_ino == info.st_ino else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ESTALE))
+            }
+            try await walkUsingPaths(at: entry.path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+                                     requireExisting: true, visit: visit)
+            return
+        }
+        let metadata = fileInfo(info, path: entry.path)
+        if metadata.kind == .directory {
+            let directory: Descriptor
+            let children: [(entry: Entry, info: LocalStat, key: String)]
+            do {
+                directory = try openEntry(entry, flags: O_RDONLY | O_DIRECTORY)
+                children = try names(in: directory, consumingOffset: true).map { name in
+                    let child = try Entry(parent: directory, storedName: name, path: entry.path.appending(name))
+                    let info = try self.metadata(child)
+                    return (child, info, walkSortKey(name: name, isDirectory: info.st_mode & S_IFMT == S_IFDIR))
+                }.sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
+            } catch {
+                guard skippingUnreadableDirectories, isSkippableWalkError(error, at: entry.path) else { throw error }
+                try await visit(metadata, { _ in throw WorkspaceError.unsupported("cannot read a directory") },
+                                { throw WorkspaceError.unsupported("not a symlink") })
+                return
+            }
+            for (child, info, _) in children {
+                try await walkEntry(child, info: info, depth: depth + 1, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
+            }
+        }
+        try await visit(metadata, { length in try self.readEntry(entry, length: length) },
+                        { try self.linkTarget(entry) })
+    }
+
+    private func openRegularFile(_ entry: Entry) throws -> (Descriptor, LocalStat) {
+        let fd = try openEntry(entry, flags: O_RDONLY | O_NONBLOCK)
+        var info = LocalStat()
+        try check(fstat(fd.value, &info))
+        guard info.st_mode & S_IFMT == S_IFREG else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(info.st_mode & S_IFMT == S_IFDIR ? EISDIR : EINVAL))
+        }
+        return (fd, info)
+    }
+
+    private func readEntry(_ entry: Entry, offset: UInt64 = 0, length: Int?) throws -> Data {
+        if let length, length < 0 { throw WorkspaceError.unsupported("read length must not be negative") }
+        let (fd, info) = try openRegularFile(entry)
+        let size = UInt64(max(0, info.st_size))
+        if offset > 0 {
+            guard offset < size else { return Data() }
+            if lseek(fd.value, off_t(offset), SEEK_SET) < 0 {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+        }
+        let limit = length ?? Int.max
+        // Allocate for the observed size, bounded by the range and a 256 MiB initial
+        // allocation ceiling. Read directly into the result, then probe EOF and
+        // accommodate concurrent growth (or files larger than the initial allocation).
+        var data = Data(count: min(limit, 256 * 1_024 * 1_024, Int(clamping: size - min(offset, size))))
+        var filled = 0
+        while filled < limit {
+            if filled == data.count {
+                var extra = [UInt8](repeating: 0, count: min(4_096, limit - filled))
+                let count = extra.withUnsafeMutableBytes { read(fd.value, $0.baseAddress!, $0.count) }
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
+                if count == 0 { break }
+                // Probe EOF before reserving more space, so unchanged small files
+                // do not allocate a large spare buffer. Once growth is observed,
+                // double the result (at least 1 MiB) and read directly into it.
+                let capacity = filled + min(limit - filled, max(1_024 * 1_024, filled))
+                data.append(extra, count: count)
+                filled += count
+                data.count = capacity
+            } else {
+                let count = data.withUnsafeMutableBytes {
+                    read(fd.value, $0.baseAddress!.advanced(by: filled), min($0.count - filled, Int(Int32.max)))
+                }
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
+                if count == 0 { break }
+                filled += count
+            }
+        }
+        data.count = filled
+        return data
+    }
+
     /// See ``FileSystem/stat(path:)``.
     ///
     /// Uses lstat semantics: inspect the link itself, including dangling or external links.
@@ -505,9 +675,11 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
         try fileInfo(metadata(resolve(path, followFinal: false)), path: path)
     }
 
-    private func names(in directory: Descriptor) throws -> [String] {
-        // openat(".") gives an independent directory offset; dup would share it.
-        let fd = openat(directory.value, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    private func names(in directory: Descriptor, consumingOffset: Bool = false) throws -> [String] {
+        // Walks own a fresh descriptor and enumerate it only once. Other callers need
+        // an independent offset, especially when their descriptor is the pinned root.
+        let fd = consumingOffset ? try duplicateDescriptor(directory.value)
+            : openat(directory.value, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard fd >= 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
@@ -538,7 +710,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
                 result.append(name)
             }
         }
-        return result.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+        return consumingOffset ? result : result.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
     }
 
     /// See ``FileSystem/listDirectory(path:)``.
@@ -553,12 +725,7 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
     }
 
     private func readHandle(_ path: WorkspacePath) throws -> FileHandle {
-        let fd = try openEntry(resolve(path, followFinal: true), flags: O_RDONLY | O_NONBLOCK)
-        var info = LocalStat()
-        try check(fstat(fd.value, &info))
-        guard info.st_mode & S_IFMT == S_IFREG else {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(info.st_mode & S_IFMT == S_IFDIR ? EISDIR : EINVAL))
-        }
+        let (fd, _) = try openRegularFile(resolve(path, followFinal: true))
         return FileHandle(fileDescriptor: try duplicateDescriptor(fd.value), closeOnDealloc: true)
     }
 
@@ -570,31 +737,12 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
 
     /// See ``FileSystem/readFile(path:)``.
     public func readFile(path: WorkspacePath) async throws -> Data {
-        let handle = try readHandle(path)
-        defer {
-            try? handle.close()
-        }
-        return try handle.readToEnd() ?? Data()
+        try readEntry(resolve(path, followFinal: true), length: nil)
     }
 
     /// See ``FileSystem/readFile(path:offset:length:)``.
     public func readFile(path: WorkspacePath, offset: UInt64, length: Int?) async throws -> Data {
-        if let length, length < 0 {
-            throw WorkspaceError.unsupported("read length must not be negative")
-        }
-        let handle = try readHandle(path)
-        defer {
-            try? handle.close()
-        }
-        let size = try handle.seekToEnd()
-        guard offset < size else {
-            return Data()
-        }
-        try handle.seek(toOffset: offset)
-        if let length {
-            return try handle.read(upToCount: length) ?? Data()
-        }
-        return try handle.readToEnd() ?? Data()
+        try readEntry(resolve(path, followFinal: true), offset: offset, length: length)
     }
 
     private actor ChunkReader {
@@ -921,26 +1069,9 @@ public final class LocalFileSystem: FileSystem, PotentialPathResolvingFileSystem
             return await exists(path: pattern) ? [pattern] : []
         }
         let regex = try NSRegularExpression(pattern: WorkspacePath.globToRegex(pattern.string))
-        var paths: [WorkspacePath] = [.root]
-        var queue: [WorkspacePath] = [.root]
-        while !queue.isEmpty {
-            let directory = queue.removeFirst()
-            let entries: [DirectoryEntry]
-            do {
-                entries = try await listDirectory(path: directory)
-            } catch let error as NSError
-                where !directory.isRoot
-                && error.domain == NSPOSIXErrorDomain
-                && [Int(EACCES), Int(ENOENT), Int(ENOTDIR)].contains(error.code)
-            {
-                continue
-            }
-            for entry in entries {
-                paths.append(entry.info.path)
-                if entry.info.kind == .directory {
-                    queue.append(entry.info.path)
-                }
-            }
+        var paths: [WorkspacePath] = []
+        try await walk(at: .root, skippingUnreadableDirectories: true) { info, _, _ in
+            paths.append(info.path)
         }
         return paths.filter {
             regex.firstMatch(in: $0.string, range: NSRange($0.string.startIndex..., in: $0.string)) != nil

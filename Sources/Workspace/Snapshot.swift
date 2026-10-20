@@ -188,12 +188,33 @@ extension Snapshot {
         return false
     }
 
+    private static func captureTree(from target: any FileSystem, at path: WorkspacePath) async throws -> Entry {
+        var children: [WorkspacePath: [Entry]] = [:]
+        var root: Entry = .missing(.init(path: path))
+        try await target.walk(at: path) { info, read, readLink in
+            let entry: Entry
+            switch info.kind {
+            case .directory:
+                entry = .directory(.init(path: info.path, permissions: info.permissions,
+                    children: (children.removeValue(forKey: info.path) ?? []).sorted { $0.path < $1.path }))
+            case .file:
+                entry = .file(.init(path: info.path, data: try await read(nil), permissions: info.permissions))
+            case .symlink:
+                entry = .symlink(.init(path: info.path, target: try await readLink(), permissions: info.permissions))
+            }
+            if info.path == path { root = entry }
+            else { children[info.path.parent, default: []].append(entry) }
+        }
+        return root
+    }
+
     private static func captureEntry(from target: any FileSystem, at path: WorkspacePath) async throws -> Entry {
         guard let info = try await infoIfPresent(at: path, on: target) else {
             return .missing(.init(path: path))
         }
         switch info.kind {
         case .directory:
+            if target.supportsScopedWalk { return try await captureTree(from: target, at: path) }
             let entries = try await target.listDirectory(path: path)
             let children = try await entries
                 .sorted { PathName($0.name) < PathName($1.name) }

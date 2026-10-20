@@ -1,7 +1,7 @@
 import Foundation
 
 /// A disk-backed filesystem rooted in a standard app sandbox location.
-public final class SandboxFileSystem: FileSystem, PotentialPathResolvingFileSystem, Sendable {
+public final class SandboxFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvingFileSystem, Sendable {
     /// Supported strategies for choosing the sandbox root.
     public enum Root: Sendable {
         /// The user's documents directory.
@@ -23,6 +23,11 @@ public final class SandboxFileSystem: FileSystem, PotentialPathResolvingFileSyst
         backing = LocalFileSystem(fileManager: fileManager)
         let resolvedRoot = try Self.resolveRootURL(root, fileManager: fileManager)
         try backing.applyConfiguration(rootDirectory: resolvedRoot)
+    }
+
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+                      visit: FileSystemWalkVisitor) async throws {
+        try await backing.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
     }
 
     /// See ``FileSystem/stat(path:)``.

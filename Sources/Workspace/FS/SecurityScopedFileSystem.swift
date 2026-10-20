@@ -5,7 +5,7 @@ import Foundation
 ///
 /// This adapter is intended for iOS and macOS workflows where filesystem access must be granted through
 /// a bookmark or document picker URL.
-public final class SecurityScopedFileSystem: FileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+public final class SecurityScopedFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     /// The permitted mutability for the scoped filesystem.
     public enum AccessMode: Sendable {
         /// Only read operations are allowed.
@@ -126,6 +126,11 @@ public final class SecurityScopedFileSystem: FileSystem, PotentialPathResolvingF
             cachedBookmarkData = nil
             try configureBackingForCurrentURL()
         }
+    }
+
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+                      visit: FileSystemWalkVisitor) async throws {
+        try await backing.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
     }
 
     /// See ``FileSystem/stat(path:)``.

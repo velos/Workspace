@@ -223,9 +223,8 @@ extension Workspace {
         }
 
         let context = min(request.contextLines, SearchRequest.maximumContextLines)
-        let allFiles = try await selectedFiles(request.files, on: fileSystem)
-        let files = Array(allFiles.prefix(request.limits.maxFiles))
-        var truncation: SearchResult.Truncation? = allFiles.count > files.count ? .fileLimit : nil
+        var selectedCount = 0
+        var truncation: SearchResult.Truncation?
         var matches: [SearchResult.Match] = []
         var skipped: [SearchResult.SkippedFile] = []
         var searchedFileCount = 0
@@ -243,9 +242,7 @@ extension Workspace {
             encoder.outputFormatting = [.sortedKeys]
             return encoder
         }
-        let regex: NSRegularExpression? = if case let .regularExpression(pattern) = request.pattern {
-            try NSRegularExpression(pattern: pattern)
-        } else { nil }
+        let matcher = try SearchMatcher(request.pattern)
 
         func recordSkipped(_ path: WorkspacePath, reason: SearchResult.SkippedFile.Reason) throws {
             let value = SearchResult.SkippedFile(path: path, reason: reason)
@@ -263,33 +260,34 @@ extension Workspace {
             }
         }
 
-        for path in files {
-            let info = try await fileSystem.stat(path: path)
+        try await visitSearchFiles(request.files, on: fileSystem) { info, read in
+            selectedCount += 1
+            guard selectedCount <= request.limits.maxFiles else {
+                if truncation == nil { truncation = .fileLimit }
+                return
+            }
+            let path = info.path
             if info.size > request.limits.maxFileBytes {
                 try recordSkipped(path, reason: .sizeLimitExceeded)
-                continue
+                return
             }
             let readLimit = Int(min(request.limits.maxFileBytes, UInt64(Int.max - 1))) + 1
-            let data = try await fileSystem.readFile(path: path, offset: 0, length: readLimit)
+            let data = try await read(readLimit)
             // Recheck actual bytes in case the file grew between stat and read.
             if UInt64(data.count) > request.limits.maxFileBytes {
                 try recordSkipped(path, reason: .sizeLimitExceeded)
-                continue
+                return
             }
-            guard !data.contains(0), let text = String(data: data, encoding: .utf8) else {
+            guard let text = SearchText(data: data) else {
                 try recordSkipped(path, reason: .binary)
-                continue
+                return
             }
             searchedFileCount += 1
-            let lines = text.utf8.split(separator: 0x0A, omittingEmptySubsequences: false)
-                .map { String(decoding: $0, as: UTF8.self) }
-            var byteOffsets: [UInt64] = [0]
-            for line in lines { byteOffsets.append(byteOffsets.last! + UInt64(line.utf8.count)) }
-            for (index, line) in lines.enumerated() where Self.matches(line, request.pattern, regex: regex) {
+            for index in text.matchingLines(matcher) {
                 // Clamp each distance before arithmetic; no untrusted addition/subtraction.
                 let lower = index - min(index, context)
-                let upper = index + 1 + min(lines.count - index - 1, context)
-                let matchBytes = byteOffsets[upper] - byteOffsets[lower]
+                let upper = index + 1 + min(text.lineCount - index - 1, context)
+                let matchBytes = text.byteCount(lower..<upper)
                 let ordinal = totalMatches
                 totalMatches += 1
                 guard ordinal >= request.matchOffset, !pageClosed else { continue }
@@ -298,10 +296,11 @@ extension Workspace {
                     pageClosed = true
                     continue
                 }
+                let line = text.line(index)
                 var match = SearchResult.Match(
                     path: path, lineNumber: index + 1, line: line,
-                    before: (lower..<index).map { .init(number: $0 + 1, text: lines[$0]) },
-                    after: ((index + 1)..<upper).map { .init(number: $0 + 1, text: lines[$0]) },
+                    before: (lower..<index).map { .init(number: $0 + 1, text: text.line($0)) },
+                    after: ((index + 1)..<upper).map { .init(number: $0 + 1, text: text.line($0)) },
                     truncated: false, totalBytes: matchBytes
                 )
                 if let encoder, let budget = remaining {
@@ -350,13 +349,21 @@ extension Workspace {
         )
     }
 
-    private static func matches(_ line: String, _ pattern: TextPattern, regex: NSRegularExpression?) -> Bool {
-        switch pattern {
-        case let .literal(value, caseSensitive):
-            return line.range(of: value, options: caseSensitive ? [] : [.caseInsensitive]) != nil
-        case .regularExpression:
-            guard let regex else { return false }
-            return regex.firstMatch(in: line, range: NSRange(line.startIndex..<line.endIndex, in: line)) != nil
+    nonisolated(nonsending) private static func visitSearchFiles(
+        _ selection: FileSelection, on fileSystem: any FileSystem,
+        visit: @escaping @isolated(any) (FileInfo, @Sendable (Int?) async throws -> Data) async throws -> Void
+    ) async throws {
+        let plan = FileSelectionPlan(selection)
+        guard let filter = try plan.walkFilter(on: fileSystem) else {
+            for path in try await selectedFiles(selection, on: fileSystem) {
+                let info = try await fileSystem.stat(path: path)
+                try await visit(info, { try await fileSystem.readFile(path: path, offset: 0, length: $0) })
+            }
+            return
+        }
+        // Start at root because selection patterns may be absolute or contain '..'.
+        try await fileSystem.walk(skippingUnreadableDirectories: true) { info, read, _ in
+            if info.kind == .file, filter.contains(info.path) { try await visit(info, read) }
         }
     }
 }

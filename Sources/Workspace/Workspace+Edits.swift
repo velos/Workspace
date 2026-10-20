@@ -296,18 +296,9 @@ extension Workspace {
     static func selectedFiles(_ selection: FileSelection, on fileSystem: any FileSystem) async throws
         -> [WorkspacePath]
     {
-        var included = Set<WorkspacePath>()
-        for pattern in selection.include {
-            let resolved = WorkspacePath(normalizing: pattern, relativeTo: selection.root)
-            included.formUnion(try await fileSystem.glob(pattern: resolved.string, currentDirectory: selection.root))
-        }
-        var excluded = Set<WorkspacePath>()
-        for pattern in selection.exclude {
-            let resolved = WorkspacePath(normalizing: pattern, relativeTo: selection.root)
-            excluded.formUnion(try await fileSystem.glob(pattern: resolved.string, currentDirectory: selection.root))
-        }
+        let selected = try await FileSelectionPlan(selection).paths(on: fileSystem)
         var files: [WorkspacePath] = []
-        for path in included.subtracting(excluded).sorted() {
+        for path in selected {
             if try await fileSystem.stat(path: path).kind == .file {
                 files.append(path)
             }

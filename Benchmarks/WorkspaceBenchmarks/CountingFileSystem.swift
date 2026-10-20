@@ -13,7 +13,7 @@ struct IOCounts: Codable, Equatable, Sendable {
 }
 
 /// A lock only protects counter updates; no lock is held across an await.
-class CountingFileSystem: FileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
+class CountingFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     let base: any FileSystem
     private let lock = NSLock()
     private var counts = IOCounts()
@@ -25,6 +25,31 @@ class CountingFileSystem: FileSystem, PotentialPathResolvingFileSystem, @uncheck
         lock.withLock {
             counts.bytesRead += Int64(data.count)
             if file { counts.filesRead += 1 }
+        }
+    }
+    nonisolated package var supportsScopedWalk: Bool { base.supportsScopedWalk }
+
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+                      visit: FileSystemWalkVisitor) async throws {
+        call("walk")
+        try await base.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories) { info, read, readLink in
+            self.call("walkEntry")
+            if info.path != path { self.lock.withLock { self.counts.directoryEntries += 1 } }
+            // The callbacks remain scoped to this awaited visit; the temporary
+            // conversion permits forwarding Swift's nested nonescaping parameters.
+            try await withoutActuallyEscaping(read) { scopedRead in
+                try await withoutActuallyEscaping(readLink) { scopedLink in
+                    try await visit(info, { length in
+                        self.call(length == nil ? "readFile" : "readRange")
+                        let data = try await scopedRead(length)
+                        self.read(data)
+                        return data
+                    }, {
+                        self.call("readSymlink")
+                        return try await scopedLink()
+                    })
+                }
+            }
         }
     }
     func stat(path: WorkspacePath) async throws -> FileInfo {

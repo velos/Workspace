@@ -46,7 +46,7 @@ public enum FileSystemLimitError: Error, Sendable, Equatable, CustomStringConver
 /// Custom backends must follow standard mutation semantics: replacement changes one entry;
 /// append updates aliases; parents may be created. A composition cycle (for example a Mounted
 /// base that mounts this same LimitedFileSystem) deadlocks while the gate is held.
-public actor LimitedFileSystem: FileSystem, PotentialPathResolvingFileSystem {
+public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PotentialPathResolvingFileSystem {
     private let base: any FileSystem
     private let pathResolver: FileSystemPathResolver
     public let limits: FileSystemLimits
@@ -57,6 +57,13 @@ public actor LimitedFileSystem: FileSystem, PotentialPathResolvingFileSystem {
         self.base = base
         pathResolver = FileSystemPathResolver(base: base)
         self.limits = limits
+    }
+
+    nonisolated package var supportsScopedWalk: Bool { base.supportsScopedWalk }
+
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool,
+                      visit: FileSystemWalkVisitor) async throws {
+        try await base.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories, visit: visit)
     }
 
     public func stat(path: WorkspacePath) async throws -> FileInfo { try await base.stat(path: path) }
@@ -195,15 +202,20 @@ public actor LimitedFileSystem: FileSystem, PotentialPathResolvingFileSystem {
 
     private func preflight(_ mutation: Mutation) async throws {
         var tree: [WorkspacePath: FileInfo] = [:]
-        var pending = [try await base.stat(path: .root)]
-        while let info = pending.popLast() {
-            let path = info.path
-            tree[path] = info
-            if info.kind == .directory {
-                for child in try await base.listDirectory(path: path) {
-                    var metadata = child.info
-                    metadata.path = path.appending(child.name)
-                    pending.append(metadata)
+        if base.supportsScopedWalk {
+            try await base.walk { info, _, _ in tree[info.path] = info }
+        } else {
+            // Preserve metadata-only accounting for custom backends: listings already
+            // supply child metadata and need not permit separate child stat calls.
+            var pending = [try await base.stat(path: .root)]
+            while let info = pending.popLast() {
+                tree[info.path] = info
+                if info.kind == .directory {
+                    for child in try await base.listDirectory(path: info.path) {
+                        var metadata = child.info
+                        metadata.path = info.path.appending(child.name)
+                        pending.append(metadata)
+                    }
                 }
             }
         }

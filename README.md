@@ -322,7 +322,7 @@ to an equivalent spelling is rejected too; move through a distinct temporary
 name if a spelling change is needed. Case-only renames remain possible on
 case-sensitive filesystems. Removing a missing/aliased spelling remains
 a no-op. Symlink targets must use the stored spelling, and `resolveRealPath`
-returns that spelling. Directory listings (and future bulk traversal) use names
+returns that spelling. Directory listings and bulk traversal use names
 emitted by `readdir`, so they already carry the stored identity.
 
 On Darwin, volume policy is cached by device. APFS and HFS+ use
@@ -409,6 +409,15 @@ let workspace = Workspace(fileSystem: authorized)
 ```
 
 Authorization supports one-shot, duration-limited, and session approvals plus bounded audit records. Prefix rules use path-component boundaries and require both paths to match for copy and move.
+
+Local scans record symlinks without descending into them and retain per-entry authorization
+checks when using an authorized filesystem. Scans are live reads, not atomic snapshots:
+concurrent changes can affect the result or cause an error. Snapshot capture fails when a
+listed child disappears before it can be inspected or read. Scoped no-follow opens reject
+substituted symlinks even when they point inside the root. Deep scans bound open directory
+handles by falling back to ordinary per-path operations; no handles are cached between calls.
+As with other local operations, host processes can relocate open directories or mutate
+hard-linked data.
 
 ## LLM Tool Adapters
 
@@ -528,3 +537,7 @@ files; transient/deleted files, repeated overwrites and OS write amplification a
 invisible. Compare identical presets for regressions: timing ratios and exact backend
 count deltas are printed. Watcher errors produce a nonzero exit while retaining successful
 results; run outside a restrictive macOS sandbox to measure FSEvents.
+
+Scoped walks report `walk` and `walkEntry` counters; their content callbacks still count as
+`readFile`, `readRange`, or `readSymlink`. `directoryEntries` includes visited descendants.
+These are logical visits, not POSIX syscall counts; backend-internal glob walks remain opaque.

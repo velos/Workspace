@@ -85,7 +85,9 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
 
     /// The final path component, or `/` for the root path.
     var basename: String {
-        Self.basename(storage)
+        guard !isRoot else { return "/" }
+        let slash = storage.utf8.lastIndex(of: 47)!
+        return String(decoding: storage.utf8[storage.utf8.index(after: slash)...], as: UTF8.self)
     }
 
     /// The final path component, or `/` for the root.
@@ -93,7 +95,8 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
 
     /// The parent directory of the path.
     var dirname: WorkspacePath {
-        Self.dirname(storage)
+        guard let slash = storage.utf8.lastIndex(of: 47), slash != storage.utf8.startIndex else { return .root }
+        return WorkspacePath(unchecked: String(decoding: storage.utf8[..<slash], as: UTF8.self))
     }
 
     /// The containing path. The root is its own parent.
@@ -101,7 +104,11 @@ public struct WorkspacePath: Sendable, Hashable, Comparable, Codable, Expressibl
 
     /// Returns a new path by appending `component` and normalizing the result.
     public func appending(_ component: some StringProtocol) -> WorkspacePath {
-        Self.join(self, String(component))
+        let component = String(component)
+        if !component.isEmpty, component != ".", component != "..", !component.utf8.contains(47) {
+            return WorkspacePath(unchecked: (isRoot ? "/" : storage + "/") + component)
+        }
+        return Self.join(self, component)
     }
 
     public static func == (lhs: WorkspacePath, rhs: WorkspacePath) -> Bool {

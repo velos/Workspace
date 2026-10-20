@@ -271,10 +271,12 @@ struct PathIdentityRegressionTests {
         #expect(try await fs.listDirectory(path: "/dir").isEmpty)
     }
 
-    @Test
-    func middleAncestorAliasIsRejectedAcrossOpenPaths() async throws {
-        let root = try TestSupport.temporaryDirectory("IdentityAncestors")
-        defer { TestSupport.remove(root) }
+    @Test(arguments: [false, true])
+    func middleAncestorAliasIsRejectedAcrossOpenPaths(relocateRoot: Bool) async throws {
+        let container = try TestSupport.temporaryDirectory("IdentityAncestors")
+        defer { TestSupport.remove(container) }
+        let root = container.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         guard try caseInsensitive(root) else { return }
         let fs = try LocalFileSystem(root: root)
         try await fs.createFile(path: "/one/middle/three/file", data: Data([42]))
@@ -282,16 +284,33 @@ struct PathIdentityRegressionTests {
         let aliasFD = open(root.path + "/one/MIDDLE/three/file", O_RDONLY)
         #expect(aliasFD >= 0)
         close(aliasFD)
+        if relocateRoot {
+            // The pinned root remains usable, but its old F_GETPATH prefix no
+            // longer matches. This forces per-component spelling verification.
+            try FileManager.default.moveItem(at: root, to: container.appendingPathComponent("relocated"))
+        }
         await expectPOSIX(ENOENT) { _ = try await fs.readFile(path: "/one/MIDDLE/three/file") }
         await expectPOSIX(ENOENT) { _ = try await fs.stat(path: "/one/MIDDLE/three/file") }
         await expectPOSIX(ENOENT) { _ = try await fs.listDirectory(path: "/one/MIDDLE/three") }
         await expectPOSIX(ENOENT) { _ = try await fs.resolveRealPath(path: "/one/MIDDLE/three/file") }
+        var aliasedVisits = 0
+        try await fs.walk(at: "/one/MIDDLE/three") { _, _, _ in aliasedVisits += 1 }
+        #expect(aliasedVisits == 0) // Walk treats an ENOENT root as missing.
         await expectPOSIX(EEXIST) {
             try await fs.writeFile(path: "/one/MIDDLE/three/new", data: Data([9]), append: false)
         }
         try await fs.createSymlink(path: "/relative", target: "one/MIDDLE/../middle/three/file")
         await expectPOSIX(ENOENT) { _ = try await fs.readFile(path: "/relative") }
         #expect(try await fs.readFile(path: "/one/middle/three/file") == Data([42]))
+        var storedFiles: [WorkspacePath] = []
+        try await fs.walk(at: "/one/middle/three") { info, read, _ in
+            if info.kind == .file {
+                storedFiles.append(info.path)
+                let data = try await read(nil)
+                #expect(data == Data([42]))
+            }
+        }
+        #expect(storedFiles == ["/one/middle/three/file"])
         #expect(!(await fs.exists(path: "/one/middle/three/new")))
     }
 
