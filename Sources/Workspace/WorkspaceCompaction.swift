@@ -37,6 +37,10 @@ extension Workspace {
         public var after: StorageStatistics
         public var removedCheckpointIDs: [UUID]
         public var rebasedCheckpointIDs: [UUID]
+        public var removedMutationCount: Int
+        /// History log bytes reclaimed by removing records.
+        /// Memory stores report the records' encoded size.
+        public var removedMutationBytes: UInt64
 
         public var removedCheckpointCount: Int { removedCheckpointIDs.count }
         public var removedSnapshotCount: Int { max(0, before.snapshotCount - after.snapshotCount) }
@@ -48,13 +52,17 @@ extension Workspace {
             before: StorageStatistics,
             after: StorageStatistics,
             removedCheckpointIDs: [UUID],
-            rebasedCheckpointIDs: [UUID]
+            rebasedCheckpointIDs: [UUID],
+            removedMutationCount: Int = 0,
+            removedMutationBytes: UInt64 = 0
         ) {
             self.dryRun = dryRun
             self.before = before
             self.after = after
             self.removedCheckpointIDs = removedCheckpointIDs
             self.rebasedCheckpointIDs = rebasedCheckpointIDs
+            self.removedMutationCount = removedMutationCount
+            self.removedMutationBytes = removedMutationBytes
         }
     }
 
@@ -63,7 +71,9 @@ extension Workspace {
         try await store.storageStatistics(workspaceId: workspaceId)
     }
 
-    /// Prunes checkpoints, rebases retained lineage, and sweeps unreachable snapshots and blobs.
+    /// Prunes checkpoints and the history records every retained checkpoint already includes,
+    /// rebases retained lineage, and sweeps unreachable snapshots and blobs.
+    /// With no retained checkpoints, mutation history is preserved.
     ///
     /// A dry run performs the same validation and returns projected statistics without changing storage.
     public func compact(retaining retention: Retention, dryRun: Bool = false) async throws -> CompactionReport {

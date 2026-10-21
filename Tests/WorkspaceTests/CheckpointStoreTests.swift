@@ -159,7 +159,7 @@ struct CheckpointStoreTests {
         }
 
         try await store.pruneMutations(workspaceId: workspaceID, throughSequence: 100)
-        #expect(try await store.listMutations(workspaceId: workspaceID).map(\.sequence) == [5])
+        #expect(try await store.listMutations(workspaceId: workspaceID).isEmpty)
         let next = try await store.appendMutation(Self.sampleMutation(workspaceID: workspaceID, path: "/next"))
         #expect(next.sequence == 6)
     }

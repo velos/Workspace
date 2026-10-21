@@ -6,6 +6,13 @@ import Darwin
 import Glibc
 #endif
 
+// Both stores use the on-disk compact representation for history byte accounting.
+private let compactStoreEncoder: JSONEncoder = {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return encoder
+}()
+
 /// Persistence for workspace checkpoints, snapshots, and mutation logs.
 ///
 /// The store is the **source of truth** for `Mutation.sequence` values. Callers may pass
@@ -32,11 +39,11 @@ protocol CheckpointStore: CheckpointRevisionStore, AnyObject, Sendable {
     @discardableResult
     func appendMutation(_ mutation: Mutation) async throws -> Mutation
     func listMutations(workspaceId: UUID, afterSequence: Int) async throws -> MutationPage
+    func listMutations(workspaceId: UUID, query: MutationQuery) async throws -> MutationPage
     /// Retracts one failed operation's record without lowering the workspace's
     /// sequence high-water mark. Later appends must never reuse its sequence.
     func removeMutation(sequence: Int, workspaceId: UUID) async throws
-    /// Removes mutation records with `sequence <= throughSequence`. The record carrying the
-    /// highest sequence is always retained so later appends stay monotonic.
+    /// Removes mutation records with `sequence <= throughSequence`, preserving the high-water mark.
     func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws
     func storageStatistics(workspaceId: UUID) async throws -> Workspace.StorageStatistics
     func compact(
@@ -52,7 +59,46 @@ struct MutationPage: Sendable {
     var retractionEpoch: Int
 }
 
+enum MutationQuery: Sendable {
+    case after(Int, limit: Int)
+    case before(Int?, limit: Int)
+
+    var limit: Int {
+        switch self {
+        case let .after(_, limit), let .before(_, limit): limit
+        }
+    }
+
+    func validate() throws {
+        guard limit >= 0 else { throw WorkspaceError.unsupported("history limit must not be negative") }
+    }
+
+    func select(_ records: [Mutation]) -> [Mutation] {
+        guard limit > 0 else { return [] }
+        switch self {
+        case let .after(cursor, limit):
+            return Array(records.lazy.filter { $0.sequence > cursor }.prefix(limit))
+        case let .before(cursor, limit):
+            return Array(records.reversed().lazy.filter { record in
+                cursor.map { record.sequence < $0 } ?? true
+            }.prefix(limit))
+        }
+    }
+}
+
+struct MutationPruningResult {
+    var count = 0
+    var bytes: UInt64 = 0
+}
+
 extension CheckpointStore {
+    func listMutations(workspaceId: UUID, query: MutationQuery) async throws -> MutationPage {
+        try query.validate()
+        var page = try await listMutations(workspaceId: workspaceId, afterSequence: 0)
+        page.records = query.select(page.records)
+        return page
+    }
+
     func resolveSnapshotFile(id: UUID, workspaceId: UUID, path: WorkspacePath) async throws -> (path: WorkspacePath, size: UInt64) {
         guard let index = try await loadRevisionIndex(id: id, workspaceId: workspaceId) else {
             throw WorkspaceError.revisionDataNotFound(id)
@@ -219,14 +265,8 @@ actor InMemoryCheckpointStore: CheckpointStore {
     }
 
     func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws {
-        let records = (mutationsByWorkspace[workspaceId] ?? []).sorted { $0.sequence < $1.sequence }
-        guard let last = records.last else {
-            return
-        }
-        var kept = records.filter { $0.sequence > throughSequence }
-        if kept.isEmpty {
-            kept = [last]
-        }
+        let records = mutationsByWorkspace[workspaceId] ?? []
+        let kept = records.filter { $0.sequence > throughSequence }
         if kept.count != records.count { mutationRetractionEpochs[workspaceId, default: 0] += 1 }
         mutationsByWorkspace[workspaceId] = kept
     }
@@ -254,15 +294,23 @@ actor InMemoryCheckpointStore: CheckpointStore {
         let retainedSnapshotIDs = Set(retained.map(\.snapshotId))
         let retainedSnapshots = currentSnapshots.filter { retainedSnapshotIDs.contains($0.key) }
         let after = statistics(checkpoints: retained, snapshots: retainedSnapshots)
+        let cutoff = retained.map(\.mutationCursor).min()
+        let pruned = (mutationsByWorkspace[workspaceId] ?? []).filter { record in
+            cutoff.map { record.sequence <= $0 } ?? false
+        }
+        let mutationBytes = try pruned.reduce(UInt64(0)) { $0 + UInt64(try compactStoreEncoder.encode($1).count + 1) }
         let report = Workspace.CompactionReport(
             dryRun: dryRun,
             before: before,
             after: after,
             removedCheckpointIDs: plan.removedCheckpointIDs,
-            rebasedCheckpointIDs: plan.rebasedCheckpointIDs
+            rebasedCheckpointIDs: plan.rebasedCheckpointIDs,
+            removedMutationCount: pruned.count,
+            removedMutationBytes: mutationBytes
         )
 
         if !dryRun {
+            if let cutoff { try await pruneMutations(workspaceId: workspaceId, throughSequence: cutoff) }
             checkpointsByWorkspace[workspaceId] = retained
             snapshotsByWorkspace[workspaceId] = retainedSnapshots
             revisionIndexesByWorkspace[workspaceId] = revisionIndexesByWorkspace[workspaceId]?.filter {
@@ -318,7 +366,8 @@ actor InMemoryCheckpointStore: CheckpointStore {
 /// A JSON file-backed checkpoint store.
 ///
 /// Mutations are stored as one JSON line per record in `mutations.jsonl` (append-friendly under
-/// the lock). Appends derive the next sequence from the log's final record instead of re-reading
+/// the lock). Compaction prunes old records with an ordered atomic replacement. Appends derive
+/// the next sequence from the high-water mark and log's final record instead of re-reading
 /// the whole log, so appends stay cheap as histories grow. A partial trailing line left by a
 /// crashed append is skipped when reading and truncated before the next append. Writes are
 /// synchronized through a persistent sidecar lockfile (`mutations.lock`) with an advisory
@@ -335,8 +384,16 @@ actor FileCheckpointStore: CheckpointStore {
     let fileManager: FileManager
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
-    private let compactEncoder: JSONEncoder
+    private let compactEncoder = compactStoreEncoder
 
+    enum IOEvent: Sendable, Equatable {
+        case mutationLogSynced
+        case mutationDecoded
+        case sequenceProbed
+        case checkpointWillPublish
+        case mutationRewriteWillReplace
+    }
+    private var ioHook: (@Sendable (IOEvent) throws -> Void)? = nil
     private let checkpointCapture: Workspace.CheckpointCapturePolicy
     // Actor reentrancy must suspend contenders before they can conflict with this store's own fd.
     private var heldLocks: Set<PathName> = []
@@ -362,9 +419,10 @@ actor FileCheckpointStore: CheckpointStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         self.encoder = encoder
         self.decoder = JSONDecoder()
-        self.compactEncoder = JSONEncoder()
-        self.compactEncoder.outputFormatting = [.sortedKeys]
     }
+
+    // Internal fault/ordering hook for persistence-boundary verification.
+    func setIOHook(_ hook: (@Sendable (IOEvent) throws -> Void)?) { ioHook = hook }
 
     func prepare(workspaceId: UUID) async throws {
         try await ensureWorkspaceDirectories(for: workspaceId)
@@ -400,7 +458,7 @@ actor FileCheckpointStore: CheckpointStore {
                 parentSnapshot: parentSnapshot
             )
             try writeSnapshotUnlocked(snapshot, workspaceId: draft.workspaceID, reusing: parentManifest?.root)
-            try write(checkpoint, to: checkpointURL(id: checkpoint.id, workspaceId: draft.workspaceID), durability: .publication)
+            try await publishCheckpoint(checkpoint)
             listCheckpointsCache[draft.workspaceID] = nil
             return checkpoint
         }
@@ -627,10 +685,7 @@ actor FileCheckpointStore: CheckpointStore {
             )
             try Task.checkCancellation()
             try self.write(manifest, to: self.snapshotURL(id: snapshotID, workspaceId: draft.workspaceID), durability: .publication)
-            try self.write(
-                checkpoint,
-                to: self.checkpointURL(id: checkpoint.id, workspaceId: draft.workspaceID), durability: .publication
-            )
+            try await self.publishCheckpoint(checkpoint)
             self.listCheckpointsCache[draft.workspaceID] = nil
             return checkpoint
         }
@@ -1090,7 +1145,7 @@ actor FileCheckpointStore: CheckpointStore {
             if fileManager.fileExists(atPath: jsonl.path) {
                 try appendJSONLLine(encode: record, to: jsonl)
             } else {
-                try writeAllMutationsAsJSONL([record], to: jsonl)
+                try writeAllMutationsAsJSONL([record], to: jsonl, durable: false)
             }
             return record
         }
@@ -1104,7 +1159,7 @@ actor FileCheckpointStore: CheckpointStore {
             let records = fileManager.fileExists(atPath: url.path) ? try loadMutationsFromJSONL(at: url) : []
             try state.bumpRetractionEpoch()
             // Publish invalidation before rewriting. A failed rewrite only causes a harmless reload.
-            try write(state, to: mutationSequenceURL(workspaceId: workspaceId), durability: .atomic)
+            try write(state, to: mutationSequenceURL(workspaceId: workspaceId), durability: .publication)
             try writeAllMutationsAsJSONL(records.filter { $0.sequence != sequence }, to: url)
         }
     }
@@ -1124,31 +1179,100 @@ actor FileCheckpointStore: CheckpointStore {
         }
     }
 
-    func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws {
+    func listMutations(workspaceId: UUID, query: MutationQuery) async throws -> MutationPage {
+        try query.validate()
         try await validateWorkspaceFormatIfPresent(workspaceId)
-        let jsonl = mutationsJsonlURL(workspaceId: workspaceId)
-        guard fileManager.fileExists(atPath: jsonl.path) else {
-            return
+        guard fileManager.fileExists(atPath: workspaceDirectoryURL(workspaceId: workspaceId).path) else {
+            return MutationPage(records: [], retractionEpoch: 0)
         }
-        let lockURL = mutationsLockURL(workspaceId: workspaceId)
-        try await withExclusiveLock(at: lockURL) {
-            var state = try mutationSequenceState(workspaceId: workspaceId)
-            guard fileManager.fileExists(atPath: jsonl.path) else { return }
-            let records = try loadMutationsFromJSONL(at: jsonl)
-                .sorted { $0.sequence < $1.sequence }
-            guard let last = records.last else {
-                return
+        return try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
+            let state = try readMutationSequenceState(workspaceId: workspaceId)
+            let url = mutationsJsonlURL(workspaceId: workspaceId)
+            var records: [Mutation] = []
+            if query.limit > 0, fileManager.fileExists(atPath: url.path) {
+                let start: UInt64
+                let end: UInt64?
+                let reverse: Bool
+                switch query {
+                case let .after(cursor, _):
+                    start = try mutationBoundary(at: url, cursor: cursor, inclusive: false)
+                    end = nil
+                    reverse = false
+                case let .before(cursor, _):
+                    start = 0
+                    end = try cursor.map { try mutationBoundary(at: url, cursor: $0, inclusive: true) }
+                    reverse = true
+                }
+                try scanMutations(at: url, reverse: reverse, startOffset: start, endOffset: end) { record, _ in
+                    records.append(record)
+                    return records.count < query.limit
+                }
             }
-            var kept = records.filter { $0.sequence > throughSequence }
-            if kept.isEmpty {
-                kept = [last]
+            return MutationPage(records: records, retractionEpoch: state.retractionEpoch)
+        }
+    }
+
+    func pruneMutations(workspaceId: UUID, throughSequence: Int) async throws {
+        _ = try await pruneMutationHistory(workspaceId: workspaceId, throughSequence: throughSequence, dryRun: false)
+    }
+
+    private func pruneMutationHistory(
+        workspaceId: UUID, throughSequence: Int?, dryRun: Bool
+    ) async throws -> MutationPruningResult {
+        try await validateWorkspaceFormatIfPresent(workspaceId)
+        let url = mutationsJsonlURL(workspaceId: workspaceId)
+        guard fileManager.fileExists(atPath: url.path) else { return MutationPruningResult() }
+        return try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
+            var state = try readMutationSequenceState(workspaceId: workspaceId)
+            var result = MutationPruningResult()
+            let originalBytes = try fileSize(at: url)
+            var retainedBytes: UInt64 = 0
+            // Stage a streamed replacement beside the log. Readers and appends hold the same
+            // stable lock, so they see either the old log or the complete ordered replacement.
+            let temporary = url.deletingLastPathComponent().appendingPathComponent(".pending-" + UUID().uuidString + "-mutations.jsonl")
+            let output: FileHandle?
+            if dryRun { output = nil }
+            else {
+                guard fileManager.createFile(atPath: temporary.path, contents: nil) else { throw POSIXError(.EIO) }
+                output = try FileHandle(forWritingTo: temporary)
             }
-            guard kept.count != records.count else {
-                return
+            defer { try? output?.close(); try? fileManager.removeItem(at: temporary) }
+            var buffer = Data()
+            try scanMutations(at: url) { record, line in
+                state.highWaterMark = max(state.highWaterMark, record.sequence)
+                if throughSequence.map({ record.sequence <= $0 }) ?? false {
+                    result.count += 1
+                } else {
+                    retainedBytes += UInt64(line.count + 1)
+                    if let output {
+                        buffer.append(line)
+                        buffer.append(0x0A)
+                        if buffer.count >= 65536 {
+                            try output.write(contentsOf: buffer)
+                            buffer.removeAll(keepingCapacity: true)
+                        }
+                    }
+                }
+                return true
             }
+            guard result.count > 0 else { return result }
+            // Count the actual reduction, including discarded blanks/torn tails and
+            // normalization of a complete final record that was missing its LF.
+            result.bytes = originalBytes - retainedBytes
+            guard !dryRun else { return result }
             try state.bumpRetractionEpoch()
-            try write(state, to: mutationSequenceURL(workspaceId: workspaceId), durability: .atomic)
-            try writeAllMutationsAsJSONL(kept, to: jsonl)
+            // Invalidation and high-water mark must survive before removing any record.
+            // An interruption here leaves the old log intact and causes a harmless reload.
+            try write(state, to: mutationSequenceURL(workspaceId: workspaceId), durability: .publication)
+            if let output {
+                try output.write(contentsOf: buffer)
+                try Self.syncFile(output)
+            }
+            try ioHook?(.mutationRewriteWillReplace)
+            guard rename(temporary.path, url.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            try Self.syncDirectory(url.deletingLastPathComponent())
+            if let output { try Self.syncFile(output) }
+            return result
         }
     }
 
@@ -1182,7 +1306,7 @@ actor FileCheckpointStore: CheckpointStore {
             )
         }
         return try await withExclusiveLock(at: lifecycleLockURL(workspaceId: workspaceId)) {
-            try compactUnlocked(workspaceId: workspaceId, retaining: retention, dryRun: dryRun)
+            try await compactUnlocked(workspaceId: workspaceId, retaining: retention, dryRun: dryRun)
         }
     }
 
@@ -1190,7 +1314,7 @@ actor FileCheckpointStore: CheckpointStore {
         workspaceId: UUID,
         retaining retention: Workspace.Retention,
         dryRun: Bool
-    ) throws -> StoreCompactionResult {
+    ) async throws -> StoreCompactionResult {
         let current = try loadAllCheckpointsUnlocked(workspaceId: workspaceId)
         let before = try physicalStatisticsUnlocked(workspaceId: workspaceId)
         let plan = try CheckpointRetentionPlanner.plan(checkpoints: current, retaining: retention)
@@ -1232,7 +1356,7 @@ actor FileCheckpointStore: CheckpointStore {
             blobCount: retainedBlobHashes.count + livePacked.count,
             blobBytes: retainedBlobBytes
         )
-        let report = Workspace.CompactionReport(
+        var report = Workspace.CompactionReport(
             dryRun: dryRun,
             before: before,
             after: after,
@@ -1240,7 +1364,16 @@ actor FileCheckpointStore: CheckpointStore {
             rebasedCheckpointIDs: plan.rebasedCheckpointIDs
         )
 
-        guard !dryRun else { return StoreCompactionResult(report: report, checkpoints: retained) }
+        let cutoff = retained.map(\.mutationCursor).min()
+        // Validate the entire log before changing checkpoint references or deleting artifacts.
+        // The real rewrite scans again under the mutations lock to include concurrent changes.
+        let projectedPruning = try await pruneMutationHistory(workspaceId: workspaceId,
+            throughSequence: cutoff, dryRun: true)
+        if dryRun {
+            report.removedMutationCount = projectedPruning.count
+            report.removedMutationBytes = projectedPruning.bytes
+            return StoreCompactionResult(report: report, checkpoints: retained)
+        }
 
         // Rewrite partial packs before changing any references. Then atomically replace
         // retained snapshot roots; a crash at any point leaves old and/or new packs live.
@@ -1261,8 +1394,13 @@ actor FileCheckpointStore: CheckpointStore {
                                      trees: &retainedTrees, packs: &retainedPacks, livePacked: &livePacked)
             }
         }
-        for checkpoint in retained where rebasedIDs.contains(checkpoint.id) {
-            try write(checkpoint, to: checkpointURL(id: checkpoint.id, workspaceId: workspaceId), durability: .publication)
+        let rebased = retained.filter { rebasedIDs.contains($0.id) }
+        if let cursor = rebased.map(\.mutationCursor).max() {
+            // Rebasing preserves cursors. One barrier covers every replacement below.
+            try await syncMutationHistory(workspaceId: workspaceId, throughSequence: cursor)
+        }
+        for checkpoint in rebased {
+            try publishDurableCheckpoint(checkpoint)
         }
         for id in plan.removedCheckpointIDs {
             try removeIfPresent(checkpointURL(id: id, workspaceId: workspaceId))
@@ -1300,16 +1438,28 @@ actor FileCheckpointStore: CheckpointStore {
         where !retainedBlobHashes.contains(url.lastPathComponent) {
             try fileManager.removeItem(at: url)
         }
-        for directory in [
-            workspaceDirectoryURL(workspaceId: workspaceId), checkpointsDirectoryURL(workspaceId: workspaceId),
-            snapshotsDirectoryURL(workspaceId: workspaceId), blobsDirectoryURL(workspaceId: workspaceId)
-        ] {
-            for url in try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-            where url.lastPathComponent.hasPrefix(".pending-") {
-                try fileManager.removeItem(at: url)
+        // Mutations can still append or retract while the lifecycle lock is held. Do not
+        // sweep their live replacement files while cleaning up interrupted writes.
+        try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
+            for directory in [
+                workspaceDirectoryURL(workspaceId: workspaceId), checkpointsDirectoryURL(workspaceId: workspaceId),
+                snapshotsDirectoryURL(workspaceId: workspaceId), blobsDirectoryURL(workspaceId: workspaceId)
+            ] {
+                for url in try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                where url.lastPathComponent.hasPrefix(".pending-") {
+                    try fileManager.removeItem(at: url)
+                }
             }
         }
         try Self.syncDirectory(blobsDirectoryURL(workspaceId: workspaceId))
+        // New appends always sequence above every retained cursor, so a validation pass
+        // with nothing to remove means the rewrite would remove nothing either.
+        if projectedPruning.count > 0 || projectedPruning.bytes > 0 {
+            let pruning = try await pruneMutationHistory(workspaceId: workspaceId,
+                throughSequence: cutoff, dryRun: false)
+            report.removedMutationCount = pruning.count
+            report.removedMutationBytes = pruning.bytes
+        }
         listCheckpointsCache[workspaceId] = nil
         return StoreCompactionResult(report: report, checkpoints: retained)
     }
@@ -1504,30 +1654,140 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     private func loadMutationsFromJSONL(at url: URL, afterSequence: Int = 0) throws -> [Mutation] {
-        if afterSequence > 0 {
-            return try loadMutationSuffix(at: url, afterSequence: afterSequence)
+        var records: [Mutation] = []
+        try scanMutations(at: url, reverse: afterSequence > 0) { record, _ in
+            guard record.sequence > afterSequence else { return false }
+            records.append(record)
+            return true
         }
-        let data = try Data(contentsOf: url)
-        if data.isEmpty { return [] }
-        let endsWithNewline = data.last == UInt8(ascii: "\n")
-        let lines = data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false)
-        var out: [Mutation] = []
-        out.reserveCapacity(lines.count)
-        for (index, line) in lines.enumerated() {
-            if line.isEmpty { continue }
-            do {
-                out.append(try decoder.decode(Mutation.self, from: Data(line)))
-            } catch {
-                // A crashed append leaves a strict prefix of `<json>\n`: an undecodable final
-                // line with no trailing newline. Tolerate exactly that torn tail; anything else
-                // is real corruption and must surface.
-                if index == lines.count - 1, !endsWithNewline, Self.isIncompleteMutationRecord(Data(line)) {
-                    continue
+        return afterSequence > 0 ? records.reversed() : records
+    }
+
+    private struct SequenceProbe: Decodable { let sequence: Int }
+
+    /// Finds the first sequence > cursor (or >= cursor for a reverse page's upper bound).
+    /// Appends reserve increasing IDs under the mutations lock, retractions sort their
+    /// replacement, and pruning preserves that order. The caller holds the same lock.
+    private func mutationBoundary(at url: URL, cursor: Int, inclusive: Bool) throws -> UInt64 {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        func matches(_ sequence: Int) -> Bool { inclusive ? sequence >= cursor : sequence > cursor }
+        guard let first = try sequenceProbe(in: handle, from: 0, size: size) else { return size }
+        if matches(first.sequence) { return first.start }
+        var low = first.end
+        var high = size
+        var boundary = size
+        while low < high {
+            let middle = low + (high - low) / 2
+            // Snap backwards so a very long record cannot make the search skip it.
+            let start = try Self.lastNewlineOffset(in: handle, before: middle).map { $0 + 1 } ?? 0
+            if let probe = try sequenceProbe(in: handle, from: start, size: size) {
+                if matches(probe.sequence) {
+                    boundary = probe.start
+                    high = start
+                } else {
+                    low = probe.end
                 }
+            } else {
+                high = start
+            }
+        }
+        return boundary
+    }
+
+    /// Reads only the sequence, skipping empty lines and an incomplete final append using
+    /// the same rules as scanMutations. Offsets include a line's LF when one is present.
+    private func sequenceProbe(
+        in handle: FileHandle, from offset: UInt64, size: UInt64
+    ) throws -> (sequence: Int, start: UInt64, end: UInt64)? {
+        try handle.seek(toOffset: offset)
+        var pending = Data()
+        var start = offset
+        func decode(_ line: Data, end: UInt64, terminated: Bool) throws -> (sequence: Int, start: UInt64, end: UInt64)? {
+            guard !line.isEmpty else { return nil }
+            do {
+                try ioHook?(.sequenceProbed)
+                let probe = try decoder.decode(SequenceProbe.self, from: line)
+                return (probe.sequence, start, end)
+            } catch {
+                if !terminated, Self.isIncompleteMutationRecord(line) { return nil }
                 throw error
             }
         }
-        return out
+        while let chunk = try handle.read(upToCount: 65536), !chunk.isEmpty {
+            pending.append(chunk)
+            var index = pending.startIndex
+            while let newline = pending[index...].firstIndex(of: 0x0A) {
+                let end = start + UInt64(pending.distance(from: index, to: newline)) + 1
+                if let probe = try decode(Data(pending[index..<newline]), end: end, terminated: true) { return probe }
+                start = end
+                index = pending.index(after: newline)
+            }
+            pending = Data(pending[index...])
+        }
+        return try decode(pending, end: size, terminated: false)
+    }
+
+    /// Bounded-buffer JSONL traversal. A page stops decoding as soon as its limit is met.
+    /// Only an incomplete, unterminated final record is tolerated as a torn append.
+    private func scanMutations(
+        at url: URL, reverse: Bool = false, startOffset: UInt64 = 0, endOffset: UInt64? = nil,
+        consume: (Mutation, Data) throws -> Bool
+    ) throws {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let fileSize = try handle.seekToEnd()
+        let size = endOffset ?? fileSize
+        guard size > startOffset else { return }
+        func visit(_ line: Data, final: Bool, terminated: Bool) throws -> Bool {
+            guard !line.isEmpty else { return true }
+            let record: Mutation
+            do {
+                try ioHook?(.mutationDecoded)
+                record = try decoder.decode(Mutation.self, from: line)
+            }
+            catch {
+                if final, !terminated, Self.isIncompleteMutationRecord(line) { return true }
+                throw error
+            }
+            return try consume(record, line)
+        }
+        var pending = Data()
+        if reverse {
+            try handle.seek(toOffset: size - 1)
+            let terminated = try handle.read(upToCount: 1) == Data([0x0A])
+            var cursor = size
+            var final = true
+            while cursor > startOffset {
+                let start = max(startOffset, cursor > 65536 ? cursor - 65536 : 0)
+                try handle.seek(toOffset: start)
+                var chunk = try handle.read(upToCount: Int(cursor - start)) ?? Data()
+                chunk.append(pending)
+                let lines = chunk.split(separator: 0x0A, omittingEmptySubsequences: false)
+                for line in lines.dropFirst().reversed() {
+                    // The empty fragment after a trailing LF is not a record.
+                    if final, line.isEmpty { continue }
+                    if try !visit(Data(line), final: final, terminated: !final || terminated) { return }
+                    final = false
+                }
+                pending = Data(lines.first ?? Data.SubSequence())
+                cursor = start
+            }
+            _ = try visit(pending, final: final, terminated: !final || terminated)
+        } else {
+            try handle.seek(toOffset: startOffset)
+            while let chunk = try handle.read(upToCount: 65536), !chunk.isEmpty {
+                pending.append(chunk)
+                var start = pending.startIndex
+                while let newline = pending[start...].firstIndex(of: 0x0A) {
+                    if try !visit(Data(pending[start..<newline]), final: false, terminated: true) { return }
+                    start = pending.index(after: newline)
+                }
+                pending = Data(pending[start...])
+            }
+            _ = try visit(pending, final: true, terminated: false)
+        }
     }
 
     /// A closed object with invalid UTF-8 or an invalid Mutation schema is corruption, even
@@ -1567,56 +1827,44 @@ actor FileCheckpointStore: CheckpointStore {
         return !delimiters.isEmpty
     }
 
-    /// Scan back only as far as the requested sequence. Appends and pruning preserve sequence
-    /// order, so repeated history queries decode new records rather than the entire log.
-    private func loadMutationSuffix(at url: URL, afterSequence: Int) throws -> [Mutation] {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var cursor = try handle.seekToEnd()
-        guard cursor > 0 else { return [] }
-        try handle.seek(toOffset: cursor - 1)
-        let endsWithNewline = try handle.read(upToCount: 1) == Data([UInt8(ascii: "\n")])
-        var pending = Data()
-        var isFinalRecord = true
-        var records: [Mutation] = []
-
-        func consume(_ line: Data) throws -> Bool {
-            defer { isFinalRecord = false }
-            guard !line.isEmpty else { return true }
-            let record: Mutation
-            do {
-                record = try decoder.decode(Mutation.self, from: line)
-            } catch {
-                if isFinalRecord, !endsWithNewline, Self.isIncompleteMutationRecord(line) { return true }
-                throw error
-            }
-            guard record.sequence > afterSequence else { return false }
-            records.append(record)
-            return true
-        }
-
-        while cursor > 0 {
-            let start = cursor > 65536 ? cursor - 65536 : 0
-            try handle.seek(toOffset: start)
-            var chunk = try handle.read(upToCount: Int(cursor - start)) ?? Data()
-            chunk.append(pending)
-            let lines = chunk.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false)
-            for line in lines.dropFirst().reversed() {
-                if try !consume(Data(line)) { return records.reversed() }
-            }
-            pending = Data(lines.first ?? Data.SubSequence())
-            cursor = start
-        }
-        _ = try consume(pending)
-        return records.reversed()
-    }
-
     /// Call while holding the lifecycle lock. The cursor is authoritative even when the
     /// Workspace that requested the checkpoint has not refreshed its mutation cache.
     func persistedMutationCursor(workspaceId: UUID) async throws -> Int {
         try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
             try mutationSequenceState(workspaceId: workspaceId).highWaterMark
         }
+    }
+
+    /// All checkpoint publishers hold the lifecycle lock and pass through this barrier.
+    /// The cursor was frozen before capture; syncing may also include later appends.
+    func publishCheckpoint(_ checkpoint: Checkpoint) async throws {
+        try await syncMutationHistory(workspaceId: checkpoint.workspaceID, throughSequence: checkpoint.mutationCursor)
+        try publishDurableCheckpoint(checkpoint)
+    }
+
+    private func syncMutationHistory(workspaceId: UUID, throughSequence: Int) async throws {
+        try await withExclusiveLock(at: mutationsLockURL(workspaceId: workspaceId)) {
+            var state = try readMutationSequenceState(workspaceId: workspaceId)
+            state.highWaterMark = max(state.highWaterMark, throughSequence)
+            let log = mutationsJsonlURL(workspaceId: workspaceId)
+            if fileManager.fileExists(atPath: log.path) {
+                // Read the latest valid sequence without repairing the tail. Compaction
+                // accounts for tail normalization in its own locked replacement.
+                try scanMutations(at: log, reverse: true) { record, _ in
+                    state.highWaterMark = max(state.highWaterMark, record.sequence)
+                    return false
+                }
+                try Self.syncFile(log)
+            }
+            try write(state, to: mutationSequenceURL(workspaceId: workspaceId), durability: .publication)
+            try ioHook?(.mutationLogSynced)
+        }
+    }
+
+    /// The caller has synced history through this checkpoint's cursor under the lifecycle lock.
+    private func publishDurableCheckpoint(_ checkpoint: Checkpoint) throws {
+        try ioHook?(.checkpointWillPublish)
+        try write(checkpoint, to: checkpointURL(id: checkpoint.id, workspaceId: checkpoint.workspaceID), durability: .publication)
     }
 
     /// Truncates a partial trailing line left behind by a crashed append so subsequent appends
@@ -1691,20 +1939,15 @@ actor FileCheckpointStore: CheckpointStore {
         return nil
     }
 
-    private func writeAllMutationsAsJSONL(_ records: [Mutation], to url: URL) throws {
-        if records.isEmpty {
-            if fileManager.fileExists(atPath: url.path) {
-                try fileManager.removeItem(at: url)
-            }
-            return
-        }
+    private func writeAllMutationsAsJSONL(_ records: [Mutation], to url: URL, durable: Bool = true) throws {
         var data = Data()
         for record in records.sorted(by: { $0.sequence < $1.sequence }) {
             var line = try compactEncoder.encode(record)
             line.append(Data("\n".utf8))
             data.append(line)
         }
-        try data.write(to: url, options: .atomic)
+        if durable { try Self.durableWrite(data, to: url, publication: true) }
+        else { try data.write(to: url, options: .atomic) }
     }
 
     private func appendJSONLLine(encode record: Mutation, to url: URL) throws {
@@ -1871,9 +2114,8 @@ actor FileCheckpointStore: CheckpointStore {
 
     /// A persistent sidecar lockfile used to serialize mutation-log access.
     ///
-    /// The mutations log is append-only; we still take the lock on a **stable** sidecar so the lock
-    /// is not taken on a file that is unlinked/renamed by atomic write helpers in other
-    /// subsystems. Mutations are written to `mutations.jsonl`.
+    /// The lock stays on a stable sidecar while retractions and compaction atomically
+    /// replace `mutations.jsonl`.
     private func mutationsLockURL(workspaceId: UUID) -> URL {
         workspaceDirectoryURL(workspaceId: workspaceId).appendingPathComponent("mutations.lock", isDirectory: false)
     }
@@ -2370,6 +2612,23 @@ actor FileCheckpointStore: CheckpointStore {
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
         try handle.synchronize()
+#endif
+    }
+
+    private nonisolated static func syncFile(_ url: URL) throws {
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try syncFile(handle)
+    }
+
+    private nonisolated static func syncFile(_ handle: FileHandle) throws {
+        try handle.synchronize()
+#if canImport(Darwin)
+        while fcntl(handle.fileDescriptor, F_FULLFSYNC) != 0 {
+            if errno == EINTR { continue }
+            // Match durableWrite's fallback for volumes without full-sync support.
+            break
+        }
 #endif
     }
 

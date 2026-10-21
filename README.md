@@ -174,11 +174,14 @@ let plan = try await workspace.compact(
     dryRun: true
 )
 print(plan.removedCheckpointCount, plan.reclaimedBytes)
+print(plan.removedMutationCount, plan.removedMutationBytes)
 
 let report = try await workspace.compact(retaining: .latest(50))
 ```
 
-`.latest` keeps the newest checkpoints, labeled ones and any IDs you list. It also keeps the checkpoint each kept rollback or transaction checkpoint came from, and any checkpoint that an open transaction or another Workspace instance in the process depends on. `.all` keeps every checkpoint and removes only unreferenced data. Survivors are rebased onto their nearest kept ancestor. `storageStatistics()` reports usage. Nothing prunes mutation history, so use `recording` to bound it.
+`.latest` keeps the newest checkpoints, labeled ones and any IDs you list. It also keeps the checkpoint each kept rollback or transaction checkpoint came from, and any checkpoint that an open transaction or another Workspace instance in the process depends on. `.all` keeps every checkpoint. Survivors are rebased onto their nearest kept ancestor. `storageStatistics()` reports checkpoint data usage.
+
+Compaction also removes history records that every kept checkpoint already includes, even with `.all`. With no checkpoints, all history is kept. Sequence numbers are never reused. `removedMutationCount` and `removedMutationBytes` report what was removed, and dry runs project them. `reclaimedBytes` does not include history.
 
 ## Transactions
 
@@ -253,12 +256,17 @@ let watcher = Task {
     }
 }
 
-let mutations = try await workspace.history()
+let mutations = try await workspace.history() // retained records, oldest first
+let page = try await workspace.history(after: 100, limit: 50) // sequences > 100, oldest first
+let newest = try await workspace.history(before: nil, limit: 50) // latest 50, newest first
+let older = try await workspace.history(before: newest.last?.sequence, limit: 50)
 ```
 
 `.changes` events cover edits, restores, archive restores and commits made through this Workspace, plus external changes the filesystem reports. Events don't say which. `.checkpoint` events cover this instance's checkpoints and, with `.directory` persistence, those of other instances sharing the store. Cancel the consuming task to end a stream.
 
-`history()` returns `Mutation` records for edits, rollbacks, transactions and archive restores from every Workspace sharing the store. It waits for this instance's in-flight mutations. External changes never enter history.
+`history()` returns all retained `Mutation` records for edits, rollbacks, transactions and archive restores from every Workspace sharing the store, oldest first. Every history call waits for this instance's in-flight mutations. External changes never enter history.
+
+`history(after:limit:)` returns up to `limit` records with a sequence greater than `after`, oldest first. `history(before:limit:)` returns up to `limit` records with a sequence less than `before`, newest first; pass `nil` to start from the newest. Cursors are exclusive, and there can be gaps. A zero limit returns an empty page; a negative limit throws. Each call reads history as it is at that moment, so a series of pages is not a snapshot.
 
 ### External changes
 
@@ -381,7 +389,7 @@ Each definition's `inputSchema` is a `JSONValue` holding a plain JSON Schema obj
 
 An atomic `apply` snapshots every path an edit touches, including parents it creates, and restores them if an edit or the history write fails. If the restore also fails, it throws `WorkspaceRollbackError` carrying both errors. Commits and `restore(to:)` recover the same way. Recovery doesn't cover hard links to an edited file outside those paths, permission changes on symbolic links themselves, or a crash: recovery runs in the process.
 
-Operations that mutate or capture the tree run one at a time per Workspace instance, in arrival order. This operation gate covers `apply` and its conveniences, `preview`, `createCheckpoint`, `restore`, `beginTransaction`, commits, `compact`, `history()` and diffs against `.current`. In practice:
+Operations that mutate or capture the tree run one at a time per Workspace instance, in arrival order. This operation gate covers `apply` and its conveniences, `preview`, `createCheckpoint`, `restore`, `beginTransaction`, commits, `compact`, all `history` overloads and diffs against `.current`. In practice:
 
 - An edit never interleaves with another edit, checkpoint or commit on the same instance.
 - A slow operation, such as the first checkpoint of a large tree, delays everything queued behind it.
@@ -424,7 +432,9 @@ Run untrusted code in an OS sandbox or container, and use these wrappers inside 
 
 Several instances and processes can share a store. Compaction only protects checkpoints in use within its own process, so coordinate compaction across processes.
 
-A checkpoint becomes visible only after its files and directories are synced with `fsync`. On Apple platforms the snapshot root and checkpoint record also use `F_FULLFSYNC` to flush the drive cache; volumes that don't support it keep the `fsync` guarantee. A published checkpoint survives a crash or power loss on storage that honors these requests, and a failed capture never publishes a checkpoint with missing content. Mutation history is appended without `fsync`, so its latest records can be lost on power failure.
+A checkpoint becomes visible only after its files and directories are synced with `fsync`. On Apple platforms the snapshot root and checkpoint record also use `F_FULLFSYNC` to flush the drive cache; volumes that don't support it keep the `fsync` guarantee. A published checkpoint survives a crash or power loss on storage that honors these requests, and a failed capture never publishes a checkpoint with missing content.
+
+Mutation appends aren't synced, for speed. Publishing any checkpoint first syncs the history log, using `F_FULLFSYNC` on Apple platforms with the same `fsync` fallback. A published checkpoint never refers to history that a crash can lose. Records since your latest checkpoint can be lost on power failure. Compaction replaces the log atomically.
 
 ### Change detection
 

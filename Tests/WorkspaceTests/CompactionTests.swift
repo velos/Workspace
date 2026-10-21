@@ -36,7 +36,7 @@ struct CompactionTests {
         #expect(try await workspace.storageStatistics() == applied.after)
         #expect(try await workspace.checkpoints().map(\.id) == [third.id])
         #expect(try await workspace.checkpoint(id: third.id)?.parentID == nil)
-        #expect(try await workspace.history().count == 3)
+        #expect(try await workspace.history().isEmpty)
         await #expect(throws: WorkspaceError.self) {
             _ = try await workspace.readText("/note", at: .checkpoint(first.id))
         }

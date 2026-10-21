@@ -180,7 +180,7 @@ extension FileCheckpointStore {
             // All immutable objects are durable before the manifest, then the checkpoint
             // is published through the same full-sync/fallback path as captureRevision.
             try write(manifest, to: snapshotURL(id: manifest.id, workspaceId: workspaceId), durability: .publication)
-            try write(checkpoint, to: checkpointURL(id: checkpoint.id, workspaceId: workspaceId), durability: .publication)
+            try await publishCheckpoint(checkpoint)
             listCheckpointsCache[workspaceId] = nil
             return checkpoint
         }

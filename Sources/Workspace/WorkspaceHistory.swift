@@ -31,7 +31,7 @@ public struct Mutation: Sendable, Codable, Equatable {
 }
 
 extension Workspace {
-    /// Returns recorded mutations in ascending sequence order.
+    /// Returns retained mutation records in ascending sequence order.
     ///
     /// History is read from the persistence store, so it includes records appended by other
     /// workspace instances sharing the store and throws if the stored log can't be read. The call
@@ -43,6 +43,25 @@ extension Workspace {
         try await ensureLoaded()
         try await refreshPersistedHistory()
         return mutations
+    }
+
+    /// Returns at most `limit` mutations strictly after `after`, oldest first.
+    /// A zero limit returns an empty page; a negative limit throws `WorkspaceError.unsupported`.
+    /// Sequence gaps are preserved.
+    /// Like `history()`, waits for this instance's mutating operations and reads the store.
+    public func history(after: Int, limit: Int) async throws -> [Mutation] {
+        await acquireOperation()
+        defer { releaseOperation() }
+        return try await store.listMutations(workspaceId: workspaceId, query: .after(after, limit: limit)).records
+    }
+
+    /// Returns at most `limit` mutations strictly before `before`, newest first.
+    /// Pass `nil` explicitly to start at the newest record. A zero limit returns an empty page;
+    /// a negative limit throws `WorkspaceError.unsupported`. Sequence gaps are preserved.
+    public func history(before: Int?, limit: Int) async throws -> [Mutation] {
+        await acquireOperation()
+        defer { releaseOperation() }
+        return try await store.listMutations(workspaceId: workspaceId, query: .before(before, limit: limit)).records
     }
 
     func refreshPersistedHistory() async throws {
