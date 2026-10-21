@@ -3,6 +3,36 @@ import Testing
 @testable import Workspace
 
 struct DeviceIdentityTests {
+    @Test
+    func `persisted equality distinguishes device renumbering from metadata reuse`() throws {
+        let original = FileCheckpointStore.SnapshotManifest.Node(
+            kind: .file, path: "/file", contentHash: "abc", contentSize: 3,
+            identity: FileIdentity(device: 1, inode: 42))
+        var renumbered = original
+        renumbered.identity = FileIdentity(device: 2, inode: 42)
+        #expect(original != renumbered)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        #expect(try encoder.encode(original) != encoder.encode(renumbered))
+        #expect(original.isReusable(as: renumbered))
+        #expect(renumbered.isReusable(as: original))
+        #expect([original] != [renumbered])
+        #expect([original].isReusable(as: [renumbered]))
+        #expect(![original].isReusable(as: []))
+        var replaced = renumbered
+        replaced.identity = FileIdentity(device: 2, inode: 43)
+        #expect(!original.isReusable(as: replaced))
+        #expect(![original].isReusable(as: [replaced]))
+
+        let metadata = MetadataIndex.Entry(info: FileInfo(
+            path: "/file", kind: .file, size: 3, permissions: .defaultFile,
+            modificationDate: nil, identity: original.identity), target: nil)
+        var renumberedMetadata = metadata
+        renumberedMetadata.info.identity = renumbered.identity
+        #expect(metadata != renumberedMetadata)
+        #expect(metadata.isReusable(as: renumberedMetadata))
+    }
+
     @Test(arguments: ["unchanged", "size", "mtime", "racy", "verified", "replacement"])
     func `device renumbering preserves capture reuse without bypassing content guards`(change: String) async throws {
         let root = try TestSupport.temporaryDirectory("DeviceCapture")

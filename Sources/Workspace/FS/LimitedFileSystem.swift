@@ -69,11 +69,11 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
     private let base: any FileSystem
     private let pathResolver: FileSystemPathResolver
     public let limits: FileSystemLimits
-    // Above this bound the same projection runs on an ephemeral full walk.
+    private let accountingCacheEntryLimit: Int
     #if os(iOS) || os(watchOS)
-    static let accountingCacheEntryLimit = 25_000
+    private static let defaultAccountingCacheEntryLimit = 25_000
     #else
-    static let accountingCacheEntryLimit = 250_000
+    private static let defaultAccountingCacheEntryLimit = 250_000
     #endif
     private var accounting = Accounting()
     private var cacheValid = false
@@ -86,10 +86,16 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
     private var mutationActive = false
     private var mutationWaiters: [CheckedContinuation<Void, Never>] = []
 
-    public init(base: any FileSystem, limits: FileSystemLimits) {
+    /// Creates a quota-enforcing decorator. `accountingCacheEntryLimit` caps retained
+    /// accounting entries, including the root. `nil` uses 250,000 entries (25,000 on
+    /// iOS/watchOS). Zero or negative values disable retention: every preflight walks
+    /// the tree. Above the cap, accounting is discarded after each operation; the
+    /// cap bounds retained entries, not peak memory during a walk.
+    public init(base: any FileSystem, limits: FileSystemLimits, accountingCacheEntryLimit: Int? = nil) {
         self.base = base
         pathResolver = FileSystemPathResolver(base: base)
         self.limits = limits
+        self.accountingCacheEntryLimit = max(0, accountingCacheEntryLimit ?? Self.defaultAccountingCacheEntryLimit)
     }
 
     deinit { observationTask?.cancel() }
@@ -215,7 +221,7 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
     }
 
     private func discardOversizedAccounting() {
-        if accounting.tree.count > Self.accountingCacheEntryLimit {
+        if accountingCacheEntryLimit == 0 || accounting.tree.count > accountingCacheEntryLimit {
             accounting = Accounting()
             cacheValid = false
         }
@@ -457,7 +463,7 @@ public actor LimitedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanti
             if generation != after { cacheValid = false; continue }
             cachedGeneration = after
             if rescan || !invalidations.isEmpty { continue }
-            return retain && accounting.tree.count <= Self.accountingCacheEntryLimit
+            return retain && accountingCacheEntryLimit > 0 && accounting.tree.count <= accountingCacheEntryLimit
         }
     }
 

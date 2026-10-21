@@ -443,7 +443,7 @@ actor FileCheckpointStore: CheckpointStore {
 
     /// A small root with content-addressed directory references and optional pack ranges.
     struct SnapshotManifest: Codable, Sendable {
-        struct Node: Codable, Sendable, Equatable {
+        struct Node: Codable, Sendable, MetadataReusable {
             enum Kind: String, Codable {
                 case file, directory, symlink, missing
             }
@@ -463,9 +463,17 @@ actor FileCheckpointStore: CheckpointStore {
                 lhs.kind == rhs.kind && lhs.path == rhs.path &&
                 lhs.permissions == rhs.permissions && lhs.contentHash == rhs.contentHash &&
                 lhs.contentSize == rhs.contentSize && lhs.modificationDate == rhs.modificationDate &&
-                FileIdentity.matchesForMetadataReuse(lhs.identity, rhs.identity) &&
+                lhs.identity == rhs.identity &&
                 lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init) &&
                 lhs.treeHash == rhs.treeHash && lhs.packed == rhs.packed
+            }
+
+            /// Compare all persisted fields, allowing only device renumbering in identity.
+            func isReusable(as other: Self) -> Bool {
+                guard FileIdentity.matchesForMetadataReuse(identity, other.identity) else { return false }
+                var comparable = self
+                comparable.identity = other.identity
+                return comparable == other
             }
         }
 
@@ -478,7 +486,7 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     /// Names are validated before entering the cache; no absolute paths are persisted.
-    private struct TreeEntry: Codable, Sendable, Equatable {
+    private struct TreeEntry: Codable, Sendable, MetadataReusable {
         var name: String
         var kind: SnapshotManifest.Node.Kind
         var permissions: POSIXPermissions
@@ -534,9 +542,17 @@ actor FileCheckpointStore: CheckpointStore {
             lhs.name.utf8.elementsEqual(rhs.name.utf8) && lhs.kind == rhs.kind &&
                 lhs.permissions == rhs.permissions && lhs.contentHash == rhs.contentHash &&
                 lhs.contentSize == rhs.contentSize && lhs.modificationDate == rhs.modificationDate &&
-                FileIdentity.matchesForMetadataReuse(lhs.identity, rhs.identity) &&
+                lhs.identity == rhs.identity &&
                 lhs.symlinkTarget.map(PathName.init) == rhs.symlinkTarget.map(PathName.init) &&
                 lhs.treeHash == rhs.treeHash && lhs.packed == rhs.packed
+        }
+
+        /// Compare all persisted fields, allowing only device renumbering in identity.
+        func isReusable(as other: Self) -> Bool {
+            guard FileIdentity.matchesForMetadataReuse(identity, other.identity) else { return false }
+            var comparable = self
+            comparable.identity = other.identity
+            return comparable == other
         }
 
         /// Trees are validated and sorted by exact name bytes before being cached.
@@ -754,7 +770,7 @@ actor FileCheckpointStore: CheckpointStore {
     ) throws -> SnapshotManifest.Node {
         let entries = directory.children.sorted { PathName($0.name) < PathName($1.name) }
         if let previous = directory.previous, previous.kind == .directory, previous.treeHash != nil,
-           directory.previousEntries == entries {
+           directory.previousEntries.isReusable(as: entries) {
             var reused = previous
             reused.permissions = info.permissions
             reused.modificationDate = info.modificationDate
@@ -1000,7 +1016,7 @@ actor FileCheckpointStore: CheckpointStore {
                 if case .missing = child { return nil }
                 return try writeManifestNode(child, workspaceId: workspaceId, batch: batch, reusing: byPath[child.path])
             }.sorted { PathName($0.path.name) < PathName($1.path.name) }
-            if let previous, previous.kind == .directory, previous.treeHash != nil, old == entries {
+            if let previous, previous.kind == .directory, previous.treeHash != nil, old.isReusable(as: entries) {
                 var reused = previous
                 reused.permissions = directory.permissions
                 return reused
@@ -1469,7 +1485,7 @@ actor FileCheckpointStore: CheckpointStore {
         } else if node.kind == .directory {
             let old = try children(of: node, workspaceId: workspaceId)
             let new = try old.map { try relocating($0, blobs: blobs, workspaceId: workspaceId) }
-            if old != new {
+            if !old.isReusable(as: new) {
                 result = try persistDirectory(result, children: new, workspaceId: workspaceId, syncParent: true)
             }
         }
@@ -2277,7 +2293,7 @@ actor FileCheckpointStore: CheckpointStore {
     }
 
     func compareNodes(_ old: SnapshotManifest.Node, _ new: SnapshotManifest.Node, workspaceId: UUID, capturing: Bool = false) async throws -> ChangeSet {
-        if old == new { return ChangeSet(changes: []) }
+        if old.isReusable(as: new) { return ChangeSet(changes: []) }
         if old.kind == .directory, new.kind == .directory {
             var changes: [FileChange] = (old.permissions) == (new.permissions) ? [] : [.init(path: new.path, kind: .directory, effect: .modified)]
             var omissions: [TextDiffOmission] = []

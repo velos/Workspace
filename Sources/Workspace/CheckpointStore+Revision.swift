@@ -152,7 +152,7 @@ extension FileCheckpointStore {
                         permissions: directory.permissions,
                         modificationDate: metadata.entries[directory.path]?.info.modificationDate,
                         identity: metadata.entries[directory.path]?.info.identity)
-                    if let old, old.kind == .directory, old.treeHash != nil, updated == previous {
+                    if let old, old.kind == .directory, old.treeHash != nil, updated.isReusable(as: previous) {
                         node.treeHash = old.treeHash
                         return node
                     }

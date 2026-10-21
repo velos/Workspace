@@ -505,8 +505,11 @@ declares complete coverage only when its base and every mount do, including late
 Incomplete or undeclared coverage uses full walks (or the exact generation capability).
 Each Limited over Local registers its own recursive inotify watcher on Linux; large trees
 can exhaust the watch limit (ENOSPC), at which point accounting safely falls back to walks.
-The retained cache is capped at 250,000 entries (25,000 on iOS/watchOS); above that cap,
-accounting is discarded after the operation and every preflight walks the tree.
+`LimitedFileSystem(base:limits:accountingCacheEntryLimit:)` caps retained accounting entries,
+including the root. Pass `nil` (the default) for 250,000 entries (25,000 on iOS/watchOS),
+or an explicit entry count to tune memory retention. `0` (or a negative value) disables
+retention, so every preflight walks the tree. Above the cap, accounting is discarded
+after the operation. This bounds retained entries, not peak memory during a walk.
 
 **Consistency:** a quota decision incorporates signals processed by this Limited actor
 before its projection finishes. Signals buffered in the backend or stream, or queued

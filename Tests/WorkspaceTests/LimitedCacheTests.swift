@@ -284,10 +284,12 @@ struct LimitedCacheTests {
         try await checkTotals(fs, base: memory)
     }
 
-    @Test
-    func oversizedAccountingIsDiscardedBetweenRejectedPreflights() async throws {
-        let base = LimitedCacheBackend(fixedEntryCount: LimitedFileSystem.accountingCacheEntryLimit)
-        let fs = LimitedFileSystem(base: base, limits: .init(maxTotalBytes: 100))
+    @Test(arguments: [0, 3, 4, 5])
+    func accountingCacheCapIncludesRootAndIsInclusive(cap: Int) async throws {
+        // Three files plus the root: only caps of at least four may retain this walk.
+        let base = LimitedCacheBackend(fixedEntryCount: 3)
+        let fs = LimitedFileSystem(base: base, limits: .init(maxTotalBytes: 100),
+                                   accountingCacheEntryLimit: cap)
         try await fs.revalidate()
         await base.clearReads()
         for _ in 0..<2 {
@@ -295,7 +297,30 @@ struct LimitedCacheTests {
                 try await fs.createFile(path: "/probe", data: Data(count: 101))
             }
         }
-        #expect(await base.listed.filter { $0.isRoot }.count == 2)
+        #expect(await base.listed.filter { $0.isRoot }.count == (cap < 4 ? 2 : 0))
+    }
+
+    @Test(arguments: [0, 2])
+    func successfulMutationsRespectAccountingCacheCap(cap: Int) async throws {
+        let base = LimitedCacheBackend()
+        let fs = LimitedFileSystem(base: base, limits: .init(maxTotalBytes: 100),
+                                   accountingCacheEntryLimit: cap)
+        try await fs.createFile(path: "/a", data: Data(count: 10))
+        await base.clearReads()
+        for _ in 0..<2 {
+            await #expect(throws: FileSystemLimitError.totalBytes(attempted: 111, limit: 100)) {
+                try await fs.createFile(path: "/probe", data: Data(count: 101))
+            }
+        }
+        #expect(await base.listed.filter { $0.isRoot }.count == (cap == 0 ? 2 : 0))
+
+        // Adding a second file takes the retained entry count from two to three.
+        try await fs.createFile(path: "/b", data: Data(count: 20))
+        await base.clearReads()
+        await #expect(throws: FileSystemLimitError.totalBytes(attempted: 131, limit: 100)) {
+            try await fs.createFile(path: "/probe", data: Data(count: 101))
+        }
+        #expect(await base.listed.filter { $0.isRoot }.count == 1)
     }
 
     @Test

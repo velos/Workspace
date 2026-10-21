@@ -173,7 +173,8 @@ struct FilesystemObservation: Sendable {
             let requiresContentCheck = new?.info.kind == .file && cache[path] != nil && (
                 verifyContents.contains(path)
                 || (checkRacyContents.contains(path) && old.map { new?.canReuseContents($0, capturedAt: before.capturedAt, exactTimestamps: before.exactTimestamps) != true } != false))
-            guard old != new || requiresContentCheck else { continue }
+            let reusable = if let old, let new { old.isReusable(as: new) } else { false }
+            guard !reusable || requiresContentCheck else { continue }
             // mtime/identity changes on directories alone are not workspace changes.
             if let old, let new, old.info.kind == .directory, new.info.kind == .directory,
                old.info.permissions == new.info.permissions { continue }

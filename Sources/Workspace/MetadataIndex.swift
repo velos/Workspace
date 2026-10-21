@@ -1,17 +1,40 @@
 import Foundation
 
+/// Metadata reuse may tolerate device renumbering; equality must remain exact.
+protocol MetadataReusable: Equatable {
+    func isReusable(as other: Self) -> Bool
+}
+
+extension Collection where Element: MetadataReusable {
+    /// Ordered children must have the same length and reusable metadata at every position.
+    func isReusable(as other: Self) -> Bool {
+        elementsEqual(other) { $0.isReusable(as: $1) }
+    }
+}
+
 /// An lstat index: directory timestamps are hints, never logical changes.
 struct MetadataIndex: Sendable {
-    struct Entry: Sendable, Equatable {
+    struct Entry: Sendable, MetadataReusable {
         var info: FileInfo
         var target: String?
 
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.info.kind == rhs.info.kind && lhs.info.size == rhs.info.size
                 && lhs.info.modificationDate == rhs.info.modificationDate
-                && FileIdentity.matchesForMetadataReuse(lhs.info.identity, rhs.info.identity)
+                && lhs.info.identity == rhs.info.identity
+                && lhs.info.path == rhs.info.path && lhs.info.linkCount == rhs.info.linkCount
                 && lhs.info.permissions == rhs.info.permissions
                 && lhs.target.map(PathName.init) == rhs.target.map(PathName.init)
+        }
+
+        /// Observation compares logical metadata; paths are keyed separately and link counts
+        /// do not describe contents. Device renumbering alone does not invalidate a hint.
+        func isReusable(as other: Self) -> Bool {
+            info.kind == other.info.kind && info.size == other.info.size
+                && info.modificationDate == other.info.modificationDate
+                && FileIdentity.matchesForMetadataReuse(info.identity, other.info.identity)
+                && info.permissions == other.info.permissions
+                && target.map(PathName.init) == other.target.map(PathName.init)
         }
 
         func canReuseContents(_ old: Self, capturedAt: Date, exactTimestamps: Bool = false) -> Bool {
