@@ -7,6 +7,47 @@ import CoreServices
 
 @Suite("Scoped filesystem observation")
 struct ScopedObservationTests {
+    @Test func scopedRefreshStatsEachSharedAncestorOnce() async throws {
+        let fs = HookableFileSystem()
+        let paths = (0..<50).map { WorkspacePath(normalizing: "/a/b/c/d/file-\($0)") }
+        for path in paths { try await fs.writeFile(path: path, data: Data("old".utf8), append: false) }
+        var observation = try await FilesystemObservation.start(on: fs, budget: 0)
+        for path in paths { try await fs.writeFile(path: path, data: Data("changed".utf8), append: false) }
+        await fs.resetMetadataCounts()
+        let changes = try await observation.refresh(on: fs,
+            signal: .paths(Dictionary(uniqueKeysWithValues: paths.map { ($0, .entry) })))
+        #expect(Set(changes.touchedPaths) == Set(paths))
+        // Fifty leaves and four unique ancestors; the root needs no lookup.
+        #expect(await fs.statCount == 54)
+        #expect(await fs.listings.isEmpty)
+        #expect(try await observation.refresh(on: fs, signal: .rescan).changes.isEmpty)
+    }
+
+    @Test(arguments: ["symlink", "file", "missing"], ["delayed", "same batch", "stale ancestor"])
+    func `descendant invalidations never traverse replaced ancestors`(replacement: String, delivery: String) async throws {
+        let fs = InMemoryFileSystem()
+        try await fs.writeFile(path: "/dir/nested/file", data: Data("old".utf8), append: false)
+        try await fs.writeFile(path: "/other/nested/file", data: Data("other".utf8), append: false)
+        var observation = try await FilesystemObservation.start(on: fs, budget: 1024)
+        try await fs.remove(path: "/dir", recursive: true)
+        if replacement == "symlink" { try await fs.createSymlink(path: "/dir", target: "other") }
+        if replacement == "file" { try await fs.writeFile(path: "/dir", data: Data("leaf".utf8), append: false) }
+        let descendants: [WorkspacePath: FileSystemChangeSignal.Scope] = ["/dir/nested": .shallow, "/dir/nested/file": .entry]
+        if delivery == "delayed" {
+            _ = try await observation.refresh(on: fs, signal: .paths(["/dir": .recursive]))
+        }
+        var paths = descendants
+        if delivery == "same batch" { paths["/dir"] = .recursive }
+        let changes = try await observation.refresh(on: fs, signal: .paths(paths))
+        #expect(!changes.changes.contains { $0.path.isWithin("/dir") && $0.path != "/dir" && $0.effect == .created })
+        #expect(observation.metadata.entries["/dir/nested"] == nil)
+        #expect(observation.metadata.entries["/dir/nested/file"] == nil)
+        if delivery == "delayed" { #expect(changes.changes.isEmpty) }
+        // With a stale ancestor, its own signal is still needed by the change-source contract.
+        if delivery == "stale ancestor" { _ = try await observation.refresh(on: fs, signal: .paths(["/dir": .recursive])) }
+        #expect(try await observation.refresh(on: fs, signal: .rescan).changes.isEmpty)
+    }
+
     @Test func `shallow parent plus entry signals leave unrelated subtrees and contents alone`() async throws {
         let fs = SignallingFileSystem()
         try await fs.base.createDirectory(path: "/unrelated/deep", recursive: true)

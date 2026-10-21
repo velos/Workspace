@@ -56,6 +56,42 @@ struct ParentCreationTests {
         }
     }
 
+    @Test(arguments: ["file", "missing"], ["local", "memory", "overlay", "authorized", "mounted", "limited local"])
+    func `hard links preserve the final symlink across backends`(target: String, backend: String) async throws {
+        let root = try TestSupport.temporaryDirectory("HardLinkSymlink")
+        defer { TestSupport.remove(root) }
+        let lower = InMemoryFileSystem()
+        let fs: any FileSystem
+        switch backend {
+        case "local": fs = try LocalFileSystem(root: root)
+        case "overlay": fs = OverlayFileSystem(over: lower)
+        case "authorized": fs = AuthorizedFileSystem(base: lower, authorizer: PermissionAuthorizer { _ in .allow })
+        case "mounted": fs = MountedFileSystem(base: InMemoryFileSystem(), mounts: [.init(mountPoint: "/mount", fileSystem: lower)])
+        case "limited local": fs = LimitedFileSystem(base: try LocalFileSystem(root: root), limits: .init(maxTotalBytes: 8))
+        default: fs = lower
+        }
+        let prefix: WorkspacePath = backend == "mounted" ? "/mount" : .root
+        let setup: any FileSystem = backend == "overlay" ? lower : fs
+        try await setup.createDirectory(path: prefix.appending("source"), recursive: true)
+        try await setup.writeFile(path: prefix.appending("source/file"), data: Data("contents".utf8), append: false)
+        try await setup.createSymlink(path: prefix.appending("source/link"), target: target)
+        try await setup.createSymlink(path: prefix.appending("alias"), target: "source")
+        let lowerBefore = try await Snapshot.capture(from: lower)
+        let hard = prefix.appending("new/deep/hard")
+        try await fs.createHardLink(path: hard, target: prefix.appending("alias/link"))
+        let info = try await fs.stat(path: hard)
+        #expect(info.kind == .symlink)
+        await #expect(throws: (any Error).self) { try await fs.stat(path: prefix.appending("new/deep/HARD")) }
+        #expect(try await fs.readSymlink(path: hard) == target)
+        #expect(info.identity == (try await fs.stat(path: prefix.appending("source/link"))).identity)
+        #expect(try await fs.stat(path: prefix.appending("new/deep")).kind == .directory)
+        if backend == "overlay" { #expect(try await Snapshot.capture(from: lower).entry == lowerBefore.entry) }
+        if let limited = fs as? LimitedFileSystem {
+            try await limited.revalidate()
+            await #expect(throws: FileSystemLimitError.self) { try await limited.createFile(path: "/extra", data: Data([1])) }
+        }
+    }
+
     @Test(arguments: cases)
     func `creation matches disk including parents permissions and errors`(operation: Operation, route: String) async throws {
         let root = try TestSupport.temporaryDirectory("ParentCreation")

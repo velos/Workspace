@@ -494,7 +494,14 @@ public final class AuthorizedFileSystem: FileSystem, PreviewSemanticsFileSystem,
             if let path = request.destinationPath {
                 resolved.destinationPath = try await resolvedPath(path, followFinal: false)
             }
-        case .createSymlink, .createHardLink:
+        case .createHardLink:
+            if let path = request.path {
+                resolved.path = try await resolvedPath(path, followFinal: false)
+            }
+            if let path = request.destinationPath {
+                resolved.destinationPath = try await resolvedPath(path, followFinal: false)
+            }
+        case .createSymlink:
             if let path = request.path {
                 resolved.path = try await resolvedPath(path, followFinal: false)
             }

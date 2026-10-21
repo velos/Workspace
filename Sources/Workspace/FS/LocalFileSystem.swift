@@ -1073,7 +1073,7 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
     /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         let config = try requireConfiguration()
-        let source = try resolve(target, followFinal: true, configuration: config)
+        let source = try resolve(target, followFinal: false, configuration: config)
         let destination = try resolve(path, followFinal: false, createParents: true, creating: true, configuration: config)
         // No AT_SYMLINK_FOLLOW: a concurrent final-component swap must not dereference a link.
         try check(linkat(source.parent.value, source.name, destination.parent.value, destination.name, 0))

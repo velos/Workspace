@@ -115,11 +115,41 @@ struct FilesystemObservation: Sendable {
                 }
             }
             var recursiveRoots: [WorkspacePath] = []
+            var verifiedDirectories: Set<WorkspacePath> = []
+            // Check top-down: even stat follows intermediate symlinks. Entries
+            // already refreshed in this batch take precedence over the old index.
+            func hasDirectoryAncestors(_ path: WorkspacePath) async throws -> Bool {
+                guard !path.isRoot else { return true }
+                var ancestors: [WorkspacePath] = []
+                var ancestor = path.parent
+                while !ancestor.isRoot {
+                    ancestors.append(ancestor)
+                    ancestor = ancestor.parent
+                }
+                for ancestor in ancestors.reversed() {
+                    if let refreshed = next.entries[ancestor] {
+                        guard refreshed.info.kind == .directory else { return false }
+                    } else {
+                        guard before.entries[ancestor] == nil,
+                              !recursiveRoots.contains(where: { Snapshot.contains($0, ancestor) }),
+                              metadata.entries[ancestor]?.info.kind == .directory
+                        else { return false }
+                        if !verifiedDirectories.contains(ancestor) {
+                            guard try await Snapshot.infoIfPresent(at: ancestor, on: fs)?.kind == .directory
+                            else { return false }
+                            verifiedDirectories.insert(ancestor)
+                        }
+                    }
+                }
+                return true
+            }
             func captureRecursive(_ root: WorkspacePath) async throws {
                 for path in subtree(root) { before.entries[path] = metadata.entries[path] }
-                let captured = try await MetadataIndex.capture(from: fs, at: root)
-                next.entries.merge(captured.entries) { _, new in new }
-                checkRacyContents.formUnion(captured.entries.keys)
+                if try await hasDirectoryAncestors(root) {
+                    let captured = try await MetadataIndex.capture(from: fs, at: root)
+                    next.entries.merge(captured.entries) { _, new in new }
+                    checkRacyContents.formUnion(captured.entries.keys)
+                }
                 recursiveRoots.append(root)
             }
             func captureEntry(_ info: FileInfo) async throws {
@@ -133,6 +163,10 @@ struct FilesystemObservation: Sendable {
                 if recursiveRoots.contains(where: { Snapshot.contains($0, path) }) { continue }
                 let scope = affected[path]!
                 let old = metadata.entries[path]
+                guard try await hasDirectoryAncestors(path) else {
+                    try await captureRecursive(path)
+                    continue
+                }
                 let info = try await Snapshot.infoIfPresent(at: path, on: fs)
                 let replacedDirectory = old?.info.kind == .directory &&
                     (info?.kind != .directory || old?.info.identity != info?.identity)

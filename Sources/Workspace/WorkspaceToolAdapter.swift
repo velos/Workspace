@@ -198,8 +198,7 @@ public actor WorkspaceToolAdapter {
                     hasMore: offset < totalBytes && UInt64(data.count) < totalBytes - offset,
                     offset: offset, leadingContext: leadingContext)
                 guard end > 0 || offset >= totalBytes else {
-                    throw WorkspaceToolError(code: .conflict, path: request.path,
-                        message: "The file changed during the read; retry this page.")
+                    throw WorkspaceToolError.readConflict(path: request.path)
                 }
                 // The read length was bounded by totalBytes - offset, so this cannot overflow.
                 let nextOffset = offset + UInt64(end)

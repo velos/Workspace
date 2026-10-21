@@ -145,6 +145,16 @@ final class LocalPathSpelling: @unchecked Sendable {
                     throw posix(EIO)
                 }
                 guard bytes[start..<(start + count - 1)].elementsEqual(name.utf8) else {
+                    // Darwin can return another hard link's name for a symlink vnode.
+                    // Verify the actual directory entry before rejecting that spelling.
+                    var info = stat()
+                    if fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) == 0,
+                       info.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK), info.st_nlink > 1 {
+                        try Self.checkListing(name: name, exists: true, creating: creating, afterCreate: afterCreate) {
+                            try Self.listNames(parent)
+                        }
+                        return
+                    }
                     throw Self.spellingMismatch(creating: creating, afterCreate: afterCreate)
                 }
             }

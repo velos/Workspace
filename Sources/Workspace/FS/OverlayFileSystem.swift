@@ -419,7 +419,7 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
     /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
         let createsParents = await previewSemantics(at: path).createsWriteParents
-        let target = try await resolveMergedPath(target)
+        let target = try await resolveMergedPath(target, followFinal: false)
         guard let targetInfo = await mergedEntry(target) else {
             throw posixError(ENOENT)
         }

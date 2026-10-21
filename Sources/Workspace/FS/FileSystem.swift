@@ -197,7 +197,10 @@ public protocol FileSystem: AnyObject, Sendable {
     func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws
     /// Creates a symbolic link at `path` pointing to `target`.
     func createSymlink(path: WorkspacePath, target: String) async throws
-    /// Creates a hard link at `path` pointing to `target`.
+    /// Creates a hard link at `path` pointing to the entry at `target`.
+    /// Intermediate symlinks in `target` are followed. A final symlink is linked
+    /// itself, without dereferencing it, like `linkat` without `AT_SYMLINK_FOLLOW`.
+    /// A dangling final symlink can also be linked.
     func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws
     /// Reads the target of the symbolic link at `path`.
     func readSymlink(path: WorkspacePath) async throws -> String

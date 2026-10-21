@@ -124,18 +124,53 @@ extension Workspace {
         var readRange: @Sendable (UInt64, Int?) async throws -> Data
     }
 
-    /// Resolve once for metadata and all reads needed to decode one UTF-8 page.
+    /// Keep one file identity across all reads needed to decode a UTF-8 page.
     func resolvedReadableFile(at path: WorkspacePath, revision: Revision) async throws -> ResolvedReadableFile {
         switch revision {
         case .current:
-            let resolvedPath = try await filesystem.resolveRealPath(path: path)
-            let metadata = try await filesystem.stat(path: resolvedPath)
+            let filesystem = filesystem
+            let features = await filesystem.capabilities()
+            let resolver = FileSystemPathResolver(base: filesystem)
+            @Sendable func currentMetadata() async throws -> (WorkspacePath, FileInfo) {
+                // The requested spelling's stat policy also governs the reported totalBytes.
+                let requested = try await filesystem.stat(path: path)
+                let resolved = try await resolver.resolve(path, features: features, followFinal: true)
+                let info = resolved == path ? requested : try await filesystem.stat(path: resolved)
+                return (resolved, info)
+            }
+            let (resolvedPath, metadata) = try await currentMetadata()
             guard metadata.kind == .file else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(EISDIR))
             }
-            let filesystem = filesystem
+            let conflict = WorkspaceToolError.readConflict(path: path)
+            @Sendable func validate() async throws {
+                do {
+                    let (currentPath, current) = try await currentMetadata()
+                    guard currentPath == resolvedPath else { throw conflict }
+                    guard current.kind == .file, current.identity == metadata.identity,
+                          current.size == metadata.size, current.modificationDate == metadata.modificationDate
+                    else { throw conflict }
+                } catch {
+                    let failure = error as NSError
+                    if failure.domain == NSPOSIXErrorDomain,
+                       [Int(ENOENT), Int(ENOTDIR), Int(ELOOP)].contains(failure.code) { throw conflict }
+                    throw error
+                }
+            }
             return ResolvedReadableFile(size: metadata.size, readRange: { offset, length in
-                try await filesystem.readFile(path: resolvedPath, offset: offset, length: length)
+                // Check both sides to detect changes between ranges and during this read.
+                try await validate()
+                let data: Data
+                do {
+                    // Preserve the caller's spelling so wrappers authorize both it and
+                    // its resolved target, just as an ordinary Workspace read does.
+                    data = try await filesystem.readFile(path: path, offset: offset, length: length)
+                } catch {
+                    try await validate()
+                    throw error
+                }
+                try await validate()
+                return data
             })
         case let .checkpoint(id):
             let access = try await checkpointAccess(id)

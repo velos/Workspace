@@ -58,6 +58,10 @@ public struct WorkspaceToolError: Error, Sendable, Codable, Equatable, CustomStr
         Self(code: .invalidArguments, path: nil, message: message)
     }
 
+    static func readConflict(path: WorkspacePath) -> Self {
+        Self(code: .conflict, path: path, message: "The file changed during the read; retry this page.")
+    }
+
     init(mapping error: any Error, requestedPaths: [WorkspacePath]) {
         // Never substitute a backend-reported spelling. Even a valid virtual path
         // may disclose a resolved target the caller did not request.

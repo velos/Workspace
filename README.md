@@ -288,6 +288,8 @@ Without cached contents, observation relies on metadata: an identical rewrite ca
 | `AuthorizedFileSystem(base:authorizer:)` | Checks every operation against a policy. |
 | `LimitedFileSystem(base:limits:)` | Rejects mutations that would exceed byte, entry or per-write limits. |
 
+Hard links follow intermediate symlinks in their source path. If the source's final entry is a symlink, the hard link shares that symlink itself, even when its target is missing. It does not link the target file.
+
 ```swift
 let local = try LocalFileSystem(root: projectURL)
 let limited = LimitedFileSystem(
