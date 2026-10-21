@@ -23,6 +23,17 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
     /// so unsupported filesystem behavior can be tested without mounts or global syscall hooks.
     typealias ExclusiveRename = @Sendable (Int32, String, Int32, String) -> Int32
 
+    #if canImport(Darwin)
+    private var bulkAttributes: DarwinBulkAttributes? = DarwinBulkAttributes()
+
+    // Per-instance route/syscall injection for parity and fallback validation.
+    convenience init(root: URL, bulkAttributes: DarwinBulkAttributes?) throws {
+        self.init()
+        self.bulkAttributes = bulkAttributes
+        try applyConfiguration(rootDirectory: root)
+    }
+    #endif
+
     private let fileManager: FileManager
     private let spelling = LocalPathSpelling()
     private let exclusiveRename: ExclusiveRename
@@ -105,8 +116,8 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
             return entry
         }
 
-        // Names emitted by readdir already have stored spelling. This initializer
-        // still applies the jail's byte-level single-component validation.
+        // Readdir and supported native bulk enumeration supply stored spelling.
+        // This initializer still applies the jail's single-component validation.
         init(parent: Descriptor, storedName: String, path: WorkspacePath) throws {
             try self.init(parent: parent, name: storedName, path: path)
             isVerified = true
@@ -599,16 +610,8 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
             let children: [(entry: Entry, info: LocalStat, key: String)]
             do {
                 directory = try openEntry(entry, flags: O_RDONLY | O_DIRECTORY)
-                children = try names(in: directory, consumingOffset: true).compactMap { name -> (entry: Entry, info: LocalStat, key: String)? in
-                    let child = try Entry(parent: directory, storedName: name, path: entry.path.appending(name))
-                    let info: LocalStat
-                    do { info = try self.metadata(child) }
-                    catch {
-                        guard skippingVanishedEntries, Snapshot.isMissingEntry(error) else { throw error }
-                        return nil
-                    }
-                    return (child, info, walkSortKey(name: name, isDirectory: info.st_mode & S_IFMT == S_IFDIR))
-                }.sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
+                children = try walkChildren(in: directory, at: entry.path,
+                    skippingVanishedEntries: skippingVanishedEntries)
             } catch {
                 guard skippingUnreadableDirectories, isSkippableWalkError(error, at: entry.path) else { throw error }
                 try await visit(metadata, { _ in throw WorkspaceError.unsupported("cannot read a directory") },
@@ -622,6 +625,37 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
         }
         try await visit(metadata, { length in try self.readEntry(entry, length: length) },
                         { try self.linkTarget(entry) })
+    }
+
+    private func walkChildren(in directory: Descriptor, at path: WorkspacePath,
+                              skippingVanishedEntries: Bool) throws -> [(entry: Entry, info: LocalStat, key: String)] {
+        var records: [(name: String, info: LocalStat?)]?
+        var consumedOffset = false
+        #if canImport(Darwin)
+        // Only APFS/HFS supply authoritative stored names through native bulk
+        // enumeration. Unknown/FSKit/network volumes keep readdir as their source.
+        if let bulkAttributes, let device = directory.directoryInfo?.st_dev,
+           directory.spellingPolicy == .darwin || directory.spellingPolicy == .hfs {
+            consumedOffset = true
+            records = try bulkAttributes.entries(in: directory.value, device: device,
+                skippingVanishedEntries: skippingVanishedEntries)?.map { ($0.name, $0.info) }
+        }
+        #endif
+        if records == nil {
+            // A failed bulk call can have advanced the fd, even after valid batches.
+            // Reopen "." for an independent offset; never resume a partial listing.
+            records = try names(in: directory, consumingOffset: !consumedOffset).map { ($0, nil) }
+        }
+        return try (records ?? []).compactMap { name, suppliedInfo in
+            let child = try Entry(parent: directory, storedName: name, path: path.appending(name))
+            let info: LocalStat
+            do { info = try suppliedInfo ?? self.metadata(child) }
+            catch {
+                guard skippingVanishedEntries, Snapshot.isMissingEntry(error) else { throw error }
+                return nil
+            }
+            return (child, info, walkSortKey(name: name, isDirectory: info.st_mode & S_IFMT == S_IFDIR))
+        }.sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
     }
 
     private func openRegularFile(_ entry: Entry) throws -> (Descriptor, LocalStat) {

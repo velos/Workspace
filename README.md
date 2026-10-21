@@ -443,6 +443,14 @@ swift test --disable-xctest --enable-swift-testing
 
 CI runs the tests with Swift 6.2 on macOS and Linux.
 
+On macOS, `LocalFileSystem` reads directory metadata in bulk where the volume reports it exactly, and uses per-file lookups otherwise. To check that both give the same results on a particular volume, mount a writable test volume (APFS, HFS+ or exFAT) and run:
+
+```bash
+Scripts/check-bulk-attributes.sh --volume /Volumes/TestVolume
+```
+
+The script creates and removes its own test folder and prints which cases ran.
+
 ## Benchmarks
 
 `WorkspaceBenchmarks` is a separate executable for macOS and Linux, not part of `swift test`. Run it in release mode and compare later runs against a saved report:
