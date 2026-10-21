@@ -2,6 +2,31 @@ import Foundation
 @testable import Workspace
 
 enum TestSupport {
+    /// Start the reader task before its deadline, and keep a delivered
+    /// element even if a delayed reader finishes after the timeout task.
+    static func nextElement<Element: Sendable>(
+        in stream: AsyncStream<Element>, timeout: Duration = .seconds(30)
+    ) async -> Element? {
+        let (ready, started) = AsyncStream<Void>.makeStream()
+        return await withTaskGroup(of: Element?.self) { group in
+            group.addTask {
+                var iterator = stream.makeAsyncIterator()
+                started.yield()
+                started.finish()
+                return await iterator.next()
+            }
+            group.addTask {
+                for await _ in ready { break }
+                try? await Task.sleep(for: timeout)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            let second = await group.next() ?? nil
+            return first ?? second
+        }
+    }
+
     static func temporaryDirectory(_ prefix: String = "WorkspaceTests") throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)

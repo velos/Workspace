@@ -344,19 +344,7 @@ enum EditOperation: CaseIterable, Sendable {
 }
 
 func nextEditEvent(
-    in stream: AsyncStream<WorkspaceEvent>, timeout: Duration = .seconds(2)
+    in stream: AsyncStream<WorkspaceEvent>, timeout: Duration = .seconds(30)
 ) async -> WorkspaceEvent? {
-    await withTaskGroup(of: WorkspaceEvent?.self) { group in
-        group.addTask {
-            var iterator = stream.makeAsyncIterator()
-            return await iterator.next()
-        }
-        group.addTask {
-            try? await Task.sleep(for: timeout)
-            return nil
-        }
-        let result = await group.next() ?? nil
-        group.cancelAll()
-        return result
-    }
+    await TestSupport.nextElement(in: stream, timeout: timeout)
 }

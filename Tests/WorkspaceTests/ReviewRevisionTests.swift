@@ -54,10 +54,17 @@ struct ReviewRevisionTests {
         let stats = await fs.base.statCount
         await fs.base.failStat(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES)))
         fs.signal(.rescan)
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while await fs.base.statCount - stats < 3, ContinuousClock.now < deadline {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+        while ContinuousClock.now < deadline {
+            let stopped = await ws.filesystemRefreshFailures == 3
+            let idle = await ws.filesystemRefreshTask == nil
+            if stopped && idle { break }
             try await Task.sleep(for: .milliseconds(10))
         }
+        // statCount increments before the refresh resumes on Workspace. Wait for
+        // the retry state machine to finish before checking that it stays stopped.
+        #expect(await ws.filesystemRefreshFailures == 3)
+        #expect(await ws.filesystemRefreshTask == nil)
         #expect(await fs.base.statCount - stats == 3)
         try await Task.sleep(for: .milliseconds(500))
         #expect(await fs.base.statCount - stats == 3)
@@ -136,12 +143,6 @@ struct ReviewRevisionTests {
     }
 
     private func first(_ stream: AsyncStream<WorkspaceEvent>) async -> WorkspaceEvent? {
-        await withTaskGroup(of: WorkspaceEvent?.self) { group in
-            group.addTask { var iterator = stream.makeAsyncIterator(); return await iterator.next() }
-            group.addTask { try? await Task.sleep(for: .seconds(2)); return nil }
-            let event = await group.next() ?? nil
-            group.cancelAll()
-            return event
-        }
+        await TestSupport.nextElement(in: stream, timeout: .seconds(30))
     }
 }

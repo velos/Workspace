@@ -173,8 +173,17 @@ struct ChangeScalingTests {
         #expect(await fs.base.reads.dropFirst(initialReads).allSatisfy { $0 == "/a" })
         #expect(await fs.base.reads.count - initialReads <= 1)
         #expect(try await workspace.history().isEmpty)
+        // Finish any coalesced refresh before checking both work and silence.
+        // The later marker passes through the same signal consumer as all 20 hints.
+        try await fs.base.writeFile(path: "/marker", data: Data(), append: false)
+        fs.signal(.paths(["/marker": .entry]))
+        guard case let .changes(marker)? = await event(in: stream) else {
+            Issue.record("missing signal delivery fence"); return
+        }
+        #expect(marker.touchedPaths == ["/marker"])
+        // The marker itself needs one additional stat.
+        #expect(await fs.base.statCount - initialStats <= 3)
         #expect(await event(in: stream, timeout: .milliseconds(150)) == nil)
-        #expect(await fs.base.statCount - initialStats <= 2)
     }
 
     @Test
@@ -241,14 +250,8 @@ struct ChangeScalingTests {
         #expect(evicted.textDiffOmissions == [.init(path: "/b", reason: .observationCacheMiss)])
     }
 
-    private func event(in stream: AsyncStream<WorkspaceEvent>, timeout: Duration = .seconds(2)) async -> WorkspaceEvent? {
-        await withTaskGroup(of: WorkspaceEvent?.self) { group in
-            group.addTask { var iterator = stream.makeAsyncIterator(); return await iterator.next() }
-            group.addTask { try? await Task.sleep(for: timeout); return nil }
-            let value = await group.next() ?? nil
-            group.cancelAll()
-            return value
-        }
+    private func event(in stream: AsyncStream<WorkspaceEvent>, timeout: Duration = .seconds(30)) async -> WorkspaceEvent? {
+        await TestSupport.nextElement(in: stream, timeout: timeout)
     }
 }
 

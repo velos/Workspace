@@ -389,19 +389,19 @@ struct LimitedCacheTests {
         let fs = LimitedFileSystem(base: base, limits: .init(maxTotalBytes: 100, maxEntryCount: 16))
         try await fs.writeFile(path: "/a", data: Data(count: 3), append: false)
         try await base.writeFile(path: "/dir/file", data: Data(count: 5), append: false)
-        try await waitForBytes(8, fs: fs)
+        try await waitForBytes(8, entries: 3, fs: fs)
         try await checkTotals(fs, base: base)
         try await base.createHardLink(path: "/alias", target: "/dir/file")
         try await base.writeFile(path: "/alias", data: Data(count: 2), append: true)
-        try await waitForBytes(17, fs: fs)
+        try await waitForBytes(17, entries: 4, fs: fs)
         try await checkTotals(fs, base: base)
         try await base.move(from: "/dir", to: "/moved")
         try await base.createSymlink(path: "/dangling", target: "/absent")
         try await base.remove(path: "/a", recursive: false)
-        try await waitForBytes(14, fs: fs)
+        try await waitForBytes(14, entries: 4, fs: fs)
         try await checkTotals(fs, base: base)
         try await base.remove(path: "/moved", recursive: true)
-        try await waitForBytes(7, fs: fs)
+        try await waitForBytes(7, entries: 2, fs: fs)
         try await checkTotals(fs, base: base)
         #if os(Linux)
         if geteuid() != 0 {
@@ -412,29 +412,45 @@ struct LimitedCacheTests {
             await #expect(throws: (any Error).self) { try await fs.revalidate() }
             try await base.setPermissions(path: "/locked", permissions: .defaultDirectory)
             try await base.writeFile(path: "/locked/file", data: Data(count: 2), append: false)
-            try await waitForBytes(9, fs: fs)
+            try await waitForBytes(9, entries: 4, fs: fs)
             try await Task.sleep(for: .milliseconds(100))
-            try await waitForBytes(9, fs: fs)
+            try await waitForBytes(9, entries: 4, fs: fs)
             // After the permission event has been consumed, a second child write must
             // have its own watch; a stale shallow invalidation cannot hide a gap.
             try await base.writeFile(path: "/locked/file", data: Data(count: 3), append: false)
-            try await waitForBytes(10, fs: fs)
+            try await waitForBytes(10, entries: 4, fs: fs)
             try await checkTotals(fs, base: base)
         }
         #endif
     }
     #endif
 
-    private func waitForBytes(_ bytes: UInt64, fs: LimitedFileSystem, limit: UInt64 = 100) async throws {
-        let deadline = ContinuousClock.now + .seconds(3)
+    private func waitForBytes(_ bytes: UInt64, entries: Int? = nil, fs: LimitedFileSystem, limit: UInt64 = 100) async throws {
+        let deadline = ContinuousClock.now + .seconds(30)
         while true {
             do {
                 try await fs.createFile(path: "/byte-probe", data: Data(count: Int(limit + 1)))
                 Issue.record("quota probe unexpectedly succeeded")
                 return
             } catch let error as FileSystemLimitError {
-                if error == .totalBytes(attempted: bytes + limit + 1, limit: limit) { return }
-                if ContinuousClock.now >= deadline { Issue.record("unexpected usage: \(error), expected \(bytes)"); return }
+                if error == .totalBytes(attempted: bytes + limit + 1, limit: limit) {
+                    guard let entries else { return }
+                    // File removal and directory retirement can arrive separately.
+                    // Correct bytes alone do not prove that all entries converged.
+                    let deep = WorkspacePath(normalizing: (0..<17).map { "entry-probe-\($0)" }.joined(separator: "/"))
+                    do {
+                        try await fs.createDirectory(path: deep, recursive: true)
+                        Issue.record("entry quota probe unexpectedly succeeded")
+                        return
+                    } catch let entryError as FileSystemLimitError {
+                        if entryError == .entryCount(attempted: entries + 17, limit: 16) { return }
+                        if ContinuousClock.now >= deadline {
+                            Issue.record("unexpected entry usage: \(entryError), expected \(entries)"); return
+                        }
+                    }
+                } else if ContinuousClock.now >= deadline {
+                    Issue.record("unexpected usage: \(error), expected \(bytes)"); return
+                }
             }
             await Task.yield()
         }

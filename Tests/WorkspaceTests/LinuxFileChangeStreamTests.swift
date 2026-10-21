@@ -76,6 +76,7 @@ struct LinuxFileChangeStreamTests {
         #expect(await signals.waitForPath("/child", after: beforeRemoval))
         // Include any queued IN_IGNORED notification after watch retirement.
         try await Task.sleep(for: .milliseconds(150))
+        #expect(try await signals.fence(on: fs))
         #expect(await signals.rescans == 0)
     }
 
@@ -98,6 +99,7 @@ struct LinuxFileChangeStreamTests {
         try await fs.writeFile(path: userPath, data: Data("user file".utf8), append: false)
         #expect(await signals.waitForPath(userPath, after: 0))
         try await Task.sleep(for: .milliseconds(150))
+        #expect(try await signals.fence(on: fs))
         #expect(await signals.rescans == 0)
         #expect(await signals.scopes["/x"] == .entry)
         #expect(await signals.scopes["/d"] == .shallow)
@@ -122,6 +124,7 @@ struct LinuxFileChangeStreamTests {
         if !moveOut { #expect(await signals.waitForPath("/e", after: 0)) }
         // IN_IGNORED from our rm_watch arrives in a later batch.
         try await Task.sleep(for: .milliseconds(400))
+        #expect(try await signals.fence(on: fs))
         #expect(await signals.rescans == 0)
         #expect(await signals.scopes["/d"] == .recursive)
         if !moveOut {
@@ -150,25 +153,43 @@ struct LinuxFileChangeStreamTests {
     }
 
     @Test
-    func `removing thousands of watched directories promptly emits an invalidation`() async throws {
-        let root = try TestSupport.temporaryDirectory("BulkDirectoryRemoval")
-        defer { TestSupport.remove(root) }
-        let bulk = root.appendingPathComponent("bulk", isDirectory: true)
-        try FileManager.default.createDirectory(at: bulk, withIntermediateDirectories: true)
-        for index in 0..<6000 {
-            try FileManager.default.createDirectory(
-                atPath: bulk.path + "/d\(index)", withIntermediateDirectories: false
-            )
+    func `bulk watch retirement has bounded cost relative to registration`() async throws {
+        await #expect(processExitsWith: .success) {
+            Thread.detachNewThread {
+                Thread.sleep(forTimeInterval: 60)
+                exit(124)
+            }
+            // A child isolates process CPU time from other tests; CPU time excludes
+            // cgroup throttling and time waiting for a worker to deliver the signal.
+            // Compare against linear setup on the same filesystem in the same run.
+            let root = try TestSupport.temporaryDirectory("BulkDirectoryRemoval")
+            defer { TestSupport.remove(root) }
+            let bulk = root.appendingPathComponent("bulk", isDirectory: true)
+            let start = processCPUTime()
+            try FileManager.default.createDirectory(at: bulk, withIntermediateDirectories: true)
+            for index in 0..<6000 {
+                try FileManager.default.createDirectory(
+                    atPath: bulk.path + "/d\(index)", withIntermediateDirectories: false
+                )
+            }
+            let fs = try LocalFileSystem(root: root)
+            let stream = try await fs.changeSignals()
+            let signals = LinuxScopedSignals()
+            let consumer = Task { for await signal in stream { await signals.record(signal) } }
+            defer { consumer.cancel() }
+            let registered = processCPUTime()
+            try FileManager.default.removeItem(at: bulk)
+            // A marker after deletion proves the native queue drained the retirement
+            // work, rather than merely delivering the first event during removal.
+            #expect(try await signals.fence(on: fs))
+            // Overflow may collapse the removal into a rescan; either must be reported.
+            let rescans = await signals.rescans
+            let reportedBulk = await signals.lastSeen["/bulk"] != nil
+            #expect(rescans > 0 || reportedBulk)
+            let retirement = processCPUTime() - registered
+            let registration = registered - start
+            #expect(retirement < max(0.05, registration) * 4)
         }
-        let stream = try DirectoryChangeStream.observe(root, recursive: true)
-        let counter = LinuxInvalidationCounter()
-        let consumer = Task { for await _ in stream { await counter.increment() } }
-        defer { consumer.cancel() }
-        let clock = ContinuousClock()
-        let start = clock.now
-        try FileManager.default.removeItem(at: bulk)
-        #expect(await counter.waitForChange(after: 0))
-        #expect(start.duration(to: clock.now) < .seconds(2))
     }
 
     @Test(.enabled(if: geteuid() != 0, "requires unprivileged filesystem permissions"))
@@ -275,13 +296,29 @@ private actor LinuxScopedSignals {
     var rescans = 0
     var scopes: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
     var lastSeen: [WorkspacePath: Int] = [:]
+    func fence(on fs: LocalFileSystem) async throws -> Bool {
+        // Native records preceding this write must be drained before its signal.
+        let marker = WorkspacePath(normalizing: "/fence-\(UUID().uuidString)")
+        let deadline = ContinuousClock.now + .seconds(30)
+        repeat {
+            let previous = count
+            try await fs.writeFile(path: marker, data: Data(), append: false)
+            while count == previous, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            if lastSeen[marker] != nil { return true }
+            // A deletion batch can legitimately collapse paths into .rescan.
+            // Reissue the marker after that batch until a scoped receipt arrives.
+        } while ContinuousClock.now < deadline
+        return false
+    }
     func waitForRescan(after previous: Int = 0) async -> Bool {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
         while ContinuousClock.now < deadline {
             if rescans > previous { return true }
             try? await Task.sleep(for: .milliseconds(10))
         }
-        return false
+        return rescans > previous
     }
     func record(_ signal: FileSystemChangeSignal) {
         count += 1
@@ -295,12 +332,12 @@ private actor LinuxScopedSignals {
         }
     }
     func waitForPath(_ path: WorkspacePath, after previous: Int) async -> Bool {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
         while ContinuousClock.now < deadline {
             if (lastSeen[path] ?? 0) > previous { return true }
             try? await Task.sleep(for: .milliseconds(10))
         }
-        return false
+        return (lastSeen[path] ?? 0) > previous
     }
 }
 
@@ -310,7 +347,7 @@ private actor LinuxInvalidationCounter {
 
     func waitForChange(after previous: Int) async -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(2))
+        let deadline = clock.now.advanced(by: .seconds(30))
         while clock.now < deadline {
             if value > previous { return true }
             try? await Task.sleep(for: .milliseconds(10))
@@ -326,5 +363,11 @@ private actor LinuxInvalidationCounter {
         }
         return value
     }
+}
+
+private func processCPUTime() -> Double {
+    var time = timespec()
+    precondition(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time) == 0)
+    return Double(time.tv_sec) + Double(time.tv_nsec) / 1_000_000_000
 }
 #endif

@@ -60,14 +60,19 @@ struct FileSystemAPITests {
 
     @Test
     func `authorization supports temporary approvals rules and bounded audit`() async throws {
-        let authorizer = PermissionAuthorizer(auditCapacity: 2) { _ in .allowFor(.milliseconds(2)) }
+        let authorizer = PermissionAuthorizer(auditCapacity: 2) { _ in .allowFor(.seconds(60)) }
         let request = PermissionRequest(operation: .readFile, path: "/a")
         _ = await authorizer.authorize(request)
         _ = await authorizer.authorize(request)
         #expect(await authorizer.auditLog().map(\.source) == [.handler, .temporaryCache])
-        try await Task.sleep(for: .milliseconds(5))
-        _ = await authorizer.authorize(request)
-        #expect(await authorizer.auditLog().count == 2)
+        _ = await authorizer.authorize(.init(operation: .readFile, path: "/b"))
+        #expect(await authorizer.auditLog().map(\.source) == [.temporaryCache, .handler])
+
+        // Exercise expiry without requiring two actor calls to fit inside 2 ms.
+        let expired = PermissionAuthorizer { _ in .allowFor(.zero) }
+        _ = await expired.authorize(request)
+        _ = await expired.authorize(request)
+        #expect(await expired.auditLog().map(\.source) == [.handler, .handler])
 
         let rules = RuleBasedPermissionAuthorizer(
             rules: [.init(operations: [.readFile], pathPrefix: "/src", effect: .allow)]

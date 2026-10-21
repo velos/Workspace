@@ -24,7 +24,11 @@ struct PersistenceTests {
     @Test
     func `checkpoint cursors exclude mutations appended after capture starts`() async throws {
         await #expect(processExitsWith: .success) {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 10) { exit(124) }
+            // Keep the deadlock bound independent of Dispatch worker availability.
+            Thread.detachNewThread {
+                Thread.sleep(forTimeInterval: 60)
+                exit(124)
+            }
             let root = try TestSupport.temporaryDirectory("CaptureCursor")
             defer { TestSupport.remove(root) }
             for persistence in [Workspace.Persistence.memory, .directory(root)] {
@@ -392,7 +396,11 @@ struct PersistenceTests {
         await #expect(processExitsWith: .success) {
             // An unstructured timeout cannot recover a blocked actor. Bound the child process
             // instead, so the original synchronous-flock deadlock fails without hanging the suite.
-            DispatchQueue.global().asyncAfter(deadline: .now() + 10) { exit(124) }
+            // Keep the deadlock bound independent of Dispatch worker availability.
+            Thread.detachNewThread {
+                Thread.sleep(forTimeInterval: 60)
+                exit(124)
+            }
             let filesRoot = try TestSupport.temporaryDirectory("ConcurrentCaptureFiles")
             let historyRoot = try TestSupport.temporaryDirectory("ConcurrentCaptureHistory")
             defer { TestSupport.remove(filesRoot); TestSupport.remove(historyRoot) }
@@ -435,21 +443,9 @@ struct PersistenceTests {
 
 private func nextPersistenceEvent(
     in stream: AsyncStream<WorkspaceEvent>,
-    timeout: Duration = .seconds(2)
+    timeout: Duration = .seconds(30)
 ) async -> WorkspaceEvent? {
-    await withTaskGroup(of: WorkspaceEvent?.self) { group in
-        group.addTask {
-            var iterator = stream.makeAsyncIterator()
-            return await iterator.next()
-        }
-        group.addTask {
-            try? await Task.sleep(for: timeout)
-            return nil
-        }
-        let result = await group.next() ?? nil
-        group.cancelAll()
-        return result
-    }
+    await TestSupport.nextElement(in: stream, timeout: timeout)
 }
 
 private actor ReadCountingFileSystem: FileSystem {

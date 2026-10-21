@@ -200,6 +200,11 @@ struct EditPathTests {
         // Exercise the refresh directly as well as any native invalidation. This
         // verifies baseline folding without depending on OS event delivery timing.
         await workspace.refreshFilesystemEvents()
+        try await fs.writeFile(path: "/marker", data: Data(), append: false)
+        guard case let .changes(marker)? = await nextEditEvent(in: events) else {
+            Issue.record("missing native delivery fence"); return
+        }
+        #expect(marker.touchedPaths == ["/marker"])
         #expect(await nextEditEvent(in: events, timeout: .milliseconds(100)) == nil)
     }
 }

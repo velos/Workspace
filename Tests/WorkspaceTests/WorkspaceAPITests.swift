@@ -43,6 +43,13 @@ struct WorkspaceAPITests {
         let expected = try await workspace.writeText("/note", "once")
 
         #expect(await nextEvent(in: stream) == .changes(expected))
+        // Fence native delivery with a later external write. A quiet timer alone
+        // could pass while the native refresh was still waiting for a worker.
+        try await workspace.fileSystem.writeFile(path: "/marker", data: Data(), append: false)
+        guard case let .changes(marker)? = await nextEvent(in: stream) else {
+            Issue.record("missing native delivery fence"); return
+        }
+        #expect(marker.touchedPaths == ["/marker"])
         #expect(await nextEvent(in: stream, timeout: .milliseconds(200)) == nil)
     }
 
@@ -179,19 +186,7 @@ struct WorkspaceAPITests {
 
 private func nextEvent(
     in stream: AsyncStream<WorkspaceEvent>,
-    timeout: Duration = .seconds(2)
+    timeout: Duration = .seconds(30)
 ) async -> WorkspaceEvent? {
-    await withTaskGroup(of: WorkspaceEvent?.self) { group in
-        group.addTask {
-            var iterator = stream.makeAsyncIterator()
-            return await iterator.next()
-        }
-        group.addTask {
-            try? await Task.sleep(for: timeout)
-            return nil
-        }
-        let result = await group.next() ?? nil
-        group.cancelAll()
-        return result
-    }
+    await TestSupport.nextElement(in: stream, timeout: timeout)
 }

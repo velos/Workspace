@@ -224,10 +224,11 @@ struct ChangeSoundnessTests {
                 }
                 return nil
             }
-            group.addTask { try? await Task.sleep(for: .seconds(2)); return nil }
+            group.addTask { try? await Task.sleep(for: .seconds(30)); return nil }
             let value = await group.next() ?? nil
             group.cancelAll()
-            return value
+            let delivered = await group.next() ?? nil
+            return value ?? delivered
         }
         guard case let .paths(paths)? = signal else {
             Issue.record("expected scoped FSEvents notification, got \(String(describing: signal))")
@@ -246,6 +247,7 @@ struct ChangeSoundnessTests {
         // No settling delay: the root's own creation can arrive with the file event.
         let stream = try await fs.changeSignals()
         try await fs.writeFile(path: "/x", data: Data("changed".utf8), append: false)
+        let (received, receipt) = AsyncStream<Bool>.makeStream()
         let collector = Task {
             var combined: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
             var rescanned = false
@@ -254,11 +256,13 @@ struct ChangeSoundnessTests {
                 case .rescan: rescanned = true
                 case let .paths(paths): combined.merge(paths, uniquingKeysWith: max)
                 }
+                if combined["/x"] != nil { receipt.yield(true) }
             }
             return (combined, rescanned)
         }
         defer { collector.cancel() }
-        // Unlike the first-event probe above, include delayed batches after /x.
+        // Start the short quiet window only after delivery, not after the write.
+        #expect(await TestSupport.nextElement(in: received) == true)
         try await Task.sleep(for: .seconds(2))
         collector.cancel()
         let (paths, rescanned) = await collector.value
@@ -269,14 +273,8 @@ struct ChangeSoundnessTests {
     }
     #endif
 
-    private func first(_ stream: AsyncStream<WorkspaceEvent>, timeout: Duration = .seconds(5)) async -> WorkspaceEvent? {
-        await withTaskGroup(of: WorkspaceEvent?.self) { group in
-            group.addTask { var it = stream.makeAsyncIterator(); return await it.next() }
-            group.addTask { try? await Task.sleep(for: timeout); return nil }
-            let v = await group.next() ?? nil
-            group.cancelAll()
-            return v
-        }
+    private func first(_ stream: AsyncStream<WorkspaceEvent>, timeout: Duration = .seconds(30)) async -> WorkspaceEvent? {
+        await TestSupport.nextElement(in: stream, timeout: timeout)
     }
 }
 
