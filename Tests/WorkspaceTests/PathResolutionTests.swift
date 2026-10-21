@@ -195,9 +195,9 @@ struct PathResolutionTests {
         await #expect(throws: (any Error).self) {
             _ = try await fs.stat(path: "/alias/file")
         }
-        await #expect(throws: (any Error).self) {
-            try await fs.createFile(path: "/alias/new", data: Data())
-        }
+        try await fs.createFile(path: "/alias/new", data: Data())
+        #expect(try await fs.listDirectory(path: "/dir").map(\.name) == ["new"])
+        #expect(try await base.readFile(path: "/dir/file") == Data("lower".utf8))
     }
 
     @Test

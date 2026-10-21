@@ -943,6 +943,11 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         let config = try requireConfiguration()
         let source = try resolve(sourcePath, followFinal: false, configuration: config)
+        let potentialDestination = try resolve(destinationPath, followFinal: false,
+            allowMissingAncestors: true, creating: true, configuration: config).path
+        guard potentialDestination == source.path || !potentialDestination.isWithin(source.path) else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
+        }
         let destination = try resolve(destinationPath, followFinal: false, createParents: true, creating: true, configuration: config)
         let renameError = exclusiveRename(source.parent.value, source.name, destination.parent.value, destination.name)
         if renameError == 0 {
@@ -1044,11 +1049,13 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
     public func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws {
         let config = try requireConfiguration()
         let source = try resolve(sourcePath, followFinal: false, configuration: config)
-        let destination = try resolve(destinationPath, followFinal: false, createParents: true, creating: true, configuration: config)
-        guard !destination.path.isWithin(source.path)
+        let potentialDestination = try resolve(destinationPath, followFinal: false,
+            allowMissingAncestors: true, creating: true, configuration: config).path
+        guard !potentialDestination.isWithin(source.path)
         else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
         }
+        let destination = try resolve(destinationPath, followFinal: false, createParents: true, creating: true, configuration: config)
         try copyEntry(source, to: destination, recursive: recursive)
     }
 

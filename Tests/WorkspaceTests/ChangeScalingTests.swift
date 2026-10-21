@@ -58,6 +58,24 @@ struct ChangeScalingTests {
         #expect(await counted.listings.isEmpty)
     }
 
+    @Test(arguments: ["../missing.txt", "./.././missing.txt", "../shared/.env"], [false, true])
+    func `leading dotdot dangling targets do not read unrelated files`(target: String, localBackend: Bool) async throws {
+        let root = try TestSupport.temporaryDirectory("LeadingDotdotJournal")
+        defer { TestSupport.remove(root) }
+        let base: any FileSystem = localBackend ? try LocalFileSystem(root: root) : InMemoryFileSystem()
+        try await base.createDirectory(path: "/a", recursive: true)
+        try await base.writeFile(path: "/other/file", data: Data("unrelated".utf8), append: false)
+        try await base.createSymlink(path: "/a/link", target: target)
+        let reads = JournalReadCounter(base: base)
+        let workspace = Workspace(fileSystem: reads)
+        let changes = try await workspace.writeText("/a/link", "new")
+        let destination = try WorkspacePath(target, relativeTo: "/a")
+        #expect(changes.touchedPaths.contains(destination))
+        #expect(try await base.readFile(path: destination) == Data("new".utf8))
+        #expect(await reads.paths.contains(destination))
+        #expect(!(await reads.paths.contains("/other/file")))
+    }
+
     @Test
     func `preview excludes untouched symlinks and reads only affected contents`() async throws {
         let root = try TestSupport.temporaryDirectory()
@@ -260,4 +278,34 @@ final class SignallingFileSystem: FileSystemChangeSource, ExactTimestampFileSyst
     func remove(path: WorkspacePath, recursive: Bool) async throws { try await base.remove(path: path, recursive: recursive) }
     func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws { try await base.move(from: sourcePath, to: destinationPath) }
     func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws { try await base.copy(from: sourcePath, to: destinationPath, recursive: recursive) }
+}
+
+// Forward real-path resolution so this counter exercises the journal's canonical-path route.
+private actor JournalReadCounter: FileSystem {
+    let base: any FileSystem
+    var paths: Set<WorkspacePath> = []
+    init(base: any FileSystem) { self.base = base }
+    func stat(path: WorkspacePath) async throws -> FileInfo { try await base.stat(path: path) }
+    func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] { try await base.listDirectory(path: path) }
+    func readFile(path: WorkspacePath) async throws -> Data {
+        paths.insert(path)
+        return try await base.readFile(path: path)
+    }
+    func exists(path: WorkspacePath) async -> Bool { await base.exists(path: path) }
+    func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath] {
+        try await base.glob(pattern: pattern, currentDirectory: currentDirectory)
+    }
+    func writeFile(path: WorkspacePath, data: Data, append: Bool) async throws {
+        try await base.writeFile(path: path, data: data, append: append)
+    }
+    func createDirectory(path: WorkspacePath, recursive: Bool) async throws { try await base.createDirectory(path: path, recursive: recursive) }
+    func remove(path: WorkspacePath, recursive: Bool) async throws { try await base.remove(path: path, recursive: recursive) }
+    func move(from: WorkspacePath, to: WorkspacePath) async throws { try await base.move(from: from, to: to) }
+    func copy(from: WorkspacePath, to: WorkspacePath, recursive: Bool) async throws { try await base.copy(from: from, to: to, recursive: recursive) }
+    func createSymlink(path: WorkspacePath, target: String) async throws { try await base.createSymlink(path: path, target: target) }
+    func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws { try await base.createHardLink(path: path, target: target) }
+    func readSymlink(path: WorkspacePath) async throws -> String { try await base.readSymlink(path: path) }
+    func setPermissions(path: WorkspacePath, permissions: POSIXPermissions) async throws { try await base.setPermissions(path: path, permissions: permissions) }
+    func capabilities() async -> FileSystemFeatures { await base.capabilities() }
+    func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath { try await base.resolveRealPath(path: path) }
 }

@@ -82,14 +82,20 @@ extension Workspace {
         var roots: [WorkspacePath] = []
         let resolvesPaths = await filesystem.capabilities().contains(.realPathResolution)
         for path in paths {
-            let entryPath = try await canonicalEntryPath(path, resolvesPaths: resolvesPaths)
+            let entryPath: WorkspacePath
+            if resolvesPaths && !path.isRoot {
+                let parent = try await resolvedCapturePath(path.dirname, additionalRoots: &roots)
+                entryPath = parent.appending(path.basename)
+            } else {
+                entryPath = path
+            }
             roots.append(try await captureRoot(for: entryPath))
             // Some backends replace the leaf link, while others follow it. Capture
             // both the canonical entry and its target, but never lexical aliases.
             switch edit {
             case .writeText, .appendText, .writeData, .appendData, .setPermissions, .replace:
                 if resolvesPaths {
-                    let target = try await resolvedCapturePath(entryPath)
+                    let target = try await resolvedCapturePath(entryPath, additionalRoots: &roots)
                     roots.append(try await captureRoot(for: target))
                 }
             default:
@@ -101,34 +107,44 @@ extension Workspace {
 
     func canonicalEntryPath(_ path: WorkspacePath, resolvesPaths: Bool) async throws -> WorkspacePath {
         guard resolvesPaths, !path.isRoot else { return path }
-        let parent = try await resolvedCapturePath(path.dirname)
+        // Archive restore rebases every write to this destination, so it never traverses the original link.
+        var additionalRoots: [WorkspacePath] = []
+        let parent = try await resolvedCapturePath(path.dirname, additionalRoots: &additionalRoots)
         return parent.appending(path.basename)
     }
 
     // Resolve existing ancestors, preserving missing suffixes for creation edits.
     // A dangling leaf still has a target even when resolveRealPath requires that
     // target to exist. Only absence permits fallback; authorization errors escape.
-    private func resolvedCapturePath(_ path: WorkspacePath, linkDepth: Int = 0) async throws -> WorkspacePath {
+    private func resolvedCapturePath(_ path: WorkspacePath, additionalRoots: inout [WorkspacePath], linkDepth: Int = 0) async throws -> WorkspacePath {
         guard linkDepth < 64 else {
             throw WorkspaceError.invalidPath("symbolic link cycle at \(path)")
         }
         if path.isRoot { return try await filesystem.resolveRealPath(path: path) }
-        let parent = try await resolvedCapturePath(path.dirname, linkDepth: linkDepth)
+        let parent = try await resolvedCapturePath(path.dirname, additionalRoots: &additionalRoots, linkDepth: linkDepth)
         let entry = parent.appending(path.basename)
         guard let info = try await Snapshot.infoIfPresent(at: entry, on: filesystem) else { return entry }
         guard info.kind == .symlink else { return entry }
         do {
             let resolved = try await filesystem.resolveRealPath(path: entry)
             if resolved != entry {
-                return try await resolvedCapturePath(resolved, linkDepth: linkDepth + 1)
+                return try await resolvedCapturePath(resolved, additionalRoots: &additionalRoots, linkDepth: linkDepth + 1)
             }
         } catch {
             guard Snapshot.isMissingEntry(error) else { throw error }
         }
         let target = try await filesystem.readSymlink(path: entry)
+        let components = WorkspacePath.splitComponents(target).filter { $0 != "." }
+        if components.drop(while: { $0 == ".." }).contains("..") {
+            // Leading '..' is exact from the physically resolved parent. A later
+            // '..' may leave a newly created directory or a symlink, outside the final
+            // canonical destination. Capture the tree conservatively in this rare
+            // case; the backend owns absolute-target namespaces and traversal.
+            additionalRoots.append(.root)
+        }
         // Absolute fallback targets are interpreted as workspace paths.
         let targetPath = WorkspacePath(normalizing: target, relativeTo: entry.dirname)
-        return try await resolvedCapturePath(targetPath, linkDepth: linkDepth + 1)
+        return try await resolvedCapturePath(targetPath, additionalRoots: &additionalRoots, linkDepth: linkDepth + 1)
     }
 
     func captureRoot(for path: WorkspacePath) async throws -> WorkspacePath {

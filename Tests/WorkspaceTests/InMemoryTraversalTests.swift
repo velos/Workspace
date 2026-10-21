@@ -7,6 +7,7 @@ struct InMemoryTraversalTests {
     func nativeWalkMatchesPerPathCaptureAndMetadata(skipUnreadable: Bool) async throws {
         let fs = InMemoryFileSystem()
         try await fs.createDirectory(path: "/a/empty", recursive: true)
+        try await fs.writeFile(path: "/implicit/parents/file", data: Data([1, 2]), append: false)
         for path: WorkspacePath in ["/a/file", "/a.txt", "/a0", "/é", "/e\u{301}"] {
             try await fs.writeFile(path: path, data: Data([0, 1, 255]), append: false)
         }
@@ -52,7 +53,7 @@ struct InMemoryTraversalTests {
             #expect(nativeBytes == fallbackBytes)
             #expect(nativeLinks == fallbackLinks)
             if path.isRoot {
-                #expect(nativeInfos.filter { $0.kind == .file }.map(\.path) == ["/a.txt", "/a/file", "/a0", "/e\u{301}", "/hard", "/é"])
+                #expect(nativeInfos.filter { $0.kind == .file }.map(\.path) == ["/a.txt", "/a/file", "/a0", "/e\u{301}", "/hard", "/implicit/parents/file", "/é"])
                 #expect(nativeInfos.first { $0.path == "/hard" }?.linkCount == 2)
                 #expect(nativeInfos.first { $0.path == "/hard" }?.identity == nativeInfos.first { $0.path == "/a/file" }?.identity)
             }

@@ -58,12 +58,11 @@ targets: [
 import Workspace
 
 let workspace = Workspace()
-try await workspace.createDirectory("/notes")
 try await workspace.writeText("/notes/todo.txt", "ship it\n")
 let text = try await workspace.readText("/notes/todo.txt")
 ```
 
-`InMemoryFileSystem` requires parent directories to exist before a write; `LocalFileSystem` creates them.
+`InMemoryFileSystem` and `LocalFileSystem` create missing parent directories for writes, exclusive file creation, copy and move destinations, and link creation. Created directories have mode `0755` (subject to the host umask on disk).
 
 To work on a directory on disk and keep history across launches:
 
@@ -338,6 +337,8 @@ let approvals = PermissionAuthorizer { request in
 }
 ```
 
+`WorkspaceToolAdapter` does not forward deny messages or other policy details to the model. A `PermissionRequest` can carry resolved symlink targets, so those details are deliberately replaced with a generic permission-denied message.
+
 ### Limits
 
 - `maxTotalBytes` caps the sum of regular-file sizes, counted per path, so each hard link counts.
@@ -381,7 +382,13 @@ Each definition's `inputSchema` is a `JSONValue` holding a plain JSON Schema obj
 
 `workspace_apply` finishes the whole edit before trimming its response, so never repeat an apply to recover detail; read the files, or diff from a checkpoint taken first. Diff between checkpoints for stable paging while the tree changes.
 
-`call` throws `WorkspaceToolError` for an unknown tool or invalid arguments. Workspace and filesystem errors, such as a missing file or a denial, propagate unchanged. Turn both into tool-error results for the model.
+`call` maps workspace and filesystem failures to `WorkspaceToolError`, a `Codable` value with `code`, optional `path`, and a short `message`. Encode the error as your provider's tool-error result. Codes include `not_found`, `not_a_directory`, `is_a_directory`, `already_exists`, `permission_denied`, `operation_not_permitted`, `invalid_path`, `illegal_byte_sequence`, `limit_exceeded`, `conflict`, `invalid_arguments`, and `unknown_tool`. `checkpoint_not_found` covers missing checkpoints or revision data; `not_found` always means a filesystem entry. Other failures have specific codes such as `symlink_loop`, `directory_not_empty`, `unsupported`, `storage_corrupted`, `rollback_failed`, or the fallback `io_error`. Cancellation remains `CancellationError`.
+
+An error's `path` is the requested workspace path or scope, using only caller-requested spellings. It is not necessarily the entry that failed: a search root can be reported for a denial deeper within it. Resolved symlink targets, unrequested stored spellings, host paths and underlying error details are omitted. Policy deny messages and other policy details are deliberately dropped because a `PermissionRequest` can carry resolved symlink targets. If the failing path cannot be identified safely, including ambiguous batch or copy/move failures, `path` is absent. Checkpoint, storage, mutation-recording, rollback, transaction and limit errors also omit `path`. For example, reading `/missing.txt` throws an error that encodes as:
+
+```json
+{"code":"not_found","path":"/missing.txt","message":"The requested file or directory was not found."}
+```
 
 ## Guarantees and limits
 

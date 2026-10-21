@@ -62,7 +62,7 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
     package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
         if let previewSource { return await previewSource.previewBehavior(at: path) }
         return .init(preservesOverwritePermissions: true,
-                     followsDirectorySymlinks: true, followsPermissionSymlinks: true)
+                     followsDirectorySymlinks: true, followsPermissionSymlinks: true, createsWriteParents: true)
     }
 
     /// Creates and configures an overlay for `rootDirectory`.
@@ -247,8 +247,7 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
             throw posixError(EISDIR)
         }
         let semantics = await previewSemantics(at: path)
-        if semantics.createsWriteParents { try await createDirectory(path: path.dirname, recursive: true) }
-        let target = try await resolveMergedPath(path)
+        let target = try await resolveMergedPath(path, allowMissingAncestors: semantics.createsWriteParents, createParents: semantics.createsWriteParents)
         if let info = await upperEntry(target) {
             try await upper.writeFile(path: target, data: data, append: append)
             if semantics.preservesOverwritePermissions { try await upper.setPermissions(path: target, permissions: info.permissions) }
@@ -258,7 +257,7 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
             guard info.kind != .directory else {
                 throw posixError(EISDIR)
             }
-            try await ensureUpperDirectories(for: target)
+            try await ensureUpperDirectories(for: target, createMissing: semantics.createsWriteParents)
             let contents: Data
             if append {
                 contents = try await lower.readFile(path: target) + data
@@ -269,17 +268,18 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
             try await upper.setPermissions(path: target, permissions: !semantics.preservesOverwritePermissions && !append ? .defaultFile : info.permissions)
             return
         }
-        try await ensureUpperDirectories(for: target)
+        try await ensureUpperDirectories(for: target, createMissing: semantics.createsWriteParents)
         try await upper.writeFile(path: target, data: data, append: false)
     }
 
     /// See ``FileSystem/createFile(path:data:)``.
     public func createFile(path: WorkspacePath, data: Data) async throws {
-        let path = try await resolveMergedPath(path, followFinal: false)
+        let createsParents = await previewSemantics(at: path).createsWriteParents
+        let path = try await resolveMergedPath(path, followFinal: false, allowMissingAncestors: createsParents, createParents: createsParents)
         guard await mergedEntry(path) == nil else {
             throw posixError(EEXIST)
         }
-        try await ensureUpperDirectories(for: path)
+        try await ensureUpperDirectories(for: path, createMissing: createsParents)
         try await upper.createFile(path: path, data: data)
     }
 
@@ -353,22 +353,25 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
     /// See ``FileSystem/move(from:to:)``.
     public func move(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath) async throws {
         let sourcePath = try await resolveMergedPath(sourcePath, followFinal: false)
-        let destinationPath = try await resolveMergedPath(destinationPath, followFinal: false)
-        if sourcePath == destinationPath {
+        let createsParents = await previewSemantics(at: destinationPath).createsWriteParents
+        let potentialDestination = try await resolveMergedPath(destinationPath, followFinal: false, allowMissingAncestors: createsParents)
+        if sourcePath == potentialDestination {
             return
         }
         guard let sourceInfo = await mergedEntry(sourcePath) else {
             throw posixError(ENOENT)
         }
-        if sourceInfo.kind == .directory, destinationPath.isWithin(sourcePath) {
+        if sourceInfo.kind == .directory, potentialDestination.isWithin(sourcePath) {
             throw posixError(EINVAL)
         }
+        let destinationPath = try await resolveMergedPath(destinationPath, followFinal: false,
+            allowMissingAncestors: createsParents, createParents: createsParents)
         guard await mergedEntry(destinationPath) == nil else {
             throw posixError(EEXIST)
         }
 
         try await materializeTree(sourcePath)
-        try await ensureUpperDirectories(for: destinationPath)
+        try await ensureUpperDirectories(for: destinationPath, createMissing: createsParents)
         try await upper.move(from: sourcePath, to: destinationPath)
         if await lowerVisibleEntry(sourcePath) != nil {
             cuts = cuts.filter { !$0.isWithin(sourcePath) }
@@ -381,36 +384,41 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
         async throws
     {
         let sourcePath = try await resolveMergedPath(sourcePath, followFinal: false)
-        let destinationPath = try await resolveMergedPath(destinationPath, followFinal: false)
+        let createsParents = await previewSemantics(at: destinationPath).createsWriteParents
+        let potentialDestination = try await resolveMergedPath(destinationPath, followFinal: false, allowMissingAncestors: createsParents)
+        guard !potentialDestination.isWithin(sourcePath) else { throw posixError(EINVAL) }
         guard let sourceInfo = await mergedEntry(sourcePath) else {
             throw posixError(ENOENT)
         }
         if sourceInfo.kind == .directory, !recursive {
             throw posixError(EISDIR)
         }
+        let destinationPath = try await resolveMergedPath(destinationPath, followFinal: false,
+            allowMissingAncestors: createsParents, createParents: createsParents)
         guard await mergedEntry(destinationPath) == nil else {
             throw posixError(EEXIST)
         }
 
         try await materializeTree(sourcePath)
-        try await ensureUpperDirectories(for: destinationPath)
+        try await ensureUpperDirectories(for: destinationPath, createMissing: createsParents)
         try await upper.copy(from: sourcePath, to: destinationPath, recursive: recursive)
     }
 
     /// See ``FileSystem/createSymlink(path:target:)``.
     public func createSymlink(path: WorkspacePath, target: String) async throws {
-        let path = try await resolveMergedPath(path, followFinal: false)
         _ = try WorkspacePath(validating: target, relativeTo: path.dirname)
+        let createsParents = await previewSemantics(at: path).createsWriteParents
+        let path = try await resolveMergedPath(path, followFinal: false, allowMissingAncestors: createsParents, createParents: createsParents)
         guard await mergedEntry(path) == nil else {
             throw posixError(EEXIST)
         }
-        try await ensureUpperDirectories(for: path)
+        try await ensureUpperDirectories(for: path, createMissing: createsParents)
         try await upper.createSymlink(path: path, target: target)
     }
 
     /// See ``FileSystem/createHardLink(path:target:)``.
     public func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws {
-        let path = try await resolveMergedPath(path, followFinal: false)
+        let createsParents = await previewSemantics(at: path).createsWriteParents
         let target = try await resolveMergedPath(target)
         guard let targetInfo = await mergedEntry(target) else {
             throw posixError(ENOENT)
@@ -418,6 +426,7 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
         guard targetInfo.kind != .directory else {
             throw posixError(EPERM)
         }
+        let path = try await resolveMergedPath(path, followFinal: false, allowMissingAncestors: createsParents, createParents: createsParents)
         guard await mergedEntry(path) == nil else {
             throw posixError(EEXIST)
         }
@@ -425,7 +434,7 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
         if await upperEntry(target) == nil {
             try await copyUpLeaf(target, info: targetInfo)
         }
-        try await ensureUpperDirectories(for: path)
+        try await ensureUpperDirectories(for: path, createMissing: createsParents)
         try await upper.createHardLink(path: path, target: target)
     }
 
@@ -477,7 +486,7 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
     /// Resolve each component in the merged namespace before consulting a backing filesystem.
     /// A lower-layer ancestor link must never let that backend bypass cuts or upper entries.
     private func resolveMergedPath(
-        _ path: WorkspacePath, followFinal: Bool = true, allowMissingAncestors: Bool = false
+        _ path: WorkspacePath, followFinal: Bool = true, allowMissingAncestors: Bool = false, createParents: Bool = false
     ) async throws -> WorkspacePath {
         var current = WorkspacePath.root
         var pending = path.components
@@ -488,12 +497,19 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
                 continue
             }
             if component == ".." {
+                guard !current.isRoot else { throw WorkspaceError.invalidPath(path.string) }
                 current = current.dirname
                 continue
             }
             let next = current.appending(component)
             let final = pending.isEmpty
             guard let info = await mergedEntry(next) else {
+                if !final && createParents {
+                    try await ensureUpperDirectories(for: next)
+                    try await upper.createDirectory(path: next, recursive: false)
+                    current = next
+                    continue
+                }
                 if final || allowMissingAncestors {
                     current = next
                     continue
@@ -528,17 +544,19 @@ public actor OverlayFileSystem: FileSystem, PreviewSemanticsFileSystem {
     }
 
     /// Materializes every merged-visible ancestor directory of `path` into the upper layer,
-    /// preserving lower-layer permissions. Throws `ENOENT` when an ancestor does not exist in
-    /// the merged view (parents are not invented, matching the in-memory backend).
-    private func ensureUpperDirectories(for path: WorkspacePath) async throws {
+    /// preserving lower-layer permissions. Creation operations may also create missing parents.
+    private func ensureUpperDirectories(for path: WorkspacePath, createMissing: Bool = false) async throws {
         var current = WorkspacePath.root
         for component in path.dirname.components {
             current = current.appending(component)
-            if await upperEntry(current) != nil {
+            if let info = await upperEntry(current) {
+                guard info.kind == .directory else { throw posixError(ENOTDIR) }
                 continue
             }
             guard let info = await lowerVisibleEntry(current) else {
-                throw posixError(ENOENT)
+                guard createMissing else { throw posixError(ENOENT) }
+                try await upper.createDirectory(path: current, recursive: false)
+                continue
             }
             guard info.kind == .directory else {
                 throw posixError(ENOTDIR)

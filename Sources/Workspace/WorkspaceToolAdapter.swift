@@ -45,18 +45,6 @@ public struct WorkspaceToolDefinition: Sendable, Codable, Equatable {
     }
 }
 
-public enum WorkspaceToolError: Error, Sendable, Equatable, CustomStringConvertible {
-    case unknownTool(String)
-    case invalidArguments(String)
-
-    public var description: String {
-        switch self {
-        case let .unknownTool(name): "unknown workspace tool: \(name)"
-        case let .invalidArguments(message): "invalid workspace tool arguments: \(message)"
-        }
-    }
-}
-
 /// Dependency-free tool definitions and execution over one shared Workspace authority.
 public actor WorkspaceToolAdapter {
     public let workspace: Workspace
@@ -145,7 +133,7 @@ public actor WorkspaceToolAdapter {
                     "edits": .arraySchema(
                         items: .schema(
                             properties: [
-                                "kind": .enumSchema(["write_text", "append_text", "create_directory", "remove", "copy", "move"]),
+                                "kind": .enumSchema(ToolEdit.Kind.allCases.map(\.rawValue)),
                                 "path": .stringSchema("Target workspace path."),
                                 "content": .stringSchema("Text for write_text or append_text."),
                                 "source": .stringSchema("Source path for copy or move."),
@@ -186,10 +174,12 @@ public actor WorkspaceToolAdapter {
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
+        var requestedPaths: [WorkspacePath] = []
         do {
             switch name {
             case "workspace_read":
                 let request = try decoder.decode(ReadArguments.self, from: arguments)
+                requestedPaths = [request.path]
                 let maxBytes = try boundedToolInteger(request.maxBytes, default: Self.defaultReadMaxBytes,
                                                      minimum: Self.minimumReadMaxBytes, maximum: Self.maximumReadMaxBytes, name: "max_bytes")
                 let offset = request.offset ?? 0
@@ -208,7 +198,8 @@ public actor WorkspaceToolAdapter {
                     hasMore: offset < totalBytes && UInt64(data.count) < totalBytes - offset,
                     offset: offset, leadingContext: leadingContext)
                 guard end > 0 || offset >= totalBytes else {
-                    throw WorkspaceError.unsupported("file changed or returned an incomplete read at \(request.path); retry the page")
+                    throw WorkspaceToolError(code: .conflict, path: request.path,
+                        message: "The file changed during the read; retry this page.")
                 }
                 // The read length was bounded by totalBytes - offset, so this cannot overflow.
                 let nextOffset = offset + UInt64(end)
@@ -216,6 +207,7 @@ public actor WorkspaceToolAdapter {
                     nextOffset: nextOffset, totalBytes: totalBytes, truncated: nextOffset < totalBytes))
             case "workspace_glob":
                 let request = try decoder.decode(GlobArguments.self, from: arguments)
+                requestedPaths = [request.currentDirectory ?? .root]
                 let budget = try toolResultBudget(request.maxBytes)
                 let offset = try boundedToolInteger(request.matchOffset, default: 0, minimum: 0, maximum: Int.max, name: "match_offset")
                 let count = try boundedToolInteger(request.maxMatches, default: Self.defaultGlobMaxMatches, minimum: 1,
@@ -225,13 +217,24 @@ public actor WorkspaceToolAdapter {
                 return try boundedGlobOutput(matches, offset: offset, maxMatches: count, maxBytes: budget, encoder: encoder)
             case "workspace_search":
                 let request = try decoder.decode(SearchArguments.self, from: arguments)
+                requestedPaths = [request.root]
                 return try encoder.encode(try await workspace.search(request.request()))
             case "workspace_apply":
                 let request = try decoder.decode(ApplyArguments.self, from: arguments)
+                requestedPaths = request.edits.flatMap { [$0.path] + ($0.source.map { [$0] } ?? []) }
                 let budget = try toolResultBudget(request.maxBytes)
                 let fileBudget = try toolFileBudget(request.maxFileBytes)
-                let result = try await workspace.apply(try request.edits.map { try $0.edit })
-                return boundedApplyOutput(result.changes, maxBytes: budget, maxFileBytes: fileBudget, encoder: encoder)
+                do {
+                    let result = try await workspace.apply(try request.edits.map { try $0.edit })
+                    return boundedApplyOutput(result.changes, maxBytes: budget, maxFileBytes: fileBudget, encoder: encoder)
+                } catch {
+                    if await isSubtreeTransferFailure(error, edits: request.edits) {
+                        let failure = WorkspaceToolError(mapping: error, requestedPaths: requestedPaths)
+                        throw WorkspaceToolError(code: failure.code, path: failure.path,
+                            message: "The destination is inside the source.")
+                    }
+                    throw error
+                }
             case "workspace_diff":
                 let request = try decoder.decode(DiffArguments.self, from: arguments)
                 let budget = try toolResultBudget(request.maxBytes)
@@ -259,7 +262,30 @@ public actor WorkspaceToolAdapter {
         } catch let error as WorkspaceToolError {
             throw error
         } catch let error as DecodingError {
-            throw WorkspaceToolError.invalidArguments(String(describing: error))
+            throw toolArgumentError(error)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw WorkspaceToolError(mapping: error, requestedPaths: requestedPaths)
+        }
+    }
+
+    private func isSubtreeTransferFailure(_ error: any Error, edits: [ToolEdit]) async -> Bool {
+        let failure = error as NSError
+        guard failure.domain == NSPOSIXErrorDomain, failure.code == Int(POSIXError.Code.EINVAL.rawValue),
+              edits.count == 1, let edit = edits.first, edit.kind == .copy || edit.kind == .move,
+              let source = edit.source else { return false }
+        // A batch can fail on several operations, and EINVAL has other causes.
+        // Only specialize an unambiguous transfer with confirmed containment.
+        let fs = workspace.fileSystem
+        let resolver = FileSystemPathResolver(base: fs)
+        let features = await fs.capabilities()
+        do {
+            let from = try await resolver.resolve(source, features: features, followFinal: false)
+            let to = try await resolver.resolve(edit.path, features: features, followFinal: false)
+            return to.isWithin(from)
+        } catch {
+            return false
         }
     }
 }
@@ -335,6 +361,11 @@ private struct SearchArguments: Decodable {
         maxBytes = try container.decodeIfPresent(Int.self, forKey: .maxBytes)
     }
     func request() throws -> SearchRequest {
+        guard !pattern.isEmpty else { throw WorkspaceToolError.invalidArguments("The pattern must not be empty.") }
+        if regularExpression {
+            do { _ = try NSRegularExpression(pattern: pattern) }
+            catch { throw WorkspaceToolError.invalidArguments("The pattern must be a valid regular expression.") }
+        }
         let context = try boundedToolInteger(contextLines, default: 0, minimum: 0,
             maximum: SearchRequest.maximumContextLines, name: "context_lines")
         let offset = try boundedToolInteger(matchOffset, default: 0, minimum: 0, maximum: Int.max, name: "match_offset")
@@ -364,8 +395,25 @@ private struct ApplyArguments: Decodable {
     }
 }
 
-private struct ToolEdit: Decodable {
-    var kind: String
+private struct ToolEdit: Decodable, Sendable {
+    enum Kind: String, Decodable, CaseIterable, Sendable {
+        case writeText = "write_text"
+        case appendText = "append_text"
+        case createDirectory = "create_directory"
+        case remove, copy, move
+
+        init(from decoder: any Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            guard let kind = Self(rawValue: raw) else {
+                let valid = Self.allCases.map(\.rawValue).joined(separator: ", ")
+                throw WorkspaceToolError.invalidArguments(
+                    "Unsupported value at \(toolCodingPath(decoder.codingPath)); use one of \(valid).")
+            }
+            self = kind
+        }
+    }
+
+    var kind: Kind
     var path: WorkspacePath
     var content: String?
     var source: WorkspacePath?
@@ -374,13 +422,12 @@ private struct ToolEdit: Decodable {
     var edit: Edit {
         get throws {
             switch kind {
-            case "write_text": .writeText(path, try required(content, "content"))
-            case "append_text": .appendText(path, try required(content, "content"))
-            case "create_directory": .createDirectory(path, recursive: recursive ?? true)
-            case "remove": .remove(path, recursive: recursive ?? true)
-            case "copy": .copy(from: try required(source, "source"), to: path, recursive: recursive ?? true)
-            case "move": .move(from: try required(source, "source"), to: path)
-            default: throw WorkspaceToolError.invalidArguments("unsupported edit kind \(kind)")
+            case .writeText: .writeText(path, try required(content, "content"))
+            case .appendText: .appendText(path, try required(content, "content"))
+            case .createDirectory: .createDirectory(path, recursive: recursive ?? true)
+            case .remove: .remove(path, recursive: recursive ?? true)
+            case .copy: .copy(from: try required(source, "source"), to: path, recursive: recursive ?? true)
+            case .move: .move(from: try required(source, "source"), to: path)
             }
         }
     }
@@ -413,13 +460,52 @@ private struct CheckpointArguments: Decodable { var label: String? }
 private func toolRevision(_ value: String?) throws -> Revision {
     guard let value else { return .current }
     guard let id = UUID(uuidString: value) else {
-        throw WorkspaceToolError.invalidArguments("checkpoint id is not a UUID: \(value)")
+        throw WorkspaceToolError.invalidArguments("The checkpoint ID must be a UUID.")
     }
     return .checkpoint(id)
 }
 
+// Coding paths contain schema field names and array indexes, never argument values.
+// Do not use DecodingError.debugDescription or underlying errors in model output.
+private func toolArgumentError(_ error: DecodingError) -> WorkspaceToolError {
+    let keys: [any CodingKey]
+    let problem: String
+    switch error {
+    case let .keyNotFound(key, context):
+        keys = context.codingPath + [key]
+        problem = "Missing required value"
+    case let .valueNotFound(_, context):
+        keys = context.codingPath
+        problem = "Expected a non-null value"
+    case let .typeMismatch(type, context):
+        keys = context.codingPath
+        if type == String.self { problem = "Expected a string" }
+        else if type == Bool.self { problem = "Expected a boolean" }
+        else if type == Int.self || type == UInt64.self { problem = "Expected an integer" }
+        else if type == Double.self { problem = "Expected a number" }
+        else if type == [Any].self { problem = "Expected an array" }
+        else if type == [String: Any].self { problem = "Expected an object" }
+        else { problem = "Expected a value of the required type" }
+    case let .dataCorrupted(context):
+        keys = context.codingPath
+        problem = "Invalid value or malformed JSON"
+    @unknown default:
+        keys = []
+        problem = "Invalid arguments"
+    }
+    return .invalidArguments("\(problem) at \(toolCodingPath(keys)).")
+}
+
+private func toolCodingPath(_ keys: [any CodingKey]) -> String {
+    let path = keys.reduce(into: "") { result, key in
+        if let index = key.intValue { result += "[\(index)]" }
+        else { result += (result.isEmpty ? "" : ".") + key.stringValue }
+    }
+    return path.isEmpty ? "arguments" : path
+}
+
 private func required<T>(_ value: T?, _ name: String) throws -> T {
-    guard let value else { throw WorkspaceToolError.invalidArguments("missing \(name)") }
+    guard let value else { throw WorkspaceToolError.invalidArguments("Missing required value at \(name).") }
     return value
 }
 
@@ -457,7 +543,7 @@ private extension JSONValue {
 private func boundedToolInteger(_ value: Int?, default fallback: Int, minimum: Int, maximum: Int, name: String) throws -> Int {
     let value = value ?? fallback
     guard value >= minimum else {
-        throw WorkspaceToolError.invalidArguments("\(name) must be at least \(minimum)")
+        throw WorkspaceToolError.invalidArguments("The \(name) argument must be at least \(minimum).")
     }
     return min(value, maximum)
 }
@@ -476,7 +562,7 @@ private func toolTextPage(
             // Report invalidEncoding instead if the rest of the page also contains invalid bytes.
             _ = try toolTextPage(Data(data.dropFirst(leading.count)), path: path, hasMore: hasMore)
             throw WorkspaceToolError.invalidArguments(
-                "offset \(offset) is inside a UTF-8 character; use a nextOffset value from a previous read"
+                "The offset is inside a UTF-8 character; use a nextOffset value from a previous read."
             )
         }
         throw WorkspaceError.invalidEncoding(path)

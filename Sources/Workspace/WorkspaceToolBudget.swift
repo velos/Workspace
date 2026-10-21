@@ -114,7 +114,7 @@ func boundedChangesOutput(
     if patch { output.unifiedPatch = patchSections.joined(separator: "\n") }
     let data = try encoder.encode(output)
     guard data.count <= maxBytes else {
-        throw WorkspaceToolError.invalidArguments("max_bytes cannot fit result metadata")
+        throw WorkspaceToolError.invalidArguments("The max_bytes argument cannot fit the result metadata.")
     }
     return data
 }
@@ -151,7 +151,7 @@ func boundedGlobOutput(
     output.truncated = cursor < matches.count || output.omittedMatches > 0
     let data = try encoder.encode(output)
     guard data.count <= maxBytes else {
-        throw WorkspaceToolError.invalidArguments("max_bytes cannot fit result metadata")
+        throw WorkspaceToolError.invalidArguments("The max_bytes argument cannot fit the result metadata.")
     }
     return data
 }

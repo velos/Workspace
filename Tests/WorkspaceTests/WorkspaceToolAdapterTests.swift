@@ -203,7 +203,7 @@ struct WorkspaceToolAdapterTests {
         try await workspace.writeData(Data([0x61, 0x80, 0x62]), to: "/orphan")
         let adapter = WorkspaceToolAdapter(workspace: workspace)
         await #expect(throws: WorkspaceToolError.invalidArguments(
-            "offset 2 is inside a UTF-8 character; use a nextOffset value from a previous read"
+            "The offset is inside a UTF-8 character; use a nextOffset value from a previous read."
         )) {
             _ = try await adapter.call(name: "workspace_read", arguments: Data(#"{"path":"/unicode","offset":2,"max_bytes":4}"#.utf8))
         }
@@ -214,12 +214,9 @@ struct WorkspaceToolAdapterTests {
             do {
                 _ = try await adapter.call(name: "workspace_read", arguments: Data(arguments.utf8))
                 Issue.record("expected invalidEncoding for malformed bytes")
-            } catch let error as WorkspaceError {
-                guard case let .invalidEncoding(invalidPath) = error else {
-                    Issue.record("expected invalidEncoding, received \(error)")
-                    continue
-                }
-                #expect(invalidPath == path)
+            } catch let error as WorkspaceToolError {
+                #expect(error.code == .illegalByteSequence)
+                #expect(error.path == path)
             }
         }
         let first = try JSONDecoder().decode(ReadPage.self, from: await adapter.call(
@@ -254,9 +251,9 @@ struct WorkspaceToolAdapterTests {
                     arguments: Data("{\"path\":\"/missing\"\(suffix)}".utf8))
                 Issue.record("expected ENOENT for missing file")
             } catch {
-                let posix = error as NSError
-                #expect(posix.domain == NSPOSIXErrorDomain)
-                #expect(posix.code == Int(ENOENT))
+                let failure = try #require(error as? WorkspaceToolError)
+                #expect(failure.code == .notFound)
+                #expect(failure.path == "/missing")
             }
         }
     }

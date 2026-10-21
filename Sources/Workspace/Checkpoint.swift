@@ -6,7 +6,6 @@ public struct Checkpoint: Sendable, Codable, Equatable {
         case manual
         case rollback(from: UUID)
         case transaction(base: UUID?)
-        case archiveRestore
     }
 
     public var id: UUID
@@ -27,7 +26,7 @@ public struct Checkpoint: Sendable, Codable, Equatable {
         switch origin {
         case let .rollback(from): from
         case let .transaction(base): base
-        case .manual, .archiveRestore: nil
+        case .manual: nil
         }
     }
 

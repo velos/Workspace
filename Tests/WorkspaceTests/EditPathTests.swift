@@ -55,6 +55,21 @@ struct EditPathTests {
     static let scenarios: [Scenario] = [
         .init(description: "nested mount write", edits: [.writeText("/mnt/data/x", "hi")]),
         .init(description: "overwrite mode", edits: [.setPermissions("/dir/a", POSIXPermissions(0o600)), .writeText("/dir/a", "new")]),
+        .init(description: "missing component before dotdot", edits: [
+            .createSymbolicLink("/dotdot", target: "scratch/../dir"),
+            .writeText("/dotdot/new/file", "new"),
+        ]),
+        .init(description: "missing writeText", edits: [.writeText("/new/deep/file", "new")]),
+        .init(description: "missing appendText", edits: [.appendText("/new/deep/file", "new")]),
+        .init(description: "missing writeData", edits: [.writeData("/new/deep/file", Data([1, 2]))]),
+        .init(description: "missing appendData", edits: [.appendData("/new/deep/file", Data([1, 2]))]),
+        .init(description: "missing copy", edits: [.copy(from: "/dir/sub", to: "/new/deep/copied")]),
+        .init(description: "missing move", edits: [.move(from: "/dir/sub", to: "/new/deep/moved")]),
+        .init(description: "missing symbolic link", edits: [.createSymbolicLink("/new/deep/link", target: "../../dir/a")]),
+        .init(description: "missing hard link", edits: [.createHardLink("/new/deep/hard", target: "/dir/a")]),
+        .init(description: "missing alias parents", edits: [.writeText("/dirlink/new/deep/file", "new")]),
+        .init(description: "dangling parent write", edits: [.writeText("/dangling/deep/file", "new")]),
+        .init(description: "dangling leaf parents", edits: [.writeText("/deepdangling", "new")]),
         .init(description: "writeText", edits: [.writeText("/dir/a", "new")]),
         .init(description: "appendText", edits: [.appendText("/dir/a", "new")]),
         .init(description: "writeData", edits: [.writeData("/dir/a", Data([1, 2]))]),
@@ -128,6 +143,7 @@ struct EditPathTests {
             try await fs.createSymlink(path: "/link", target: "dir/a")
             try await fs.createSymlink(path: "/dangling", target: "nowhere")
             try await fs.createSymlink(path: "/chain", target: "dangling")
+            try await fs.createSymlink(path: "/deepdangling", target: "new/deep/file")
             let workspace = Workspace(fileSystem: fs)
             let before = try await Snapshot.capture(from: fs)
             let edits = scenario.edits + (failing ? [.copy(from: "/absent", to: "/failure")] : [])

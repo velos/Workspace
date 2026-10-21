@@ -233,10 +233,12 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
     /// write a single atomic step.
     public func createFile(path: WorkspacePath, data: Data) async throws {
         defer { generation &+= 1 }
-        if (try? node(at: path, followFinalSymlink: false)) != nil {
+        let destination = try resolvePath(path: path, followFinalSymlink: false,
+                                          allowMissing: true, createParents: true)
+        if (try? node(at: destination, followFinalSymlink: false)) != nil {
             throw posixError(EEXIST)
         }
-        try write(path: path, data: data, append: false)
+        try write(path: destination, data: data, append: false)
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.
@@ -250,7 +252,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
             throw posixError(EISDIR)
         }
 
-        let writePath = try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0, allowMissing: true)
+        let writePath = try resolvePath(path: path, followFinalSymlink: true, allowMissing: true, createParents: true)
 
         let (parent, name) = try parentDirectoryAndName(for: writePath)
         var children = try directoryChildren(of: parent)
@@ -346,12 +348,14 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
             throw posixError(ENOENT)
         }
 
+        let sourceEntry = try resolvePath(path: sourcePath, followFinalSymlink: false)
+        let destinationEntry = try resolvePath(path: destinationPath, followFinalSymlink: false, allowMissing: true)
         if sourceNode.isDirectory,
-           destinationPath.isWithin(sourcePath) {
+           destinationEntry.isWithin(sourceEntry) {
             throw posixError(EINVAL)
         }
 
-        let (destinationParent, destinationName) = try parentDirectoryAndName(for: destinationPath)
+        let (destinationParent, destinationName) = try parentDirectoryAndName(for: destinationPath, createParents: true)
         if sourceParent === destinationParent {
             var children = try directoryChildren(of: sourceParent)
             if children[PathName(destinationName)] != nil {
@@ -385,12 +389,21 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
         async throws
     {
         defer { generation &+= 1 }
-        let sourceNode = try node(at: sourcePath, followFinalSymlink: false)
+        let sourceEntry: WorkspacePath
+        if sourcePath.isRoot {
+            sourceEntry = .root
+        } else {
+            let parent = try resolvePath(path: sourcePath.dirname, followFinalSymlink: true, requireDirectory: true)
+            sourceEntry = parent.appending(sourcePath.basename)
+        }
+        let destinationEntry = try resolvePath(path: destinationPath, followFinalSymlink: false, allowMissing: true)
+        guard !destinationEntry.isWithin(sourceEntry) else { throw posixError(EINVAL) }
+
+        let (destinationParent, destinationName) = try parentDirectoryAndName(for: destinationPath, createParents: true)
+        let sourceNode = try node(at: sourceEntry, followFinalSymlink: false)
         if sourceNode.isDirectory, !recursive {
             throw posixError(EISDIR)
         }
-
-        let (destinationParent, destinationName) = try parentDirectoryAndName(for: destinationPath)
         var destinationChildren = try directoryChildren(of: destinationParent)
         if destinationChildren[PathName(destinationName)] != nil {
             throw posixError(EEXIST)
@@ -409,7 +422,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
             throw posixError(EEXIST)
         }
 
-        let (parent, name) = try parentDirectoryAndName(for: path)
+        let (parent, name) = try parentDirectoryAndName(for: path, createParents: true)
         var children = try directoryChildren(of: parent)
         if children[PathName(name)] != nil {
             throw posixError(EEXIST)
@@ -432,7 +445,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
             throw posixError(EPERM)
         }
 
-        let (parent, name) = try parentDirectoryAndName(for: path)
+        let (parent, name) = try parentDirectoryAndName(for: path, createParents: true)
         var children = try directoryChildren(of: parent)
         if children[PathName(name)] != nil {
             throw posixError(EEXIST)
@@ -465,7 +478,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 
     /// See ``FileSystem/resolveRealPath(path:)``.
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
-        try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0)
+        try resolvePath(path: path, followFinalSymlink: true)
     }
 
     /// Returns entry existence without following the final symlink (lstat semantics).
@@ -574,12 +587,13 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
         return children
     }
 
-    private func parentDirectoryAndName(for path: WorkspacePath) throws -> (Node, String) {
+    private func parentDirectoryAndName(for path: WorkspacePath, createParents: Bool = false) throws -> (Node, String) {
         guard !path.isRoot else {
             throw posixError(EPERM)
         }
 
-        let parentPath = path.dirname
+        let parentPath = try resolvePath(path: path.dirname, followFinalSymlink: true,
+                                         allowMissing: createParents, createParents: createParents, requireDirectory: true)
         let name = path.basename
         let parent = try node(at: parentPath, followFinalSymlink: true)
         _ = try directoryChildren(of: parent)
@@ -595,93 +609,70 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
         return (parent, name, entry)
     }
 
-    private func node(at path: WorkspacePath, followFinalSymlink: Bool, symlinkDepth: Int = 0) throws -> Node {
-        if symlinkDepth > 64 {
-            throw posixError(ELOOP)
-        }
-
-        if path.isRoot {
-            return root
-        }
-
-        let components = path.components
+    private func node(at path: WorkspacePath, followFinalSymlink: Bool) throws -> Node {
+        let resolved = try resolvePath(path: path, followFinalSymlink: followFinalSymlink)
         var current = root
-        var currentPath = WorkspacePath.root
-
-        for (index, component) in components.enumerated() {
-            guard case let .directory(children) = current.kind else {
-                throw posixError(ENOTDIR)
-            }
-
-            guard let child = children[PathName(component)] else {
+        for component in resolved.components {
+            guard let child = try directoryChildren(of: current)[PathName(component)] else {
                 throw posixError(ENOENT)
             }
-
-            let isFinal = index == components.count - 1
-            if case let .symlink(target) = child.kind,
-               (!isFinal || followFinalSymlink) {
-                let base = currentPath
-                let targetPath = WorkspacePath(normalizing: target, relativeTo: base)
-                let remaining = components.suffix(from: index + 1).joined(separator: "/")
-                let combined = remaining.isEmpty ? targetPath : targetPath.appending(remaining)
-                return try node(at: combined, followFinalSymlink: followFinalSymlink, symlinkDepth: symlinkDepth + 1)
-            }
-
             current = child
-            currentPath = currentPath.appending(component)
         }
-
         return current
     }
 
     package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
-        try resolvePath(path: path, followFinalSymlink: true, symlinkDepth: 0, allowMissing: true)
+        try resolvePath(path: path, followFinalSymlink: true, allowMissing: true)
     }
 
     private func resolvePath(
-        path: WorkspacePath, followFinalSymlink: Bool, symlinkDepth: Int, allowMissing: Bool = false
+        path: WorkspacePath, followFinalSymlink: Bool, allowMissing: Bool = false,
+        createParents: Bool = false, requireDirectory: Bool = false
     ) throws -> WorkspacePath {
-        if symlinkDepth > 64 {
-            throw posixError(ELOOP)
-        }
-
-        if path.isRoot {
-            return .root
-        }
-
-        let components = path.components
-        var current = root
-        var resolvedPath = WorkspacePath.root
-
-        for (index, component) in components.enumerated() {
-            guard case let .directory(children) = current.kind else {
-                throw posixError(ENOTDIR)
+        var pending = path.components
+        var nodes: [Node?] = [root]
+        var resolved = WorkspacePath.root
+        var hops = 0
+        while !pending.isEmpty {
+            let component = pending.removeFirst()
+            if component == "." { continue }
+            if component == ".." {
+                guard !resolved.isRoot else { throw WorkspaceError.invalidPath(path.string) }
+                resolved = resolved.dirname
+                nodes.removeLast()
+                continue
             }
-
-            guard let child = children[PathName(component)] else {
-                if allowMissing {
-                    return resolvedPath.appending(components.dropFirst(index).joined(separator: "/"))
-                }
+            let current = nodes.last!
+            var children = try current.map { try directoryChildren(of: $0) } ?? [:]
+            let final = pending.isEmpty
+            let child: Node?
+            if let existing = children[PathName(component)] {
+                child = existing
+            } else if createParents && (!final || requireDirectory) {
+                child = makeNode(kind: .directory([:]), permissions: 0o755)
+                children[PathName(component)] = child
+                current?.kind = .directory(children)
+                current?.modificationDate = nextTimestamp()
+            } else if allowMissing {
+                child = nil
+            } else {
                 throw posixError(ENOENT)
             }
-
-            let isFinal = index == components.count - 1
-            if case let .symlink(target) = child.kind,
-               (!isFinal || followFinalSymlink) {
-                let targetPath = WorkspacePath(normalizing: target, relativeTo: resolvedPath)
-                let remaining = components.suffix(from: index + 1).joined(separator: "/")
-                let combined = remaining.isEmpty ? targetPath : targetPath.appending(remaining)
-                return try resolvePath(
-                    path: combined, followFinalSymlink: followFinalSymlink,
-                    symlinkDepth: symlinkDepth + 1, allowMissing: allowMissing
-                )
+            if let child, case let .symlink(target) = child.kind, !final || followFinalSymlink {
+                hops += 1
+                guard hops <= 40 else { throw posixError(ELOOP) }
+                if target.utf8.first == 47 {
+                    nodes = [root]
+                    resolved = .root
+                }
+                pending = WorkspacePath.splitComponents(target) + pending
+                continue
             }
-
-            current = child
-            resolvedPath = resolvedPath.appending(component)
+            if let child, !final || requireDirectory { _ = try directoryChildren(of: child) }
+            nodes.append(child)
+            resolved = resolved.appending(component)
         }
-
-        return resolvedPath
+        return resolved
     }
 
     private func posixError(_ code: Int32) -> NSError {
@@ -690,7 +681,7 @@ public actor InMemoryFileSystem: FileSystem, PotentialPathResolvingFileSystem, E
 }
 
 extension InMemoryFileSystem: PreviewSemanticsFileSystem {
-    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics { .init() }
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics { .init(createsWriteParents: true) }
 }
 
 /// Optional exact revision for metadata accounting. Each attempted public mutation advances
