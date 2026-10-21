@@ -65,7 +65,7 @@ struct ScopedObservationTests {
         guard case let .changes(change)? = await first(events) else { Issue.record("missing external event"); return }
         #expect(change.touchedPaths == ["/x"])
         #expect(await fs.base.listings.dropFirst(lists).allSatisfy { $0 == .root })
-        #expect(await fs.base.reads.dropFirst(reads).allSatisfy { $0 == "/x" })
+        #expect(await fs.base.reads.dropFirst(reads).filter { $0 != "/x" } == [])
         // The untouched descendants must remain in the observation index.
         try await fs.base.remove(path: "/unrelated", recursive: true)
         fs.signal(.paths([.root: .shallow]))
@@ -184,8 +184,14 @@ struct ScopedObservationTests {
         let fs = SignallingFileSystem(base: local, source: local)
         let ws = Workspace(fileSystem: fs)
         let events = await ws.events(.init(includeCheckpoints: false))
-        // Drain fixture setup notifications before measuring the external write.
-        try await Task.sleep(for: .milliseconds(250))
+        // Drain fixture setup notifications before measuring: FSEvents delivers in
+        // order, so once the marker's event arrives, setup batches are done.
+        try await local.writeFile(path: "/marker", data: Data(), append: false)
+        var drained = false
+        while case let .changes(setup)? = await first(events) {
+            if setup.touchedPaths.contains("/marker") { drained = true; break }
+        }
+        try #require(drained, "missing setup delivery fence")
         let lists = await fs.base.listings.count
         let stats = await fs.base.statCount
         let reads = await fs.base.reads.count
@@ -200,7 +206,7 @@ struct ScopedObservationTests {
         #expect(refreshed.allSatisfy { $0 == .root })
         #expect(refreshed.count <= 4)
         #expect(await fs.base.statCount - stats < 20)
-        #expect(await fs.base.reads.dropFirst(reads).allSatisfy { $0 == "/x" })
+        #expect(await fs.base.reads.dropFirst(reads).filter { $0 != "/x" } == [])
     }
     #endif
 
