@@ -36,6 +36,12 @@ public struct TextDiffOmission: Sendable, Codable, Equatable {
     public enum Reason: String, Sendable, Codable {
         case binary
         case sizeLimitExceeded
+        /// The previous contents were not retained in the observation cache.
+        case observationCacheMiss
+        /// Reading the current file contents failed; its metadata change is still reported.
+        case contentReadFailed
+        /// The tool adapter omitted text to fit its encoded output budget.
+        case outputBudgetExceeded
     }
 
     public var path: WorkspacePath

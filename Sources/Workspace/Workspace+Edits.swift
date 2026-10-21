@@ -10,53 +10,150 @@ extension Workspace {
         return text
     }
 
-    /// Previews edits against an isolated in-memory copy of the current workspace.
+    /// Previews edits against an isolated copy-on-write layer over the current workspace.
     public func preview(_ edits: [Edit]) async throws -> ChangeSet {
-        let before = try await Snapshot.capture(from: filesystem)
-        let scratch = InMemoryFileSystem()
-        try await Snapshot.restore(before, to: scratch)
-        for edit in edits {
-            try await Self.apply(edit, to: scratch)
-        }
-        let after = try await Snapshot.capture(from: scratch)
-        return changeSet(from: before, to: after)
+        await acquireOperation()
+        defer { releaseOperation() }
+        let scratch = OverlayFileSystem(previewOf: filesystem)
+        let workspace = Workspace(fileSystem: scratch, recording: .off)
+        return try await workspace.apply(edits).changes
     }
 
     /// Applies edits through one canonical execution and recording path.
+    ///
+    /// Atomic recovery restores only affected subtrees, including implicitly
+    /// created parents. Hard-link aliases outside those subtrees are not tracked,
+    /// and permission changes to symlink entries are not rolled back.
+    /// Direct filesystem mutations and other processes are not serialized by the
+    /// workspace operation gate; concurrent changes within affected roots may be lost.
     @discardableResult
     public func apply(_ edits: [Edit], policy: EditPolicy = .atomic) async throws -> EditResult {
-        try await ensureLoaded()
-        let before = try await Snapshot.capture(from: filesystem)
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
+        try await prepareForMutation()
+        var journal = SnapshotJournal()
         var failures: [EditFailure] = []
 
-        for (index, edit) in edits.enumerated() {
-            do {
-                try await Self.apply(edit, to: filesystem)
-            } catch {
-                let failure = EditFailure(index: index, edit: edit, message: String(describing: error))
-                switch policy {
-                case .atomic:
-                    try await Snapshot.restore(before, to: filesystem)
-                    throw error
-                case .stopOnError:
-                    failures.append(failure)
-                    break
-                case .continueAfterError:
-                    failures.append(failure)
-                    continue
+        do {
+            for (index, edit) in edits.enumerated() {
+                do {
+                    let paths = try await affectedRoots(for: edit)
+                    try await journal.capture(paths, from: filesystem)
+                    if transactionRoots != nil { transactionRoots!.formUnion(paths) }
+                    try await Self.apply(edit, to: filesystem)
+                } catch {
+                    if policy == .atomic { throw error }
+                    failures.append(EditFailure(index: index, edit: edit, message: String(describing: error)))
+                    if policy == .stopOnError { break }
                 }
+            }
+
+            let after = try await journal.captureAfter(from: filesystem)
+            let changes = changeSet(from: journal.snapshots, to: after)
+            if !changes.isEmpty {
+                let recorded = recordingChanges(changes, from: journal.snapshots, to: after)
+                try await appendMutation(operation: .edit, changes: recorded)
+            }
+            for snapshot in after { await noteWorkspaceSnapshot(snapshot) }
+            if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
+            return EditResult(changes: changes, failures: failures)
+        } catch {
+            // Capture and persistence failures are also inside the atomic boundary.
+            try await restoreAfterFailure(journal.snapshots, originalError: error)
+        }
+    }
+
+    /// Includes implicitly created parent directories. Hard-link aliases outside
+    /// these roots cannot be discovered through FileSystem and are not journaled.
+    private func affectedRoots(for edit: Edit) async throws -> [WorkspacePath] {
+        let paths: [WorkspacePath]
+        switch edit {
+        case let .replace(files, _, _):
+            paths = try await Self.selectedFiles(files, on: filesystem)
+        case let .move(source, destination): paths = [source, destination]
+        case let .copy(_, destination, _): paths = [destination]
+        case let .writeText(path, _), let .appendText(path, _),
+             let .writeData(path, _), let .appendData(path, _),
+             let .createDirectory(path, _), let .remove(path, _),
+             let .createSymbolicLink(path, _), let .createHardLink(path, _),
+             let .setPermissions(path, _): paths = [path]
+        }
+        var roots: [WorkspacePath] = []
+        let resolvesPaths = await filesystem.capabilities().contains(.realPathResolution)
+        for path in paths {
+            let entryPath: WorkspacePath
+            if resolvesPaths && !path.isRoot {
+                let parent = try await resolvedCapturePath(path.dirname, additionalRoots: &roots)
+                entryPath = parent.appending(path.basename)
+            } else {
+                entryPath = path
+            }
+            roots.append(try await captureRoot(for: entryPath))
+            // Some backends replace the leaf link, while others follow it. Capture
+            // both the canonical entry and its target, but never lexical aliases.
+            switch edit {
+            case .writeText, .appendText, .writeData, .appendData, .setPermissions, .replace:
+                if resolvesPaths {
+                    let target = try await resolvedCapturePath(entryPath, additionalRoots: &roots)
+                    roots.append(try await captureRoot(for: target))
+                }
+            default:
                 break
             }
         }
+        return roots
+    }
 
-        let after = try await Snapshot.capture(from: filesystem)
-        noteWorkspaceSnapshot(after)
-        let changes = changeSet(from: before, to: after)
-        if !changes.isEmpty {
-            try await appendMutation(operation: .edit, changes: changes)
-            emitWorkspaceEvent(.changes(changes))
+    func canonicalEntryPath(_ path: WorkspacePath, resolvesPaths: Bool) async throws -> WorkspacePath {
+        guard resolvesPaths, !path.isRoot else { return path }
+        // Archive restore rebases every write to this destination, so it never traverses the original link.
+        var additionalRoots: [WorkspacePath] = []
+        let parent = try await resolvedCapturePath(path.dirname, additionalRoots: &additionalRoots)
+        return parent.appending(path.basename)
+    }
+
+    // Resolve existing ancestors, preserving missing suffixes for creation edits.
+    // A dangling leaf still has a target even when resolveRealPath requires that
+    // target to exist. Only absence permits fallback; authorization errors escape.
+    private func resolvedCapturePath(_ path: WorkspacePath, additionalRoots: inout [WorkspacePath], linkDepth: Int = 0) async throws -> WorkspacePath {
+        guard linkDepth < 64 else {
+            throw WorkspaceError.invalidPath("symbolic link cycle at \(path)")
         }
-        return EditResult(changes: changes, failures: failures)
+        if path.isRoot { return try await filesystem.resolveRealPath(path: path) }
+        let parent = try await resolvedCapturePath(path.dirname, additionalRoots: &additionalRoots, linkDepth: linkDepth)
+        let entry = parent.appending(path.basename)
+        guard let info = try await Snapshot.infoIfPresent(at: entry, on: filesystem) else { return entry }
+        guard info.kind == .symlink else { return entry }
+        do {
+            let resolved = try await filesystem.resolveRealPath(path: entry)
+            if resolved != entry {
+                return try await resolvedCapturePath(resolved, additionalRoots: &additionalRoots, linkDepth: linkDepth + 1)
+            }
+        } catch {
+            guard Snapshot.isMissingEntry(error) else { throw error }
+        }
+        let target = try await filesystem.readSymlink(path: entry)
+        let components = WorkspacePath.splitComponents(target).filter { $0 != "." }
+        if components.drop(while: { $0 == ".." }).contains("..") {
+            // Leading '..' is exact from the physically resolved parent. A later
+            // '..' may leave a newly created directory or a symlink, outside the final
+            // canonical destination. Capture the tree conservatively in this rare
+            // case; the backend owns absolute-target namespaces and traversal.
+            additionalRoots.append(.root)
+        }
+        // Absolute fallback targets are interpreted as workspace paths.
+        let targetPath = WorkspacePath(normalizing: target, relativeTo: entry.dirname)
+        return try await resolvedCapturePath(targetPath, additionalRoots: &additionalRoots, linkDepth: linkDepth + 1)
+    }
+
+    func captureRoot(for path: WorkspacePath) async throws -> WorkspacePath {
+        var root = path
+        while !root.dirname.isRoot,
+              try await Snapshot.infoIfPresent(at: root.dirname, on: filesystem) == nil {
+            root = root.dirname
+        }
+        return root
     }
 
     @discardableResult
@@ -112,22 +209,37 @@ extension Workspace {
     }
 
     func changeSet(from before: Snapshot, to after: Snapshot) -> ChangeSet {
-        let limit: Int?
+        changeSet(from: [before], to: [after])
+    }
+
+    func changeSet(
+        from before: [Snapshot], to after: [Snapshot], maxTextBytes: Int? = DiffOptions.default.maxTextBytes
+    ) -> ChangeSet {
+        let parts = zip(before, after).map {
+            ChangeSet.compare(before: $0, after: $1, maxTextBytes: maxTextBytes)
+        }
+        return ChangeSet(
+            changes: parts.flatMap(\.changes),
+            textDiffOmissions: parts.flatMap(\.textDiffOmissions)
+        )
+    }
+
+    func recordingChanges(_ changes: ChangeSet, from before: Snapshot, to after: Snapshot) -> ChangeSet {
+        recordingChanges(changes, from: [before], to: [after])
+    }
+
+    func recordingChanges(_ changes: ChangeSet, from before: [Snapshot], to after: [Snapshot]) -> ChangeSet {
         switch recording {
-        case let .full(maxTextBytes): limit = maxTextBytes
-        case .changesOnly, .off: limit = 0
+        case let .full(limit):
+            if limit == DiffOptions.default.maxTextBytes { return changes }
+            return changeSet(from: before, to: after, maxTextBytes: limit)
+        case .changesOnly, .off:
+            return ChangeSet(changes: changes.changes.map { change in
+                var copy = change
+                copy.diff = nil
+                return copy
+            })
         }
-        var result = ChangeSet.compare(before: before, after: after, maxTextBytes: limit)
-        if case .full = recording {
-            return result
-        }
-        result.changes = result.changes.map { change in
-            var copy = change
-            copy.diff = nil
-            return copy
-        }
-        result.textDiffOmissions = []
-        return result
     }
 
     private static func apply(_ edit: Edit, to fileSystem: any FileSystem) async throws {
@@ -198,18 +310,9 @@ extension Workspace {
     static func selectedFiles(_ selection: FileSelection, on fileSystem: any FileSystem) async throws
         -> [WorkspacePath]
     {
-        var included = Set<WorkspacePath>()
-        for pattern in selection.include {
-            let resolved = WorkspacePath(normalizing: pattern, relativeTo: selection.root)
-            included.formUnion(try await fileSystem.glob(pattern: resolved.string, currentDirectory: selection.root))
-        }
-        var excluded = Set<WorkspacePath>()
-        for pattern in selection.exclude {
-            let resolved = WorkspacePath(normalizing: pattern, relativeTo: selection.root)
-            excluded.formUnion(try await fileSystem.glob(pattern: resolved.string, currentDirectory: selection.root))
-        }
+        let selected = try await FileSelectionPlan(selection).paths(on: fileSystem)
         var files: [WorkspacePath] = []
-        for path in included.subtracting(excluded).sorted() {
+        for path in selected {
             if try await fileSystem.stat(path: path).kind == .file {
                 files.append(path)
             }

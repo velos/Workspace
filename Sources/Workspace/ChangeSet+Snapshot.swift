@@ -34,18 +34,18 @@ extension ChangeSet {
             changes.append(.init(path: rhs.path, kind: .file, effect: .modified, diff: diffResult.diff))
             if let omission = diffResult.omission { omissions.append(omission) }
         case let (.symlink(lhs), .symlink(rhs)):
-            guard lhs.target != rhs.target || lhs.permissions != rhs.permissions else { return }
+            guard !lhs.target.utf8.elementsEqual(rhs.target.utf8) || lhs.permissions != rhs.permissions else { return }
             changes.append(.init(path: rhs.path, kind: .symlink, effect: .modified))
         case let (.directory(lhs), .directory(rhs)):
             if lhs.permissions != rhs.permissions {
                 changes.append(.init(path: rhs.path, kind: .directory, effect: .modified))
             }
-            let oldChildren = Dictionary(uniqueKeysWithValues: lhs.children.map { ($0.path.name, $0) })
-            let newChildren = Dictionary(uniqueKeysWithValues: rhs.children.map { ($0.path.name, $0) })
+            let oldChildren = Dictionary(uniqueKeysWithValues: lhs.children.map { (PathName($0.path.name), $0) })
+            let newChildren = Dictionary(uniqueKeysWithValues: rhs.children.map { (PathName($0.path.name), $0) })
             for name in Set(oldChildren.keys).union(newChildren.keys).sorted() {
                 compareEntries(
-                    oldChildren[name] ?? .missing(.init(path: lhs.path.appending(name))),
-                    newChildren[name] ?? .missing(.init(path: rhs.path.appending(name))),
+                    oldChildren[name] ?? .missing(.init(path: lhs.path.appending(name.string))),
+                    newChildren[name] ?? .missing(.init(path: rhs.path.appending(name.string))),
                     maxTextBytes: maxTextBytes,
                     changes: &changes,
                     omissions: &omissions

@@ -37,6 +37,10 @@ extension Workspace {
         public var after: StorageStatistics
         public var removedCheckpointIDs: [UUID]
         public var rebasedCheckpointIDs: [UUID]
+        public var removedMutationCount: Int
+        /// History log bytes reclaimed by removing records.
+        /// Memory stores report the records' encoded size.
+        public var removedMutationBytes: UInt64
 
         public var removedCheckpointCount: Int { removedCheckpointIDs.count }
         public var removedSnapshotCount: Int { max(0, before.snapshotCount - after.snapshotCount) }
@@ -48,13 +52,17 @@ extension Workspace {
             before: StorageStatistics,
             after: StorageStatistics,
             removedCheckpointIDs: [UUID],
-            rebasedCheckpointIDs: [UUID]
+            rebasedCheckpointIDs: [UUID],
+            removedMutationCount: Int = 0,
+            removedMutationBytes: UInt64 = 0
         ) {
             self.dryRun = dryRun
             self.before = before
             self.after = after
             self.removedCheckpointIDs = removedCheckpointIDs
             self.rebasedCheckpointIDs = rebasedCheckpointIDs
+            self.removedMutationCount = removedMutationCount
+            self.removedMutationBytes = removedMutationBytes
         }
     }
 
@@ -63,13 +71,35 @@ extension Workspace {
         try await store.storageStatistics(workspaceId: workspaceId)
     }
 
-    /// Prunes checkpoints, rebases retained lineage, and sweeps unreachable snapshots and blobs.
+    /// Prunes checkpoints and the history records every retained checkpoint already includes,
+    /// rebases retained lineage, and sweeps unreachable snapshots and blobs.
+    /// With no retained checkpoints, mutation history is preserved.
     ///
     /// A dry run performs the same validation and returns projected statistics without changing storage.
     public func compact(retaining retention: Retention, dryRun: Bool = false) async throws -> CompactionReport {
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
         try await ensureLoaded()
-        let result = try await store.compact(workspaceId: workspaceId, retaining: retention, dryRun: dryRun)
+        // A reusable base alone does not override retention. Independent transaction
+        // handles and other workspace instances still protect their lazy revision reads.
+        let reusablePin = transactionBase?.revisionPin?.token
+        let store = store
+        let workspaceId = workspaceId
+        let result = try await TransactionRevisionGate.shared.withLock {
+            let effectiveRetention: Retention
+            if case let .latest(count, labels, preserving) = retention {
+                let known = Set(try await store.listCheckpoints(workspaceId: workspaceId).map(\.id))
+                let pins = TransactionRevisionPins.shared.checkpoints(in: workspaceId, excluding: reusablePin).intersection(known)
+                effectiveRetention = .latest(count, preservingLabeled: labels, preserving: preserving.union(pins))
+            } else { effectiveRetention = retention }
+            return try await store.compact(workspaceId: workspaceId, retaining: effectiveRetention, dryRun: dryRun)
+        }
         if !dryRun {
+            if let id = transactionBase?.checkpointID, !result.checkpoints.contains(where: { $0.id == id }) {
+                transactionBase = nil
+                transactionMetadata = nil
+            }
             checkpoints = result.checkpoints
             headCheckpointId = Checkpoint.lineageHeadID(in: checkpoints)
         }

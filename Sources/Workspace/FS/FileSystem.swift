@@ -59,6 +59,19 @@ public enum WorkspaceError: Error, CustomStringConvertible, Sendable {
     }
 }
 
+/// An operation failed and recovery also failed, either while restoring the
+/// previous filesystem state or while retracting its mutation-history record.
+public struct WorkspaceRollbackError: Error, CustomStringConvertible, Sendable {
+    /// The operation or persistence error that triggered recovery.
+    public let originalError: any Error
+    /// The error encountered while restoring files or retracting history.
+    public let rollbackError: any Error
+
+    public var description: String {
+        "\(originalError); restoring the previous state also failed: \(rollbackError)"
+    }
+}
+
 /// Metadata describing a filesystem entry.
 public struct FileInfo: Sendable, Codable {
     /// The normalized path for the entry.
@@ -71,6 +84,12 @@ public struct FileInfo: Sendable, Codable {
     public var permissions: POSIXPermissions
     /// The last modification timestamp when available.
     public var modificationDate: Date?
+    /// Identity shared by aliases, when the backend supplies it. It must distinguish
+    /// different entries across backend instances and agree for the same underlying entry.
+    public var identity: FileIdentity?
+    /// Number of hard links to this entry, when known. One rules out additional hard links;
+    /// mounts may still expose the same entry at several virtual paths.
+    public var linkCount: UInt64?
 
     /// Creates metadata for a filesystem entry.
     public init(
@@ -78,13 +97,39 @@ public struct FileInfo: Sendable, Codable {
         kind: FileTree.Kind,
         size: UInt64,
         permissions: POSIXPermissions,
-        modificationDate: Date?
+        modificationDate: Date?,
+        identity: FileIdentity? = nil,
+        linkCount: UInt64? = nil
     ) {
         self.path = path
         self.kind = kind
         self.size = size
         self.permissions = permissions
         self.modificationDate = modificationDate
+        self.identity = identity
+        self.linkCount = linkCount
+    }
+}
+
+/// Opaque identity of a filesystem entry, shared by aliases across backend instances.
+/// Device and inode values must distinguish live entries across backend instances;
+/// replacements receive a new identity. Device numbers may change across remounts.
+/// Independent in-memory backends need distinct device tokens; disk backends can use st_dev and st_ino.
+public struct FileIdentity: Hashable, Sendable, Codable {
+    private let device: UInt64
+    private let inode: UInt64
+
+    public init(device: UInt64, inode: UInt64) {
+        self.device = device
+        self.inode = inode
+    }
+
+    /// Only for persisted/cached metadata comparisons, never live alias detection.
+    /// Equal inodes with different devices may reflect a remount: identity is then
+    /// unknown, leaving size, mtime and the racy window to decide content reuse.
+    /// Missing identities compare equal only to each other here.
+    static func matchesForMetadataReuse(_ lhs: Self?, _ rhs: Self?) -> Bool {
+        lhs?.inode == rhs?.inode
     }
 }
 
@@ -121,6 +166,10 @@ public struct FileSystemFeatures: OptionSet, Sendable {
     public static let permissions = FileSystemFeatures(rawValue: 1 << 2)
     /// ``FileSystem/resolveRealPath(path:)`` resolves symlink chains.
     public static let realPathResolution = FileSystemFeatures(rawValue: 1 << 3)
+    /// Non-appending writes follow the final symlink instead of replacing the link itself.
+    /// Composing backends intersect this feature, so a mixed filesystem uses conservative
+    /// byte accounting where the flag is absent. Appends follow existing final symlinks.
+    public static let replacementFollowsFinalSymlink = FileSystemFeatures(rawValue: 1 << 4)
 }
 
 /// The low-level interface implemented by workspace storage backends.
@@ -131,7 +180,8 @@ public protocol FileSystem: AnyObject, Sendable {
     func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry]
     /// Reads the file contents at `path`.
     func readFile(path: WorkspacePath) async throws -> Data
-    /// Returns whether an entry exists at `path`.
+    /// Returns whether an entry exists at `path`, using lstat semantics: intermediate
+    /// symlinks are followed, but the final symlink itself exists even when its target does not.
     func exists(path: WorkspacePath) async -> Bool
     /// Expands a glob pattern relative to `currentDirectory`.
     func glob(pattern: String, currentDirectory: WorkspacePath) async throws -> [WorkspacePath]
@@ -147,7 +197,10 @@ public protocol FileSystem: AnyObject, Sendable {
     func copy(from sourcePath: WorkspacePath, to destinationPath: WorkspacePath, recursive: Bool) async throws
     /// Creates a symbolic link at `path` pointing to `target`.
     func createSymlink(path: WorkspacePath, target: String) async throws
-    /// Creates a hard link at `path` pointing to `target`.
+    /// Creates a hard link at `path` pointing to the entry at `target`.
+    /// Intermediate symlinks in `target` are followed. A final symlink is linked
+    /// itself, without dereferencing it, like `linkat` without `AT_SYMLINK_FOLLOW`.
+    /// A dangling final symlink can also be linked.
     func createHardLink(path: WorkspacePath, target: WorkspacePath) async throws
     /// Reads the target of the symbolic link at `path`.
     func readSymlink(path: WorkspacePath) async throws -> String
@@ -168,8 +221,57 @@ public protocol FileSystem: AnyObject, Sendable {
 
 /// A filesystem that can push invalidations when its contents change outside Workspace APIs.
 public protocol FileSystemChangeSource: FileSystem {
-    /// Emits after one or more entries may have changed. Consumers should re-read the affected tree.
-    func changes() async throws -> AsyncStream<Void>
+    /// Emits scoped invalidations using the `FileSystemChangeSignal` contract.
+    func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal>
+}
+
+/// Opt-in guarantee that the stream covers every visible child. A composite must
+/// re-evaluate this after topology changes and terminate a stream if coverage fails.
+package protocol CompleteFileSystemChangeSource: FileSystemChangeSource {
+    var changeSignalsAreComplete: Bool { get async }
+}
+
+extension FileSystem {
+    package var changeSignalsAreComplete: Bool {
+        get async { await (self as? any CompleteFileSystemChangeSource)?.changeSignalsAreComplete ?? false }
+    }
+}
+
+#if os(macOS) || os(Linux)
+extension LocalFileSystem: CompleteFileSystemChangeSource {
+    package var changeSignalsAreComplete: Bool { true }
+}
+#endif
+
+/// Invalidates paths in the change source's own filesystem namespace.
+/// Include deleted or replaced ancestors so their former descendants are checked.
+/// Use `.rescan` when paths are unknown, events were dropped, or coverage is uncertain.
+public enum FileSystemChangeSignal: Sendable, Equatable {
+    /// Invalidates the entire tree, including entries that no longer exist.
+    case rescan
+    /// Invalidates each path at its specified scope. Coalescing retains the strongest
+    /// scope for a path; a shallow ancestor does not subsume descendant signals.
+    case paths([WorkspacePath: Scope])
+
+    public enum Scope: Int, Sendable, Comparable {
+        /// Only this entry's contents or metadata changed. A removed or replaced
+        /// directory also invalidates its former descendants.
+        case entry
+        /// This entry and its immediate directory listing may have changed. Existing
+        /// child directories are not traversed; added or replaced subtrees are captured.
+        case shallow
+        /// Everything beneath this path is unknown, including former descendants.
+        /// Use for directory creation, removal or rename, and incomplete subtree coverage.
+        case recursive
+
+        public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+    }
+}
+
+/// Resolves links in the backend's namespace without requiring the target to exist.
+/// Missing parent suffixes are retained for quota preflight without creating them.
+package protocol PotentialPathResolvingFileSystem: FileSystem {
+    func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath
 }
 
 extension FileSystem {
@@ -257,4 +359,41 @@ extension FileSystem {
     }
 }
 
-typealias FileSystemCapabilities = FileSystemFeatures
+/// Backend differences relevant to copy-on-write edit previews.
+package struct FileSystemPreviewSemantics: Sendable {
+    package var preservesOverwritePermissions: Bool
+    package var followsDirectorySymlinks: Bool
+    package var followsPermissionSymlinks: Bool
+    package var createsWriteParents: Bool
+
+    package init(preservesOverwritePermissions: Bool = false, followsDirectorySymlinks: Bool = false,
+                followsPermissionSymlinks: Bool = false, createsWriteParents: Bool = false) {
+        self.preservesOverwritePermissions = preservesOverwritePermissions
+        self.followsDirectorySymlinks = followsDirectorySymlinks
+        self.followsPermissionSymlinks = followsPermissionSymlinks
+        self.createsWriteParents = createsWriteParents
+    }
+}
+
+package protocol PreviewSemanticsFileSystem: FileSystem {
+    func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics
+}
+
+extension FileSystem {
+    package func previewBehavior(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        if let source = self as? any PreviewSemanticsFileSystem { return await source.previewSemantics(at: path) }
+        return .init()
+    }
+}
+
+/// Backends whose content changes always change mtime or identity, even within a clock tick.
+/// Wrappers may forward this only when preserving those metadata guarantees.
+package protocol ExactTimestampFileSystem: FileSystem {
+    var hasExactContentTimestamps: Bool { get async }
+}
+
+extension FileSystem {
+    package var supportsExactContentTimestamps: Bool {
+        get async { await (self as? any ExactTimestampFileSystem)?.hasExactContentTimestamps ?? false }
+    }
+}

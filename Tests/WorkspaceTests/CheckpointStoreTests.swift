@@ -4,6 +4,64 @@ import Testing
 
 @Suite("Checkpoint store")
 struct CheckpointStoreTests {
+    @Test(arguments: [false, true])
+    func `retraction never reuses an observed sequence`(diskBacked: Bool) async throws {
+        let root = try TestSupport.temporaryDirectory("SequenceRetraction")
+        defer { TestSupport.remove(root) }
+        let id = UUID()
+        var store: any CheckpointStore = diskBacked
+            ? FileCheckpointStore(rootDirectory: root) : InMemoryCheckpointStore()
+        let first = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/a"))
+        let retracted = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/b"))
+        try await store.removeMutation(sequence: retracted.sequence, workspaceId: id)
+        if diskBacked { store = FileCheckpointStore(rootDirectory: root) }
+        let afterRetraction = try await store.captureRevision(from: InMemoryFileSystem(), draft: Self.sampleDraft(workspaceID: id))
+        #expect(afterRetraction.mutationCursor == 2)
+        let next = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/c"))
+        let assigned: [Int] = [first.sequence, retracted.sequence, next.sequence]
+        #expect(assigned == [1, 2, 3])
+        #expect(try await store.listMutations(workspaceId: id).map(\.sequence) == [1, 3])
+        try await store.removeMutation(sequence: first.sequence, workspaceId: id)
+        try await store.removeMutation(sequence: next.sequence, workspaceId: id)
+        if diskBacked { store = FileCheckpointStore(rootDirectory: root) }
+        let emptyCheckpoint = try await store.saveRevision(Self.sampleSnapshot(), draft: Self.sampleDraft(workspaceID: id))
+        #expect(emptyCheckpoint.mutationCursor == 3)
+        let emptyCapture = try await store.captureRevision(from: InMemoryFileSystem(), draft: Self.sampleDraft(workspaceID: id))
+        #expect(emptyCapture.mutationCursor == 3)
+        let afterEmpty = try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/d"))
+        #expect(afterEmpty.sequence == 4)
+        let other = try await store.appendMutation(Self.sampleMutation(workspaceID: UUID(), path: "/a"))
+        #expect(other.sequence == 1)
+    }
+
+    @Test
+    func `reserved torn appends preserve the cursor`() async throws {
+        let root = try TestSupport.temporaryDirectory("SequenceSidecar")
+        defer { TestSupport.remove(root) }
+        let id = UUID()
+        let store = FileCheckpointStore(rootDirectory: root)
+        try await store.appendMutation(Self.sampleMutation(workspaceID: id, path: "/a"))
+        let directory = root.appendingPathComponent(id.uuidString)
+        let sidecar = directory.appendingPathComponent("mutations.sequence.json")
+        // Simulate a reserved sequence whose append failed mid-UTF8.
+        let state = #"{"highWaterMark":7,"retractionEpoch":3}"#
+        try Data(state.utf8).write(to: sidecar)
+        let log = directory.appendingPathComponent("mutations.jsonl")
+        let handle = try FileHandle(forWritingTo: log)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data([0x7B, 0x22, 0xE2, 0x82]))
+        try handle.close()
+        let checkpoint = try await store.captureRevision(from: InMemoryFileSystem(), draft: Self.sampleDraft(workspaceID: id))
+        #expect(checkpoint.mutationCursor == 7)
+        #expect(try Data(contentsOf: log).last == UInt8(ascii: "\n"))
+        try await store.removeMutation(sequence: 1, workspaceId: id)
+        let page = try await store.listMutations(workspaceId: id, afterSequence: 0)
+        #expect(page.records.isEmpty)
+        #expect(page.retractionEpoch == 4)
+        let next = try await FileCheckpointStore(rootDirectory: root).appendMutation(Self.sampleMutation(workspaceID: id, path: "/next"))
+        #expect(next.sequence == 8)
+    }
+
     @Test
     func `in-memory store isolates workspaces and assigns mutation sequences`() async throws {
         let store = InMemoryCheckpointStore()
@@ -101,24 +159,127 @@ struct CheckpointStoreTests {
         }
 
         try await store.pruneMutations(workspaceId: workspaceID, throughSequence: 100)
-        #expect(try await store.listMutations(workspaceId: workspaceID).map(\.sequence) == [5])
+        #expect(try await store.listMutations(workspaceId: workspaceID).isEmpty)
         let next = try await store.appendMutation(Self.sampleMutation(workspaceID: workspaceID, path: "/next"))
         #expect(next.sequence == 6)
     }
 
     @Test
-    func `unsupported store versions are rejected`() async throws {
-        let root = try TestSupport.temporaryDirectory("StoreVersion")
+    func `incremental mutation reads cross byte chunks and tolerate only a torn tail`() async throws {
+        let root = try TestSupport.temporaryDirectory("StoreIncremental")
+        defer { TestSupport.remove(root) }
+        let workspaceID = UUID()
+        let store = FileCheckpointStore(rootDirectory: root)
+        for index in 1...5 {
+            // A record longer than the backward-read chunk, with multibyte characters spanning
+            // chunk boundaries. No filesystem entry is created for this recorded path.
+            let path = index == 3 ? "/" + String(repeating: "🎉", count: 20000) : "/\(index)"
+            _ = try await store.appendMutation(Self.sampleMutation(workspaceID: workspaceID, path: WorkspacePath(normalizing: path)))
+        }
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 1).records.map(\.sequence) == [2, 3, 4, 5])
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 3).records.map(\.sequence) == [4, 5])
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 5).records.isEmpty)
+
+        let log = root.appendingPathComponent(workspaceID.uuidString).appendingPathComponent("mutations.jsonl")
+        let handle = try FileHandle(forWritingTo: log)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data([0x7B, 0x22, 0xE2, 0x82]))
+        try handle.close()
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 1).records.map(\.sequence) == [2, 3, 4, 5])
+        let next = try await store.appendMutation(Self.sampleMutation(workspaceID: workspaceID, path: "/6"))
+        #expect(next.sequence == 6)
+        try await store.pruneMutations(workspaceId: workspaceID, throughSequence: 5)
+        #expect(try await store.listMutations(workspaceId: workspaceID, afterSequence: 5).records.map(\.sequence) == [6])
+
+        let corrupt = try FileHandle(forWritingTo: log)
+        try corrupt.seekToEnd()
+        try corrupt.write(contentsOf: Data([0x7B, 0x22, 0xE2, 0x82, 0x0A]))
+        try corrupt.close()
+        await #expect(throws: DecodingError.self) {
+            _ = try await store.listMutations(workspaceId: workspaceID, afterSequence: 6)
+        }
+    }
+
+    @Test(arguments: ["empty directory", "temporary marker", "completed marker"])
+    func `interrupted first open leaves only recoverable staging`(crashPoint: String) async throws {
+        let root = try TestSupport.temporaryDirectory("StoreFirstOpen")
+        defer { TestSupport.remove(root) }
+        let id = UUID()
+        let staging = root.appendingPathComponent(".\(id.uuidString).pending", isDirectory: true)
+        let published = root.appendingPathComponent(id.uuidString, isDirectory: true)
+        // Another workspace may be initializing under its own lock.
+        let otherStaging = root.appendingPathComponent(".\(UUID().uuidString).pending", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherStaging, withIntermediateDirectories: false)
+        let interrupted = FileCheckpointStore(rootDirectory: root,
+            fileManager: FirstOpenCrashManager(staging: staging, crashPoint: crashPoint))
+        await #expect(throws: TestFileSystemError.self) { try await interrupted.prepare(workspaceId: id) }
+        #expect(!FileManager.default.fileExists(atPath: published.path))
+        #expect(FileManager.default.fileExists(atPath: staging.path))
+        if crashPoint == "completed marker" {
+            #expect(FileManager.default.fileExists(atPath: staging.appendingPathComponent("format.json").path))
+        }
+
+        let recovered = FileCheckpointStore(rootDirectory: root)
+        let snapshot = Self.sampleSnapshot()
+        let checkpoint = try await recovered.saveRevision(snapshot, draft: Self.sampleDraft(workspaceID: id))
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(FileManager.default.fileExists(atPath: otherStaging.path))
+        let reopened = FileCheckpointStore(rootDirectory: root)
+        #expect(try await reopened.loadSnapshot(id: checkpoint.snapshotId, workspaceId: id) == snapshot)
+    }
+
+    private final class FirstOpenCrashManager: FileManager, @unchecked Sendable {
+        let staging: URL
+        let crashPoint: String
+        init(staging: URL, crashPoint: String) {
+            self.staging = staging
+            self.crashPoint = crashPoint
+            super.init()
+        }
+        override func createDirectory(at url: URL, withIntermediateDirectories createIntermediates: Bool,
+                                      attributes: [FileAttributeKey: Any]? = nil) throws {
+            try super.createDirectory(at: url, withIntermediateDirectories: createIntermediates, attributes: attributes)
+            if url == staging, crashPoint != "completed marker" {
+                if crashPoint == "temporary marker" {
+                    try Data("{partial".utf8).write(to: url.appendingPathComponent(".pending-\(UUID().uuidString)-format.json"))
+                }
+                throw TestFileSystemError.injected
+            }
+        }
+        override func moveItem(at source: URL, to destination: URL) throws {
+            if source == staging { throw TestFileSystemError.injected }
+            try super.moveItem(at: source, to: destination)
+        }
+    }
+
+    @Test(arguments: [nil, "{}", "not JSON", #"{"version":1}"#,
+                      #"{"format":"other","version":1}"#,
+                      #"{"format":"workspace-history","version":0}"#,
+                      #"{"format":"workspace-history","version":2}"#] as [String?])
+    func `invalid store markers require deleting the history directory`(marker: String?) async throws {
+        let root = try TestSupport.temporaryDirectory("StoreFormat")
         defer { TestSupport.remove(root) }
         let workspaceID = UUID()
         let directory = root.appendingPathComponent(workspaceID.uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try Data("{\"version\":999}".utf8).write(to: directory.appendingPathComponent("format.json"))
+        let format = directory.appendingPathComponent("format.json")
+        if let marker { try Data(marker.utf8).write(to: format) }
 
         let store = FileCheckpointStore(rootDirectory: root)
-        await #expect(throws: WorkspaceError.self) {
-            _ = try await store.listMutations(workspaceId: workspaceID)
+        // Neither opening for writes nor reading may silently initialize an existing directory.
+        for writing in [false, true] {
+            do {
+                if writing { try await store.prepare(workspaceId: workspaceID) }
+                else { _ = try await store.listMutations(workspaceId: workspaceID) }
+                Issue.record("invalid store marker was accepted")
+            } catch let error as WorkspaceError {
+                guard case let .storageCorrupted(message) = error else { throw error }
+                #expect(message.contains("delete the history directory"))
+                #expect(message.contains(directory.path))
+            }
         }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == (marker == nil ? [] : ["format.json"]))
+        if let marker { #expect(try String(contentsOf: format, encoding: .utf8) == marker) }
     }
 
     private static func sampleSnapshot() -> Snapshot {
@@ -139,8 +300,7 @@ struct CheckpointStoreTests {
             workspaceID: workspaceID,
             label: "test",
             preferredParentID: nil,
-            origin: .manual,
-            mutationCursor: 0
+            origin: .manual
         )
     }
 

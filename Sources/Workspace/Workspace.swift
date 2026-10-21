@@ -8,13 +8,36 @@ public actor Workspace {
         case directory(URL)
     }
 
-    /// Controls mutation-history detail without affecting explicit previews or diffs.
+    /// Controls content verification for transactions, checkpoint comparisons/restores, and directory checkpoint capture.
+    public enum CheckpointCapturePolicy: Sendable, Equatable {
+        /// Reuse matching size and mtime when mtime is over two seconds older than the prior
+        /// capture, comparing identity when both entries provide it. Device-only changes with
+        /// equal inodes are treated as unknown identity. Exact-timestamp backends
+        /// skip the racy window. Missing mtimes always require reading contents.
+        case trustMetadata
+        /// Read and verify every file, including changes that preserve older timestamps.
+        case verifyContents
+    }
+
+    /// Controls only the detail stored in mutation history. Returned edit results,
+    /// events, explicit previews, and diffs are independent of this policy and use
+    /// `DiffOptions.default` unless the API accepts explicit diff options.
     public enum RecordingPolicy: Sendable, Equatable {
         case full(maxTextBytes: Int?)
         case changesOnly
         case off
 
         public static let `default` = RecordingPolicy.full(maxTextBytes: 1_000_000)
+    }
+
+    /// Bounds the old-content cache used for external-change text diffs.
+    public struct ObservationPolicy: Sendable, Equatable {
+        public let contentCacheBytes: Int
+        /// Zero disables content caching. Negative budgets are treated as zero.
+        public init(contentCacheBytes: Int = 32 * 1024 * 1024) {
+            self.contentCacheBytes = max(0, contentCacheBytes)
+        }
+        public static let `default` = ObservationPolicy()
     }
 
     struct EventWatcher {
@@ -32,32 +55,58 @@ public actor Workspace {
     public nonisolated var fileSystem: any FileSystem { filesystem }
     public nonisolated let recording: RecordingPolicy
     let store: any CheckpointStore
+    let checkpointCapture: CheckpointCapturePolicy
+
+    // Actor isolation alone does not span suspension points. Ownership is handed
+    // directly to the next waiter, preventing newcomers from overtaking the queue.
+    var operationInProgress = false
+    var operationWaiters: [CheckedContinuation<Void, Never>] = []
 
     var loadTask: Task<Void, Error>?
     var didLoadStoreState = false
+    var didPrepareStore = false
     var checkpoints: [Checkpoint] = []
     var mutations: [Mutation] = []
+    var historyRefreshSequence = 0
+    var historyRetractionEpoch = 0
+    var deliveredCheckpointEventIDs: Set<UUID> = []
     var headCheckpointId: UUID?
     var eventWatchers: [UUID: EventWatcher] = [:]
     var checkpointObservationTask: Task<Void, Never>?
     var filesystemObservationTask: Task<Void, Never>?
-    var observedFilesystemSnapshot: Snapshot?
+    var observedFilesystem: FilesystemObservation?
+    var pendingFilesystemSignal: FileSystemChangeSignal?
+    var filesystemRefreshTask: Task<Void, Never>?
+    var filesystemRetryMilliseconds = 40
+    var filesystemRefreshFailures = 0
+    public nonisolated let observation: ObservationPolicy
+    var hasBegunTransaction = false
+    var transactionBase: TransactionTree?
+    var transactionMetadata: MetadataIndex?
+    weak var coldTransactionBase: ColdTransactionBase?
+    var transactionRoots: Set<WorkspacePath>?
+    let usesMemoryPersistence: Bool
 
-    /// Creates a workspace over a filesystem.
+    /// Creates a workspace over a filesystem with independent history and capture policies.
     public init(
         workspaceID: UUID = UUID(),
         fileSystem: any FileSystem = InMemoryFileSystem(),
         persistence: Persistence = .memory,
-        recording: RecordingPolicy = .default
+        recording: RecordingPolicy = .default,
+        checkpointCapture: CheckpointCapturePolicy = .trustMetadata,
+        observation: ObservationPolicy = .default
     ) {
+        if case .memory = persistence { usesMemoryPersistence = true } else { usesMemoryPersistence = false }
         self.workspaceId = workspaceID
         self.filesystem = fileSystem
         self.recording = recording
+        self.checkpointCapture = checkpointCapture
+        self.observation = observation
         self.store = switch persistence {
         case .memory:
             InMemoryCheckpointStore()
         case let .directory(url):
-            FileCheckpointStore(rootDirectory: url)
+            FileCheckpointStore(rootDirectory: url, checkpointCapture: checkpointCapture)
         }
     }
 
@@ -78,11 +127,14 @@ public actor Workspace {
         offset: UInt64,
         length: Int? = nil
     ) async throws -> Data {
+        if let length, length < 0 {
+            throw WorkspaceError.unsupported("read length must not be negative")
+        }
         switch revision {
         case .current:
-            try await filesystem.readFile(path: path, offset: offset, length: length)
+            return try await filesystem.readFile(path: path, offset: offset, length: length)
         case .checkpoint:
-            try await revisionData(at: path, revision: revision, offset: offset, length: length)
+            return try await revisionData(at: path, revision: revision, offset: offset, length: length)
         }
     }
 

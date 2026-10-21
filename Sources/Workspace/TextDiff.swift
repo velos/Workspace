@@ -91,8 +91,8 @@ public struct TextDiff: Sendable, Equatable, Codable {
         Statistics(
             originalLineCount: originalLineCount,
             updatedLineCount: updatedLineCount,
-            additions: hunks.flatMap(\.lines).count { $0.kind == .added },
-            deletions: hunks.flatMap(\.lines).count { $0.kind == .removed }
+            additions: hunks.reduce(0) { $0 + $1.lines.count { $0.kind == .added } },
+            deletions: hunks.reduce(0) { $0 + $1.lines.count { $0.kind == .removed } }
         )
     }
 
@@ -103,19 +103,41 @@ public struct TextDiff: Sendable, Equatable, Codable {
     }
 
     /// Builds a line diff with three context lines and UTF-16 intra-line ranges.
+    /// A bounded Myers search retains precise sparse edits even in large files.
+    /// When its work or edit-distance limit is reached, the unmatched interior
+    /// becomes a coarse replacement. Statistics then describe a nonminimal script.
     public static func lineBased(from originalContent: String, to updatedContent: String) -> TextDiff {
-        let originalLines = diffLineTokens(in: originalContent)
-        let updatedLines = diffLineTokens(in: updatedContent)
-        let changes = Array(updatedLines.difference(from: originalLines))
+        var work = Work()
+        return lineBased(from: originalContent, to: updatedContent, work: &work)
+    }
 
-        let removals = Dictionary(grouping: changes.compactMap { change -> (Int, DiffLineToken)? in
-            guard case let .remove(offset, element, _) = change else { return nil }
-            return (offset, element)
-        }, by: \.0)
-        let insertions = Dictionary(grouping: changes.compactMap { change -> (Int, DiffLineToken)? in
-            guard case let .insert(offset, element, _) = change else { return nil }
-            return (offset, element)
-        }, by: \.0)
+    /// Internal diagnostics keep work limits observable without changing the diff's
+    /// public representation, equality, or encoding.
+    struct SearchWork {
+        var steps = 0
+        var editDistance = 0
+        var usedTrivialCase = false
+        var usedCoarseFallback = false
+    }
+
+    struct Work {
+        var lines = SearchWork()
+        var intralineSearches = 0
+        var maximumIntralineSteps = 0
+        var intralineFallbacks = 0
+    }
+
+    static let maximumSearchSteps = 1_000_000
+    static let maximumEditDistance = 1_000
+
+    static func lineBased(from originalContent: String, to updatedContent: String, work: inout Work) -> TextDiff {
+        let originalLines = diffLineTokens(in: originalContent)
+        if originalContent == updatedContent {
+            work.lines.usedTrivialCase = true
+            return TextDiff(originalLineCount: originalLines.count, updatedLineCount: originalLines.count, hunks: [])
+        }
+        let updatedLines = diffLineTokens(in: updatedContent)
+        let (removals, insertions) = boundedDifferenceOffsets(from: originalLines, to: updatedLines, work: &work.lines)
 
         var lines: [Line] = []
         var originalIndex = 0
@@ -124,34 +146,20 @@ public struct TextDiff: Sendable, Equatable, Codable {
         var updatedLineNumber = 1
 
         while originalIndex < originalLines.count || updatedIndex < updatedLines.count {
-            if let removed = removals[originalIndex] {
-                for (_, token) in removed {
-                    lines.append(
-                        Line(
-                            kind: .removed,
-                            text: token.text,
-                            hasTrailingNewline: token.hasTrailingNewline,
-                            oldLineNumber: originalLineNumber
-                        )
-                    )
-                    originalIndex += 1
-                    originalLineNumber += 1
-                }
+            if removals.contains(originalIndex) {
+                let token = originalLines[originalIndex]
+                lines.append(Line(kind: .removed, text: token.text, hasTrailingNewline: token.hasTrailingNewline,
+                                  oldLineNumber: originalLineNumber))
+                originalIndex += 1
+                originalLineNumber += 1
                 continue
             }
-            if let inserted = insertions[updatedIndex] {
-                for (_, token) in inserted {
-                    lines.append(
-                        Line(
-                            kind: .added,
-                            text: token.text,
-                            hasTrailingNewline: token.hasTrailingNewline,
-                            newLineNumber: updatedLineNumber
-                        )
-                    )
-                    updatedIndex += 1
-                    updatedLineNumber += 1
-                }
+            if insertions.contains(updatedIndex) {
+                let token = updatedLines[updatedIndex]
+                lines.append(Line(kind: .added, text: token.text, hasTrailingNewline: token.hasTrailingNewline,
+                                  newLineNumber: updatedLineNumber))
+                updatedIndex += 1
+                updatedLineNumber += 1
                 continue
             }
             guard originalIndex < originalLines.count, updatedIndex < updatedLines.count else { break }
@@ -171,7 +179,7 @@ public struct TextDiff: Sendable, Equatable, Codable {
             updatedLineNumber += 1
         }
 
-        applyIntralineRanges(to: &lines)
+        applyIntralineRanges(to: &lines, work: &work)
         let changedIndices = lines.indices.filter { lines[$0].kind != .context }
         guard !changedIndices.isEmpty else {
             return TextDiff(originalLineCount: originalLines.count, updatedLineCount: updatedLines.count, hunks: [])
@@ -216,22 +224,24 @@ private struct DiffLineToken: Hashable {
 private func diffLineTokens(in text: String) -> [DiffLineToken] {
     guard !text.isEmpty else { return [] }
     var tokens: [DiffLineToken] = []
-    var current = ""
-    for character in text {
-        if character == "\n" {
-            tokens.append(DiffLineToken(text: current, hasTrailingNewline: true))
-            current.removeAll(keepingCapacity: true)
-        } else {
-            current.append(character)
+    // CRLF is one Swift Character. Split UTF-8 code units so LF alone is the delimiter,
+    // preserving CR in the line's content and distinguishing a terminated final line.
+    var contiguous = text
+    contiguous.makeContiguousUTF8()
+    contiguous.withUTF8 { bytes in
+        var start = 0
+        for index in bytes.indices where bytes[index] == 0x0A {
+            tokens.append(DiffLineToken(text: String(decoding: bytes[start..<index], as: UTF8.self), hasTrailingNewline: true))
+            start = index + 1
         }
-    }
-    if !current.isEmpty || text.last != "\n" {
-        tokens.append(DiffLineToken(text: current, hasTrailingNewline: false))
+        if start != bytes.count {
+            tokens.append(DiffLineToken(text: String(decoding: bytes[start...], as: UTF8.self), hasTrailingNewline: false))
+        }
     }
     return tokens
 }
 
-private func applyIntralineRanges(to lines: inout [TextDiff.Line]) {
+private func applyIntralineRanges(to lines: inout [TextDiff.Line], work: inout TextDiff.Work) {
     var index = 0
     while index < lines.count {
         guard lines[index].kind != .context else {
@@ -245,7 +255,11 @@ private func applyIntralineRanges(to lines: inout [TextDiff.Line]) {
         for pairIndex in 0..<min(removed.count, added.count) {
             let oldIndex = removed[pairIndex]
             let newIndex = added[pairIndex]
-            let ranges = characterDifferenceRanges(from: lines[oldIndex].text, to: lines[newIndex].text)
+            var pairWork = TextDiff.SearchWork()
+            let ranges = characterDifferenceRanges(from: lines[oldIndex].text, to: lines[newIndex].text, work: &pairWork)
+            work.intralineSearches += 1
+            work.maximumIntralineSteps = max(work.maximumIntralineSteps, pairWork.steps)
+            work.intralineFallbacks += pairWork.usedCoarseFallback ? 1 : 0
             lines[oldIndex].intralineRanges = ranges.old
             lines[newIndex].intralineRanges = ranges.new
         }
@@ -254,22 +268,16 @@ private func applyIntralineRanges(to lines: inout [TextDiff.Line]) {
 
 private func characterDifferenceRanges(
     from original: String,
-    to updated: String
+    to updated: String,
+    work: inout TextDiff.SearchWork
 ) -> (old: [TextDiff.IntralineRange], new: [TextDiff.IntralineRange]) {
     let oldCharacters = Array(original)
     let newCharacters = Array(updated)
-    let difference = newCharacters.difference(from: oldCharacters)
-    let removed = difference.compactMap { change -> Int? in
-        guard case let .remove(offset, _, _) = change else { return nil }
-        return offset
-    }
-    let inserted = difference.compactMap { change -> Int? in
-        guard case let .insert(offset, _, _) = change else { return nil }
-        return offset
-    }
+    let (removed, inserted) = boundedDifferenceOffsets(from: oldCharacters, to: newCharacters, work: &work)
+
     return (
-        collapsedUTF16Ranges(characterOffsets: removed, in: original),
-        collapsedUTF16Ranges(characterOffsets: inserted, in: updated)
+        collapsedUTF16Ranges(characterOffsets: Array(removed), in: original),
+        collapsedUTF16Ranges(characterOffsets: Array(inserted), in: updated)
     )
 }
 
@@ -285,12 +293,103 @@ private func collapsedUTF16Ranges(characterOffsets: [Int], in text: String) -> [
             characterRanges.append(offset..<(offset + 1))
         }
     }
+    var utf16Offsets = [0]
+    for character in characters { utf16Offsets.append(utf16Offsets.last! + character.utf16.count) }
     return characterRanges.map { range in
-        let prefix = String(characters[..<range.lowerBound])
-        let fragment = String(characters[range])
-        return TextDiff.IntralineRange(
-            location: prefix.utf16.count,
-            length: fragment.utf16.count
-        )
+        TextDiff.IntralineRange(location: utf16Offsets[range.lowerBound],
+                               length: utf16Offsets[range.upperBound] - utf16Offsets[range.lowerBound])
     }
+}
+
+/// A Myers forward search with a fixed edit-distance and visited-step budget.
+/// Trace layers contain only their active diagonals, bounding trace storage by D²
+/// (at most 1,002,001 slots), independently of input size. Prefix/suffix scans and
+/// empty-side scripts are linear and do not enter the edit search.
+private func boundedDifferenceOffsets<Element: Equatable>(
+    from old: [Element], to new: [Element], work: inout TextDiff.SearchWork
+) -> (removed: Set<Int>, inserted: Set<Int>) {
+    var prefix = 0
+    while prefix < min(old.count, new.count), old[prefix] == new[prefix] { prefix += 1 }
+    var oldEnd = old.count
+    var newEnd = new.count
+    while oldEnd > prefix, newEnd > prefix, old[oldEnd - 1] == new[newEnd - 1] {
+        oldEnd -= 1
+        newEnd -= 1
+    }
+    let oldCount = oldEnd - prefix
+    let newCount = newEnd - prefix
+    func replacement() -> (Set<Int>, Set<Int>) { (Set(prefix..<oldEnd), Set(prefix..<newEnd)) }
+    guard oldCount > 0, newCount > 0 else {
+        work.usedTrivialCase = true
+        return replacement()
+    }
+    // Length imbalance is a lower bound on D, so no search can fit this limit.
+    guard abs(oldCount - newCount) <= TextDiff.maximumEditDistance else {
+        work.usedCoarseFallback = true
+        return replacement()
+    }
+
+    var trace: [[Int]] = []
+    for depth in 0...min(oldCount + newCount, TextDiff.maximumEditDistance) {
+        let previous = trace.last ?? []
+        var frontier = Array(repeating: 0, count: depth * 2 + 1)
+        for diagonal in stride(from: -depth, through: depth, by: 2) {
+            guard work.steps < TextDiff.maximumSearchSteps else {
+                work.usedCoarseFallback = true
+                return replacement()
+            }
+            work.steps += 1
+            var x: Int
+            if depth == 0 {
+                x = 0
+            } else if diagonal == -depth || (diagonal != depth &&
+                previous[diagonal - 1 + depth - 1] < previous[diagonal + 1 + depth - 1]) {
+                x = previous[diagonal + 1 + depth - 1]
+            } else {
+                x = previous[diagonal - 1 + depth - 1] + 1
+            }
+            var y = x - diagonal
+            while x < oldCount, y < newCount {
+                guard work.steps < TextDiff.maximumSearchSteps else {
+                    work.usedCoarseFallback = true
+                    return replacement()
+                }
+                work.steps += 1
+                guard old[prefix + x] == new[prefix + y] else { break }
+                x += 1
+                y += 1
+            }
+            frontier[diagonal + depth] = x
+            if x >= oldCount, y >= newCount {
+                work.editDistance = depth
+                var removed: Set<Int> = []
+                var inserted: Set<Int> = []
+                // Recover the chosen shortest script through earlier frontiers.
+                for d in stride(from: depth, through: 1, by: -1) {
+                    let previous = trace[d - 1]
+                    let k = x - y
+                    let previousK: Int
+                    if k == -d || (k != d && previous[k - 1 + d - 1] < previous[k + 1 + d - 1]) {
+                        previousK = k + 1
+                    } else {
+                        previousK = k - 1
+                    }
+                    let previousX = previous[previousK + d - 1]
+                    let previousY = previousX - previousK
+                    while x > previousX, y > previousY { x -= 1; y -= 1 }
+                    if x == previousX {
+                        y -= 1
+                        inserted.insert(prefix + y)
+                    } else {
+                        x -= 1
+                        removed.insert(prefix + x)
+                    }
+                }
+                return (removed, inserted)
+            }
+        }
+        trace.append(frontier)
+    }
+    work.usedCoarseFallback = true
+    return replacement()
 }

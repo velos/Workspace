@@ -1,7 +1,7 @@
 import Foundation
 
 /// A disk-backed filesystem rooted in a standard app sandbox location.
-public final class SandboxFileSystem: FileSystem, Sendable {
+public final class SandboxFileSystem: FileSystem, TraversingFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, Sendable {
     /// Supported strategies for choosing the sandbox root.
     public enum Root: Sendable {
         /// The user's documents directory.
@@ -23,6 +23,12 @@ public final class SandboxFileSystem: FileSystem, Sendable {
         backing = LocalFileSystem(fileManager: fileManager)
         let resolvedRoot = try Self.resolveRootURL(root, fileManager: fileManager)
         try backing.applyConfiguration(rootDirectory: resolvedRoot)
+    }
+
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
+                      visit: FileSystemWalkVisitor) async throws {
+        try await backing.walk(at: path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+            skippingVanishedEntries: skippingVanishedEntries, visit: visit)
     }
 
     /// See ``FileSystem/stat(path:)``.
@@ -58,9 +64,17 @@ public final class SandboxFileSystem: FileSystem, Sendable {
         try await backing.createFile(path: path, data: data)
     }
 
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        await backing.previewBehavior(at: path)
+    }
+
     /// See ``FileSystem/capabilities()``.
     public func capabilities() async -> FileSystemFeatures {
         await backing.capabilities()
+    }
+
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        try await backing.resolvePotentialPath(path: path)
     }
 
     /// See ``FileSystem/writeFile(path:data:append:)``.
@@ -157,4 +171,12 @@ public final class SandboxFileSystem: FileSystem, Sendable {
     }
 }
 
-typealias SandboxFilesystem = SandboxFileSystem
+extension SandboxFileSystem: CompleteFileSystemChangeSource {
+    package var changeSignalsAreComplete: Bool { get async { await (backing as any FileSystem).changeSignalsAreComplete } }
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        guard let source = (backing as any FileSystem) as? any FileSystemChangeSource else {
+            throw WorkspaceError.unsupported("filesystem change notifications are not supported")
+        }
+        return try await source.changeSignals()
+    }
+}

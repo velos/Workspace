@@ -10,7 +10,7 @@ import Glibc
 ///
 /// Each mount is exposed at a virtual path, allowing callers to present a single workspace assembled
 /// from multiple independent roots.
-public final class MountedFileSystem: FileSystem, @unchecked Sendable {
+public final class MountedFileSystem: FileSystem, TraversingFileSystem, PreviewSemanticsFileSystem, PotentialPathResolvingFileSystem, @unchecked Sendable {
     /// A mounted filesystem and the virtual path where it appears.
     public struct Mount: Sendable {
         /// The normalized virtual mount point.
@@ -37,6 +37,9 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
     private let base: any FileSystem
     private let stateLock = NSLock()
     private var mounts: [Mount]
+    private var mountObservers: [UUID: AsyncStream<[Mount]>.Continuation] = [:]
+    private let syntheticDevice = UInt64.random(in: 1...UInt64.max)
+    private var syntheticInodes: [WorkspacePath: UInt64] = [:]
 
     private func withLock<R>(_ body: () throws -> R) rethrows -> R {
         stateLock.lock()
@@ -54,7 +57,7 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
         mounts: [Mount] = []
     ) {
         self.base = base
-        self.mounts = mounts.sorted { $0.mountPoint.string.count > $1.mountPoint.string.count }
+        self.mounts = mounts.sorted { $0.mountPoint.components.count > $1.mountPoint.components.count }
     }
 
     /// Adds a filesystem mount at `mountPoint`.
@@ -62,7 +65,8 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
         withLock {
             let mount = Mount(mountPoint: mountPoint, fileSystem: fileSystem)
             mounts.append(mount)
-            mounts.sort { $0.mountPoint.string.count > $1.mountPoint.string.count }
+            mounts.sort { $0.mountPoint.components.count > $1.mountPoint.components.count }
+            for observer in mountObservers.values { observer.yield(mounts) }
         }
     }
 
@@ -75,75 +79,112 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
         mount(WorkspacePath(normalizing: mountPoint), fileSystem: filesystem)
     }
 
+    package var supportsScopedWalk: Bool {
+        base.supportsScopedWalk || mountsSnapshot().contains { $0.fileSystem.supportsScopedWalk }
+    }
+
+    nonisolated(nonsending) package func walk(at path: WorkspacePath, skippingUnreadableDirectories: Bool, skippingVanishedEntries: Bool = false,
+                                            visit: FileSystemWalkVisitor) async throws {
+        let mounts = mountsSnapshot()
+        // An entire subtree in one backend can use its descriptor-scoped walk.
+        // At mount junctions, virtual listings retain shadowing and synthetic parents.
+        if !mounts.contains(where: { $0.mountPoint != path && $0.mountPoint.isWithin(path) }) {
+            let resolved = resolveWritable(path: path, mounts: mounts)
+            var visited = false
+            do {
+                try await resolved.filesystem.walk(at: resolved.relativePath,
+                    skippingUnreadableDirectories: skippingUnreadableDirectories,
+                        skippingVanishedEntries: skippingVanishedEntries) { info, read, readLink in
+                    visited = true
+                    let virtual = resolved.mountPoint.appending(info.path.components.joined(separator: "/"))
+                    try await withoutActuallyEscaping(read) { scopedRead in
+                        try await withoutActuallyEscaping(readLink) { scopedLink in
+                            try await visit(Self.virtualInfo(info, at: virtual),
+                                            { try await scopedRead($0) }, { try await scopedLink() })
+                        }
+                    }
+                }
+            } catch {
+                // A backend root may be a skippable child in our virtual namespace.
+                guard !visited, resolved.relativePath.isRoot, skippingUnreadableDirectories,
+                      isSkippableWalkError(error, at: path) else { throw error }
+                try await walkUsingPaths(at: path, skippingUnreadableDirectories: true,
+                    skippingVanishedEntries: skippingVanishedEntries, visit: visit)
+            }
+            return
+        }
+        guard let info = try await Snapshot.infoIfPresent(at: path, on: self) else { return }
+        if info.kind == .directory {
+            let listing: [DirectoryEntry]
+            do { listing = try await listDirectory(path: path) }
+            catch {
+                guard skippingUnreadableDirectories, isSkippableWalkError(error, at: path) else { throw error }
+                try await visit(info, { _ in throw WorkspaceError.unsupported("cannot read a directory") },
+                                { throw WorkspaceError.unsupported("not a symlink") })
+                return
+            }
+            for child in listing.sorted(by: { PathName(walkSortKey($0)) < PathName(walkSortKey($1)) }) {
+                try await walk(at: child.info.path, skippingUnreadableDirectories: skippingUnreadableDirectories,
+                    skippingVanishedEntries: skippingVanishedEntries, visit: visit)
+            }
+        }
+        try await visit(info, { length in
+            try await self.readFile(path: path, offset: 0, length: length)
+        }, { try await self.readSymlink(path: path) })
+    }
+
     /// See ``FileSystem/stat(path:)``.
     public func stat(path: WorkspacePath) async throws -> FileInfo {
         let mounts = mountsSnapshot()
-        if let resolved = resolveMounted(path: path, mounts: mounts) {
-            var info = try await resolved.filesystem.stat(path: resolved.relativePath)
-            info.path = path
-            return info
-        }
-
-        if hasSyntheticDirectory(at: path, mounts: mounts) {
-            return FileInfo(
-                path: path,
-                kind: .directory,
-                size: 0,
-                permissions: .defaultDirectory,
-                modificationDate: nil
+        let resolved = resolveWritable(path: path, mounts: mounts)
+        do {
+            return Self.virtualInfo(
+                try await resolved.filesystem.stat(path: resolved.relativePath),
+                at: path
             )
+        } catch {
+            guard Self.isMissing(error),
+                  path.isRoot || !syntheticChildMountNames(under: path, mounts: mounts).isEmpty else { throw error }
+            return syntheticInfo(at: path)
         }
-
-        return try await base.stat(path: path)
     }
 
     /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         let mounts = mountsSnapshot()
-        if let resolved = resolveMounted(path: path, mounts: mounts) {
-            let entries = try await resolved.filesystem.listDirectory(path: resolved.relativePath)
-            return entries.map { entry in
-                DirectoryEntry(
+        let syntheticNames = syntheticChildMountNames(under: path, mounts: mounts)
+        let resolved = resolveWritable(path: path, mounts: mounts)
+        var merged: [PathName: DirectoryEntry] = [:]
+        do {
+            for entry in try await resolved.filesystem.listDirectory(path: resolved.relativePath) {
+                merged[PathName(entry.name)] = DirectoryEntry(
                     name: entry.name,
-                    info: FileInfo(
-                        path: path.appending(entry.name),
-                        kind: entry.info.kind,
-                        size: entry.info.size,
-                        permissions: entry.info.permissions,
-                        modificationDate: entry.info.modificationDate
-                    )
+                    info: Self.virtualInfo(entry.info, at: path.appending(entry.name))
                 )
             }
-        }
-
-        var merged: [String: DirectoryEntry] = [:]
-        let baseHasPath = path.isRoot ? true : await base.exists(path: path)
-        if baseHasPath {
-            if let baseEntries = try? await base.listDirectory(path: path) {
-                for entry in baseEntries {
-                    merged[entry.name] = entry
-                }
+        } catch {
+            let nsError = error as NSError
+            guard Self.isMissing(error)
+                    || (nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(ENOTDIR)) else { throw error }
+            guard path.isRoot || !syntheticNames.isEmpty else { throw error }
+            let listingError = error
+            var missing = false
+            do {
+                _ = try await resolved.filesystem.stat(path: resolved.relativePath)
+            } catch {
+                guard Self.isMissing(error) else { throw listingError }
+                missing = true
             }
+            guard missing else { throw listingError }
         }
 
-        for syntheticName in syntheticChildMountNames(under: path, mounts: mounts) {
-            merged[syntheticName] = DirectoryEntry(
-                name: syntheticName,
-                info: FileInfo(
-                    path: path.appending(syntheticName),
-                    kind: .directory,
-                    size: 0,
-                    permissions: .defaultDirectory,
-                    modificationDate: nil
-                )
-            )
+        for name in syntheticNames {
+            let child = path.appending(name)
+            // Actual mounts shadow entries. Synthetic ancestors use backend metadata if
+            // present, keeping traversal consistent with stat (including regular files).
+            merged[PathName(name)] = DirectoryEntry(name: name, info: try await stat(path: child))
         }
-
-        if merged.isEmpty, !hasSyntheticDirectory(at: path, mounts: mounts) {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
-        }
-
-        return merged.values.sorted { $0.name < $1.name }
+        return merged.values.sorted { PathName($0.name) < PathName($1.name) }
     }
 
     /// See ``FileSystem/readFile(path:)``.
@@ -184,6 +225,11 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
     public func createFile(path: WorkspacePath, data: Data) async throws {
         let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
         try await resolved.filesystem.createFile(path: resolved.relativePath, data: data)
+    }
+
+    package func previewSemantics(at path: WorkspacePath) async -> FileSystemPreviewSemantics {
+        let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
+        return await resolved.filesystem.previewBehavior(at: resolved.relativePath)
     }
 
     /// See ``FileSystem/capabilities()``. Reports the intersection of the base filesystem's and
@@ -294,19 +340,22 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
     public func resolveRealPath(path: WorkspacePath) async throws -> WorkspacePath {
         let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
         let real = try await resolved.filesystem.resolveRealPath(path: resolved.relativePath)
-        return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, String(real.string.dropFirst()))
+        return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, real.components.joined(separator: "/"))
+    }
+
+    // Used only when a symlink target or suffix is missing. Resolve inside the selected
+    // backend before translating back; raw absolute targets are never outer virtual paths.
+    package func resolvePotentialPath(path: WorkspacePath) async throws -> WorkspacePath {
+        let resolved = resolveWritable(path: path, mounts: mountsSnapshot())
+        let real = try await FileSystemPathResolver(base: resolved.filesystem).resolve(
+            resolved.relativePath, features: await resolved.filesystem.capabilities(), followFinal: true
+        )
+        return resolved.mountPoint.isRoot ? real : WorkspacePath.join(resolved.mountPoint, real.components.joined(separator: "/"))
     }
 
     /// See ``FileSystem/exists(path:)``.
     public func exists(path: WorkspacePath) async -> Bool {
-        let mounts = mountsSnapshot()
-        if let resolved = resolveMounted(path: path, mounts: mounts) {
-            return await resolved.filesystem.exists(path: resolved.relativePath)
-        }
-        if hasSyntheticDirectory(at: path, mounts: mounts) {
-            return true
-        }
-        return await base.exists(path: path)
+        (try? await stat(path: path)) != nil
     }
 
     /// See ``FileSystem/glob(pattern:currentDirectory:)``.
@@ -383,37 +432,45 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
         return Array(Set(paths))
     }
 
-    private func hasSyntheticDirectory(at path: WorkspacePath, mounts: [Mount]) -> Bool {
-        path.isRoot || mounts.contains { parentPath(of: $0.mountPoint) == path }
-            || syntheticChildMountNames(under: path, mounts: mounts).isEmpty == false
+    private static func virtualInfo(_ info: FileInfo, at path: WorkspacePath) -> FileInfo {
+        var adjusted = info
+        adjusted.path = path
+        return adjusted
+    }
+
+    private func syntheticInfo(at path: WorkspacePath) -> FileInfo {
+        let inode = withLock {
+            if let existing = syntheticInodes[path] { return existing }
+            let next = UInt64(syntheticInodes.count) + 1
+            syntheticInodes[path] = next
+            return next
+        }
+        return FileInfo(path: path, kind: .directory, size: 0, permissions: .defaultDirectory,
+                        modificationDate: nil, identity: FileIdentity(device: syntheticDevice, inode: inode))
+    }
+
+    private static func isMissing(_ error: Error) -> Bool {
+        let error = error as NSError
+        return (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
+            || (error.domain == NSCocoaErrorDomain
+                && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code))
     }
 
     private func syntheticChildMountNames(under path: WorkspacePath, mounts: [Mount]) -> [String] {
-        var names = Set<String>()
+        var names = Set<PathName>()
         for mount in mounts where mount.mountPoint != path {
             guard isPath(mount.mountPoint, inside: path) else {
                 continue
             }
-            let remaining = mount.mountPoint.isRoot
-                ? ""
-                : String(mount.mountPoint.string.dropFirst(path.isRoot ? 1 : path.string.count + 1))
-            guard !remaining.isEmpty else { continue }
-            if let first = remaining.split(separator: "/").first {
-                names.insert(String(first))
+            if let first = mount.mountPoint.components.dropFirst(path.components.count).first {
+                names.insert(PathName(first))
             }
         }
-        return names.sorted()
-    }
-
-    private func parentPath(of path: WorkspacePath) -> WorkspacePath {
-        path.dirname
+        return names.sorted().map(\.string)
     }
 
     private func isPath(_ candidate: WorkspacePath, inside parent: WorkspacePath) -> Bool {
-        if parent.isRoot {
-            return candidate.string.hasPrefix("/") && !candidate.isRoot
-        }
-        return candidate == parent || candidate.string.hasPrefix(parent.string + "/")
+        candidate.isWithin(parent)
     }
 
     private func resolveWritable(path: WorkspacePath, mounts: [Mount])
@@ -434,8 +491,8 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
                 return (mount.mountPoint, mount.fileSystem, path)
             }
 
-            if !mount.mountPoint.isRoot, path.string.hasPrefix(mount.mountPoint.string + "/") {
-                let suffix = String(path.string.dropFirst(mount.mountPoint.string.count))
+            if path.isWithin(mount.mountPoint) {
+                let suffix = path.components.dropFirst(mount.mountPoint.components.count).joined(separator: "/")
                 return (
                     mount.mountPoint,
                     mount.fileSystem,
@@ -444,5 +501,67 @@ public final class MountedFileSystem: FileSystem, @unchecked Sendable {
             }
         }
         return nil
+    }
+}
+
+extension MountedFileSystem: CompleteFileSystemChangeSource {
+    package var changeSignalsAreComplete: Bool {
+        get async {
+            let mounts = mountsSnapshot()
+            guard await base.changeSignalsAreComplete else { return false }
+            for mount in mounts where await !mount.fileSystem.changeSignalsAreComplete { return false }
+            return true
+        }
+    }
+    public func changeSignals() async throws -> AsyncStream<FileSystemChangeSignal> {
+        let id = UUID()
+        let (topology, updates) = AsyncStream<[Mount]>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        withLock {
+            mountObservers[id] = updates
+            updates.yield(mounts)
+        }
+        return AsyncStream { continuation in
+            let task = Task {
+                var subscriptions: [Task<Void, Never>] = []
+                defer { subscriptions.forEach { $0.cancel() } }
+                for await mounts in topology where !Task.isCancelled {
+                    subscriptions.forEach { $0.cancel() }
+                    subscriptions.removeAll()
+                    let sources = [Mount(mountPoint: .root, fileSystem: self.base)] + mounts
+                    for mount in sources {
+                        guard let source = mount.fileSystem as? any FileSystemChangeSource else { continue }
+                        let signals: AsyncStream<FileSystemChangeSignal>
+                        do { signals = try await source.changeSignals() }
+                        catch { continuation.finish(); return }
+                        subscriptions.append(Task {
+                            for await signal in signals where !Task.isCancelled {
+                                switch signal {
+                                case .rescan:
+                                    continuation.yield(.paths([mount.mountPoint: .recursive]))
+                                case let .paths(paths):
+                                    var visible: [WorkspacePath: FileSystemChangeSignal.Scope] = [:]
+                                    for (path, scope) in paths {
+                                        let virtual = mount.mountPoint.appending(path.components.joined(separator: "/"))
+                                        let owner = self.resolveWritable(path: virtual, mounts: mounts)
+                                        guard owner.mountPoint == mount.mountPoint else { continue }
+                                        visible[virtual] = scope
+                                    }
+                                    if !visible.isEmpty { continuation.yield(.paths(visible)) }
+                                }
+                            }
+                            // A failed child must not leave a live, silently incomplete stream.
+                            if !Task.isCancelled { continuation.finish() }
+                        })
+                    }
+                    // Reconcile changes during subscription setup and any new mount.
+                    continuation.yield(.rescan)
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+                self.withLock { self.mountObservers.removeValue(forKey: id)?.finish() }
+            }
+        }
     }
 }

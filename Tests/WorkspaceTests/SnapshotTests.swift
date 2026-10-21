@@ -5,6 +5,38 @@ import Testing
 @Suite("Snapshot engine")
 struct SnapshotTests {
     @Test
+    func `permission denial recognizes Foundation and nested Swift error representations`() {
+        let denied: [any Error] = [
+            POSIXError(.EACCES), POSIXError(.EPERM),
+            NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXError.Code.EACCES.rawValue)),
+            NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXError.Code.EPERM.rawValue)),
+            CocoaError(.fileReadNoPermission), CocoaError(.fileWriteNoPermission),
+            NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileWriteUnknown.rawValue,
+                    userInfo: [NSUnderlyingErrorKey: POSIXError(.EACCES) as any Error]),
+            NSError(domain: "outer", code: 1, userInfo: [NSUnderlyingErrorKey:
+                NSError(domain: "inner", code: 2, userInfo: [NSUnderlyingErrorKey: POSIXError(.EPERM) as any Error])])
+        ]
+        for error in denied { #expect(Snapshot.isPermissionDenied(error)) }
+        let other: [any Error] = [
+            POSIXError(.ENOENT), POSIXError(.EIO), CocoaError(.fileWriteUnknown),
+            WorkspaceError.unsupported("permissions"), WorkspaceError.accessDenied(operation: "write", message: nil),
+            NSError(domain: "unrelated", code: Int(POSIXError.Code.EACCES.rawValue)),
+            NSError(domain: "outer", code: 1, userInfo: [NSUnderlyingErrorKey: POSIXError(.EIO) as any Error])
+        ]
+        for error in other { #expect(!Snapshot.isPermissionDenied(error)) }
+    }
+
+    @Test
+    func `folding a replacement preserves unrelated missing entries`() {
+        let missing = Snapshot.Entry.missing(.init(path: "/unrelated"))
+        let file = Snapshot.Entry.file(.init(path: "/changed", data: Data(), permissions: .defaultFile))
+        let tree = Snapshot.Entry.directory(.init(path: .root, permissions: .defaultDirectory, children: [file, missing]))
+        let replacement = Snapshot.Entry.missing(.init(path: "/changed"))
+        let folded = Snapshot.replacing(tree, with: replacement)
+        #expect(folded == .directory(.init(path: .root, permissions: .defaultDirectory, children: [missing])))
+    }
+
+    @Test
     func `capture and restore roundtrips tree contents symlinks and permissions`() async throws {
         let source = InMemoryFileSystem()
         try await source.createDirectory(path: "/docs/nested", recursive: true)

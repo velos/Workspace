@@ -48,22 +48,22 @@ extension Workspace {
         if eventWatchers.isEmpty {
             filesystemObservationTask?.cancel()
             filesystemObservationTask = nil
-            observedFilesystemSnapshot = nil
+            filesystemRefreshTask?.cancel()
+            filesystemRefreshTask = nil
+            filesystemRetryMilliseconds = 40
+            filesystemRefreshFailures = 0
+            pendingFilesystemSignal = nil
+            observedFilesystem = nil
         }
     }
 
     func emitWorkspaceEvent(_ event: WorkspaceEvent) {
+        if case let .checkpoint(checkpoint) = event {
+            guard deliveredCheckpointEventIDs.insert(checkpoint.id).inserted else { return }
+        }
         for watcher in eventWatchers.values where Self.matches(event, filter: watcher.filter) {
             watcher.continuation.yield(event)
         }
-    }
-
-    /// Compatibility spelling for observing future workspace changes at a path.
-    public func watchChanges(
-        at path: WorkspacePath = .root,
-        recursive: Bool = true
-    ) async -> AsyncStream<WorkspaceEvent> {
-        await events(.init(path: path, recursive: recursive, includeCheckpoints: false))
     }
 
     private static func matches(_ event: WorkspaceEvent, filter: WorkspaceEvent.Filter) -> Bool {
@@ -74,7 +74,7 @@ extension Workspace {
             guard let path = filter.path else { return true }
             return changes.touchedPaths.contains { candidate in
                 if filter.recursive {
-                    return candidate == path || candidate.string.hasPrefix(path.isRoot ? "/" : path.string + "/")
+                    return candidate.isWithin(path)
                 }
                 return candidate == path
             }

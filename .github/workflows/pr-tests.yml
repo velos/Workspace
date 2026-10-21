@@ -9,7 +9,7 @@ on:
       - ready_for_review
   push:
     branches:
-      - core-improvements
+      - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

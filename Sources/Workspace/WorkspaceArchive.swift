@@ -9,6 +9,19 @@ extension Workspace {
             case directory(path: WorkspacePath, permissions: POSIXPermissions, children: [Entry])
             case symbolicLink(path: WorkspacePath, target: String, permissions: POSIXPermissions)
 
+            public static func == (lhs: Self, rhs: Self) -> Bool {
+                switch (lhs, rhs) {
+                case let (.missing(a), .missing(b)): return a == b
+                case let (.file(a, dataA, modeA), .file(b, dataB, modeB)):
+                    return a == b && dataA == dataB && modeA == modeB
+                case let (.directory(a, modeA, childrenA), .directory(b, modeB, childrenB)):
+                    return a == b && modeA == modeB && childrenA == childrenB
+                case let (.symbolicLink(a, targetA, modeA), .symbolicLink(b, targetB, modeB)):
+                    return a == b && modeA == modeB && targetA.utf8.elementsEqual(targetB.utf8)
+                default: return false
+                }
+            }
+
             public var path: WorkspacePath {
                 switch self {
                 case let .missing(path), let .file(path, _, _), let .directory(path, _, _),
@@ -24,6 +37,29 @@ extension Workspace {
         public init(root: WorkspacePath, entry: Entry) {
             self.root = root
             self.entry = entry
+        }
+
+        /// Validates the entire tree before restore can remove or write any destination entry.
+        /// Decoded archives are untrusted: paths must form a tree rooted exactly at `root`.
+        public func validate() throws {
+            guard entry.path == root else {
+                throw WorkspaceError.unsupported("invalid archive: entry path \(entry.path) does not equal root \(root)")
+            }
+            // Immediate-child edges and a matching root prove containment inductively.
+            var pending = [entry]
+            while let entry = pending.popLast() {
+                guard case let .directory(parent, _, children) = entry else { continue }
+                var names = Set<PathName>()
+                for child in children {
+                    guard child.path != parent, child.path.parent == parent else {
+                        throw WorkspaceError.unsupported("invalid archive: \(child.path) is not an immediate child of \(parent)")
+                    }
+                    guard names.insert(PathName(child.path.name)).inserted else {
+                        throw WorkspaceError.unsupported("invalid archive: duplicate child \(child.path.name) in \(parent)")
+                    }
+                    pending.append(child)
+                }
+            }
         }
     }
 
@@ -43,19 +79,30 @@ extension Workspace {
     /// Restores a portable archive and records the resulting changes.
     @discardableResult
     public func restore(_ archive: Archive, at destination: WorkspacePath? = nil) async throws -> ChangeSet {
-        try await ensureLoaded()
-        let before = try await Snapshot.capture(from: filesystem)
-        let destination = destination ?? archive.root
+        try archive.validate()
+        await acquireOperation()
+        defer { releaseOperation() }
+        try Task.checkCancellation()
+        try await prepareForMutation()
+        let resolvesPaths = await filesystem.capabilities().contains(.realPathResolution)
+        let destination = try await canonicalEntryPath(destination ?? archive.root, resolvesPaths: resolvesPaths)
         let entry = Self.snapshotEntry(archive.entry, replacing: archive.root, with: destination)
-        try await Snapshot.restore(Snapshot(rootPath: destination, entry: entry), to: filesystem)
-        let after = try await Snapshot.capture(from: filesystem)
-        noteWorkspaceSnapshot(after)
-        let changes = changeSet(from: before, to: after)
-        if !changes.isEmpty {
-            try await appendMutation(operation: .archiveRestore, changes: changes)
-            emitWorkspaceEvent(.changes(changes))
+        let root = try await captureRoot(for: destination)
+        let before = try await Snapshot.capture(from: filesystem, at: root)
+        do {
+            try await Snapshot.restore(Snapshot(rootPath: destination, entry: entry), to: filesystem)
+            let after = try await Snapshot.capture(from: filesystem, at: root)
+            let changes = changeSet(from: before, to: after)
+            if !changes.isEmpty {
+                let recorded = recordingChanges(changes, from: before, to: after)
+                try await appendMutation(operation: .archiveRestore, changes: recorded)
+            }
+            await noteWorkspaceSnapshot(after)
+            if !changes.isEmpty { emitWorkspaceEvent(.changes(changes)) }
+            return changes
+        } catch {
+            try await restoreAfterFailure([before], originalError: error)
         }
-        return changes
     }
 
     private static func archiveEntry(_ entry: Snapshot.Entry) -> Archive.Entry {
@@ -105,16 +152,15 @@ extension Workspace {
         to destinationRoot: WorkspacePath
     ) -> WorkspacePath {
         guard path != sourceRoot else { return destinationRoot }
-        let prefix = sourceRoot.isRoot ? "/" : sourceRoot.string + "/"
-        guard path.string.hasPrefix(prefix) else { return path }
-        return destinationRoot.appending(String(path.string.dropFirst(prefix.count)))
+        guard path.isWithin(sourceRoot) else { return path }
+        return destinationRoot.appending(path.components.dropFirst(sourceRoot.components.count).joined(separator: "/"))
     }
 
     private static func entry(at path: WorkspacePath, in entry: Snapshot.Entry) -> Snapshot.Entry {
         if entry.path == path { return entry }
         guard case let .directory(directory) = entry else { return .missing(.init(path: path)) }
         for child in directory.children {
-            if child.path == path || path.string.hasPrefix(child.path.string + "/") {
+            if path.isWithin(child.path) {
                 return self.entry(at: path, in: child)
             }
         }
