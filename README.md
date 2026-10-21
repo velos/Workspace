@@ -1,89 +1,108 @@
 # Workspace
 
-`Workspace` is a Swift package for agent and tool runtimes that need controlled filesystem access, structured edits, revision history, and isolated transactions without shell parsing.
+Workspace is a Swift package that gives agent and tool runtimes controlled access to a directory tree. It provides structured, atomic edits with a record of what changed, checkpoints you can diff and restore, isolated transactions with a three-way merge, change events, text search and an LLM tool adapter. Filesystem wrappers add root confinement, authorization rules, quotas, overlays and mounts.
 
-The package is beta software. Its rooted filesystems, authorization rules, and limits are useful safety layers, but they are not a hardened process sandbox.
+The package hasn't been released, and its API can change.
 
-## Installation
+## When to use it
+
+Use Workspace when a program, such as a coding agent, edits files on someone's behalf and needs to preview edits, apply them all-or-nothing, show what changed and roll back.
+
+It's the wrong tool when:
+
+- **You need to contain untrusted code.** The wrappers constrain calls made through the `FileSystem` API, not processes. Use an OS sandbox or a container. See [Safety layer, not a sandbox](#safety-layer-not-a-sandbox).
+- **You need to run commands.** There's no process execution or shell.
+- **You want version control.** Checkpoints are local snapshots of one tree, with no branches or remotes.
+- **Every operation must be cheap on a very large tree.** Checkpoints, transaction begin and commit, and checkpoint-to-current diffs each walk the whole tree's metadata.
+- **Every writer must be recorded.** Changes made outside the Workspace can appear as events but never enter history.
+
+## Requirements
+
+Swift 6.2 or later on macOS 13, iOS 16, tvOS 16, watchOS 9 or Linux, with no dependencies. Events for external changes need macOS (FSEvents) or Linux (inotify).
 
 ```swift
-.dependencies: [
-    .package(path: "../Workspace")
+dependencies: [
+    .package(path: "../Workspace"),
+],
+targets: [
+    .target(name: "MyTool", dependencies: [
+        .product(name: "Workspace", package: "Workspace"),
+    ]),
 ]
 ```
 
-The package contains one library product, `Workspace`, and has no external dependencies.
+## Core model
 
-## The Model
+- **`Workspace`** is an actor that owns one tree: its current state (a `FileSystem`), a mutation history, checkpoints and an event stream.
+- **`WorkspacePath`** is a normalized absolute path. String literals convert to it.
+- **`Edit`** describes one mutation: write, append, create a directory, remove, copy, move, link, set permissions, or find-and-replace.
+- **`ChangeSet`** lists `FileChange` values (path, kind, effect, optional `TextDiff`) and `textDiffOmissions` for files without a text diff. Previews, edit results, history, events, diffs and commits all return it.
+- **`Checkpoint`** is a stored revision of the whole tree. A **`Revision`** is `.current` or `.checkpoint(id)`.
+- **`Workspace.Transaction`** is an isolated draft that commits back with a three-way merge.
+- **`FileSystem`** is the storage protocol behind the current state.
 
-The public API centers on a small set of concepts:
+`Workspace.init` parameters, all optional:
 
-- `Workspace` owns current mutable state, history, checkpoints, and events.
-- `Revision` addresses either the current state or a checkpoint.
-- `Edit` describes a mutation.
-- `ChangeSet` is the common result used by previews, edits, history, events, diffs, and transactions.
-- `Workspace.Transaction` provides isolated preview, three-way commit, and discard.
-- `FileSystem` is the low-level protocol for custom storage backends.
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `workspaceID` | `UUID()` | Identifies this workspace in a store. Pass the same value each time to reopen persisted history. |
+| `fileSystem` | `InMemoryFileSystem()` | Holds the current state. |
+| `persistence` | `.memory` | `.memory` keeps checkpoints and history in the process; `.directory(URL)` stores them on disk. |
+| `recording` | `.full(maxTextBytes: 1_000_000)` | Detail kept in history: `.full` keeps text diffs up to the size limit, `.changesOnly` keeps paths and effects, `.off` keeps nothing. Returned results and events are unaffected. |
+| `checkpointCapture` | `.trustMetadata` | See [Change detection](#change-detection). |
+| `observation` | 32 MiB cache | See [External changes](#external-changes). |
 
-## Create a Workspace
-
-An empty in-memory workspace needs no configuration:
+## Getting started
 
 ```swift
 import Workspace
 
 let workspace = Workspace()
+try await workspace.createDirectory("/notes")
 try await workspace.writeText("/notes/todo.txt", "ship it\n")
 let text = try await workspace.readText("/notes/todo.txt")
 ```
 
-Use a rooted local filesystem and persisted revision store when state should survive process exit:
+`InMemoryFileSystem` requires parent directories to exist before a write; `LocalFileSystem` creates them.
+
+To work on a directory on disk and keep history across launches:
 
 ```swift
-let files = try LocalFileSystem(root: projectURL)
 let workspace = Workspace(
-    workspaceID: projectID,
-    fileSystem: files,
-    persistence: .directory(historyURL),
-    recording: .full(maxTextBytes: 1_000_000)
+    workspaceID: projectID,  // a UUID you store and reuse
+    fileSystem: try LocalFileSystem(root: projectURL),
+    persistence: .directory(historyURL)
 )
 ```
 
-The injected filesystem remains available as `workspace.fileSystem` so one `Workspace` can be
-shared as the filesystem authority across shells, tool runtimes, and other adapters. Reads through
-that reference are always fine. Mutations made directly through it bypass Workspace history,
-checkpoints, and events, so integrations should either route mutations through the Workspace edit
-pipeline or deliberately accept that those changes are unrecorded.
+`LocalFileSystem(root:)` creates the root if it's missing. A history directory holds one subdirectory per `workspaceID`. Keep it outside `projectURL`, or the store's files become part of the tree it records.
 
-## Edits and Changes
+`workspace.fileSystem` returns the filesystem you passed in. Reading through it is fine, but writes through it bypass history and the [operation gate](#atomicity-and-the-operation-gate).
 
-Every mutation returns the same structured `ChangeSet`:
+## Editing files
 
 ```swift
-let preview = try await workspace.preview([
+let edits: [Edit] = [
     .createDirectory("/Sources"),
-    .writeText("/Sources/main.swift", "print(\"hello\")\n")
-])
+    .writeText("/Sources/main.swift", "print(\"hello\")\n"),
+]
 
-let result = try await workspace.apply([
-    .createDirectory("/Sources"),
-    .writeText("/Sources/main.swift", "print(\"hello\")\n")
-])
+let preview = try await workspace.preview(edits)   // nothing is written
+let result = try await workspace.apply(edits)      // atomic by default
 
-print(result.changes.touchedPaths)
+for change in result.changes.changes {
+    print(change.effect, change.kind, change.path)
+}
 print(result.changes.statistics.additions)
 ```
 
-`apply` is atomic by default. `.stopOnError` and `.continueAfterError` expose partial failures explicitly.
-Atomic recovery does not track hard-link aliases outside captured roots or roll back permission changes to symlink entries.
+`preview` runs the edits on a copy-on-write layer and returns the ChangeSet `apply` would produce. It can't predict concurrent writes or permission and quota failures.
 
-Edit previews use an isolated copy-on-write layer and the same affected-root journal as `apply`.
-Their ChangeSets describe the edited paths, including link and permission changes. Preview does not
-simulate external races or guarantee that later writes pass filesystem permissions or quota checks.
+`apply(_:policy:)` is `.atomic` by default: if any edit fails, the affected paths are restored and the error is rethrown. `.stopOnError` keeps earlier successes and stops at the first failure; `.continueAfterError` attempts every edit. Both report failures in `result.failures` and record what succeeded.
 
-Direct conveniences—`writeText`, `writeData`, `appendText`, `createDirectory`, `remove`, `copy`, `move`, link creation, and permission changes—use the same edit pipeline.
+`writeText`, `writeData(_:to:)`, `writeJSON`, `appendText`, `appendData`, `createDirectory`, `remove`, `copy`, `move`, `createSymbolicLink`, `createHardLink` and `setPermissions` each apply one edit and return its ChangeSet.
 
-Text replacement is an edit and shares its file selection and pattern engine with search:
+Find-and-replace is an edit like any other:
 
 ```swift
 let swiftFiles = FileSelection(
@@ -97,161 +116,82 @@ try await workspace.apply([
 ])
 ```
 
+Patterns are `.literal(_:caseSensitive:)` or `.regularExpression(_:)` (an `NSRegularExpression`; the replacement accepts `$1` templates). Every selected file must be UTF-8 text without NUL bytes, or the edit fails.
+
+Selection patterns resolve against `root`; includes are combined and excludes removed. Globs support `*`, `?`, `[...]`, `[!...]` and `**`, and `*` matches names starting with a dot.
+
+`readText`, `readData` (with an optional byte range), `readJSON`, `exists`, `info`, `list`, `glob` and `tree` all accept a `Revision`, so they read checkpoints too.
+
 ## Search
 
 ```swift
-let result = try await workspace.search(
-    SearchRequest(
-        pattern: .regularExpression(#"\bTODO\b"#),
-        files: swiftFiles,
-        contextLines: 2
-    )
+let request = SearchRequest(
+    pattern: .regularExpression(#"\bTODO\b"#),
+    files: swiftFiles,
+    contextLines: 2
 )
+let result = try await workspace.search(request)
 
 for match in result.matches {
     print("\(match.path):\(match.lineNumber): \(match.line)")
 }
 ```
 
-Search is deterministic, line-oriented, does not follow symlinks, and reports binary, oversized, or truncated work as structured result data.
+Search reads regular files in the current state, in path order, without following symbolic links. Binary and oversized files are listed in `skippedFiles`. Default limits are 1,000,000-byte files, 10,000 files and 1,000 matches; `maxOutputBytes` can also cap the encoded result. `truncation` names the limit that stopped a result. To page, pass `nextMatchOffset` back as `matchOffset`. Each page rescans every selected file.
 
-## Checkpoints, Revisions, and Diffs
-
-Checkpoints are persisted revisions; there is no second public snapshot representation.
+## Checkpoints, diffs and restore
 
 ```swift
+try await workspace.writeText("/README.md", "Original\n")
 let before = try await workspace.createCheckpoint(label: "before")
 try await workspace.writeText("/README.md", "Updated\n")
-let after = try await workspace.createCheckpoint(label: "after")
 
-let oldText = try await workspace.readText(
-    "/README.md",
-    at: .checkpoint(before.id)
-)
+let oldText = try await workspace.readText("/README.md", at: .checkpoint(before.id))
+let changes = try await workspace.diff(from: .checkpoint(before.id), to: .current)
+print(changes.unifiedPatch())
 
-let changes = try await workspace.diff(
-    from: .checkpoint(before.id),
-    to: .checkpoint(after.id)
-)
+let restored = try await workspace.restore(to: before)
 ```
 
-Checkpoint reads use cached in-memory indexes or persisted manifest metadata, resolve directory
-symlinks inside the workspace namespace (at most 64 hops), and read selected byte ranges without
-materializing whole blobs. `TextDiff` includes total line counts, addition/deletion statistics,
-hunks, and UTF-16 intra-line ranges. Empty and identical inputs and unchanged prefixes/suffixes
-avoid the general diff search. A Myers search preserves sparse edits; if its work or edit-distance
-limit is reached, the unmatched interior uses a coarse replacement hunk. Its statistics describe
-the emitted additions/deletions and may exceed a minimal edit script. The line search and each
-intra-line pair have independent limits of 1,000 edits or 1,000,000 visited search steps.
+A checkpoint records file contents, directories, symbolic links and permissions, storing identical contents once. Its `origin` is `.manual`, `.rollback(from:)` or `.transaction(base:)`, and its `summary` describes changes from its parent.
 
-Use `Workspace.Archive` only when a fully materialized, portable subtree is actually required:
+`restore(to:)` rewrites only the entries that differ, then records the result as a checkpoint with origin `.rollback(from:)`. Later checkpoints are kept.
+
+`diff(from:to:options:)` compares any two revisions. Files larger than `DiffOptions.maxTextBytes` (default 1,000,000), binary files and metadata-only changes get no text diff and are listed in `textDiffOmissions`. `ChangeSet.unifiedPatch()` renders a git-style patch. The diff search gives up after 1,000 edits or 1,000,000 steps per file and emits one replacement hunk for the unmatched middle, so statistics can exceed a minimal diff.
+
+To copy a subtree into another workspace, use an archive. Restoring one is recorded in history but creates no checkpoint.
 
 ```swift
 let archive = try await workspace.archive(at: "/Sources")
 try await anotherWorkspace.restore(archive, at: "/Imported")
 ```
 
-## Storage Lifecycle
-
-Inspect checkpoint-store usage and preview retention before deleting anything:
+### Compaction
 
 ```swift
-let usage = try await workspace.storageStatistics()
-
-let preview = try await workspace.compact(
-    retaining: .latest(
-        50,
-        preservingLabeled: true,
-        preserving: [releaseCheckpoint.id]
-    ),
+let plan = try await workspace.compact(
+    retaining: .latest(50, preservingLabeled: true, preserving: [release.id]),
     dryRun: true
 )
+print(plan.removedCheckpointCount, plan.reclaimedBytes)
 
-print(preview.removedCheckpointCount)
-print(preview.reclaimedBytes)
-```
-
-Apply the same policy by omitting `dryRun`:
-
-```swift
 let report = try await workspace.compact(retaining: .latest(50))
 ```
 
-Compaction rebases retained checkpoints to their nearest retained ancestor and recomputes their summaries. Retained rollback and transaction checkpoints also retain an existing checkpoint they reference as provenance. `.all` keeps every checkpoint while sweeping orphaned manifests and blobs.
-
-Directory-backed stores serialize checkpoint commits, revision reads, and compaction with a persistent lifecycle lock. Mutation history is independent and is not pruned by checkpoint retention.
-
-Directory stores use the marker `{"format":"workspace-history","version":1}` in `format.json`.
-An existing store directory must have that marker; a missing, malformed, or unsupported marker is an error instructing the
-caller to delete the history directory. Store creation is serialized across instances and processes.
-
-A small snapshot root points to SHA-256-addressed directory
-objects in `trees/`. Each object contains byte-sorted immediate child names (never absolute paths), with child directories
-referenced by hash. An incremental capture writes only changed directories and their ancestors;
-unchanged objects remain shared. File reads decode only directories on the requested path.
-Decoded trees and the write catalog share a **32 MiB estimated decoded-storage budget** per
-store (24 MiB for trees, 8 MiB for the catalog). Both refresh recency on hits and normally use
-O(1) LRU eviction. Capture-time tree inserts evict the most recent entry instead, so repeated
-whole-tree scans retain a resident set when the trees exceed the budget. Estimates include entry,
-string-buffer and bookkeeping costs; this is not a process-RSS cap.
-File metadata and directory listings also use path-only lookup. Full revision indexes are still materialized
-when a whole-tree operation requests them. Metadata capture still walks the filesystem.
-
-Blobs retain their SHA-256 identities. Small captures use loose `blobs/<hash>` files; after the
-first 32 new unique blobs in a capture, remaining blobs go into immutable `packs/<uuid>.pack`
-files with adjacent JSON hash/range indexes. Packs target 16 MiB and use a 1 MiB write buffer;
-a single larger file may exceed the target. Tree file entries carry their pack/range, so reads
-need no global pack-index decode. Full snapshot materialization maps at most four packs at a
-time and copies only the required file ranges; those mappings do not escape the locked load.
-The bounded write-side pack catalog is cached for one workspace. A constant-size `packs.generation`
-token invalidates other writers' catalogs before compaction removes packs, without depending on
-directory mtimes or enumerating historical pack files on warm writes. Hashes captured with in-memory
-checkpoints are reused by revision indexes and unchanged files in subsequent checkpoints.
-
-Publication orders durable blob/pack writes and directory objects before the snapshot root,
-and the snapshot root before checkpoint metadata. Files are synchronized before atomic rename,
-and containing directories are synchronized before advancing publication. Tree-directory syncs
-are batched at capture completion; compaction synchronizes each relocated tree before replacing
-roots. On Darwin, snapshot-root and checkpoint-metadata publication additionally use `F_FULLFSYNC`
-after syncing the containing directory, flushing the drive cache including preceding writes.
-A successfully published checkpoint therefore survives process crashes and power loss on storage
-that honors these synchronization requests. If `F_FULLFSYNC` fails other than interruption,
-publication retains the completed file and directory `fsync`; power-loss protection is best-effort
-on such volumes. Other POSIX platforms use file and directory `fsync`.
-Failed captures can leave unreachable objects, but publish no checkpoint referencing incomplete content. Compaction
-sweeps unreachable objects, rewrites partially live packs, durably replaces affected snapshot roots,
-and only then removes old objects. Interrupted compaction can be resumed; dry-run blob counts
-and byte totals include reclaimable pack entries and incomplete orphan packs.
-
-All writers preserve the mutation sequence high-water mark and retraction epoch in
-`mutations.sequence.json`. Retractions and failed
-append reservations can leave sequence gaps. History refreshes invalidate cached records when
-another instance retracts or prunes mutations.
-
-Directory-backed checkpoint capture also reuses existing CAS blobs when a file's size and available
-modification timestamp are unchanged and the timestamp is more than two seconds older than the
-previous capture's start. Entries within that timestamp-granularity window are rehashed. It still
-walks directory metadata for correctness. Filesystems without modification timestamps and
-materialized snapshots without capture hints require content reads.
-
-For tools that preserve older timestamps while changing content, pass
-`checkpointCapture: .verifyContents` to `Workspace` to read and hash every file at each checkpoint.
-The default `.trustMetadata` policy compares the local wall clock with filesystem modification
-timestamps. Clock skew can make a recent change appear safely old; use `.verifyContents` for
-network filesystems whose clock may differ. This policy affects only `.directory` persistence.
+`.latest` keeps the newest checkpoints, labeled ones and any IDs you list. It also keeps the checkpoint each kept rollback or transaction checkpoint came from, and any checkpoint that an open transaction or another Workspace instance in the process depends on. `.all` keeps every checkpoint and removes only unreferenced data. Survivors are rebased onto their nearest kept ancestor. `storageStatistics()` reports usage. Nothing prunes mutation history, so use `recording` to bound it.
 
 ## Transactions
-
-Begin an isolated transaction:
 
 ```swift
 let transaction = try await workspace.beginTransaction(label: "agent draft")
 try await transaction.writeText("/README.md", "Draft\n")
 
-let preview = try await transaction.preview()
-let commit = try await transaction.commit(strategy: .threeWay)
+let draft = try await transaction.preview()   // base-to-draft ChangeSet
+let commit = try await transaction.commit()   // .threeWay by default
 
-if !commit.applied {
+if commit.applied {
+    print("committed as checkpoint", commit.checkpoint?.id as Any)
+} else {
     for conflict in commit.conflicts {
         print(conflict.path, conflict.kind)
     }
@@ -259,203 +199,87 @@ if !commit.applied {
 }
 ```
 
-Transaction commits follow these rules:
+A transaction starts from a frozen copy of the tree and edits a private draft, with the same read, search and edit methods as `Workspace`. The parent stays editable. A successful commit writes the merge to the parent, records it in history and as a checkpoint with origin `.transaction(base:)`, and emits an event. `commit.checkpoint` is `nil` when there was nothing to apply.
 
-- Three-way merging accepts a change made by only one side, coalesces identical changes, and reports divergent changes to the same node as conflicts.
-- A directory removed or replaced on one side while the other creates or modifies something beneath it is a `.structural` conflict at the outermost removed or replaced directory. Descendant deletions converge with ancestor removal. Directory mode changes and child edits merge.
-- Strict mode rejects any parent change, including root-directory metadata.
-- Moves are delete-plus-create operations. Moving the same source to different destinations keeps both copies.
-- During `commit()`, edits and `discard()` throw `TransactionError.committing`; read-only draft calls remain available. Another commit also throws `.committing`.
-- A rollback failure permanently closes the transaction. Failures that leave the parent unchanged allow retry.
+### Merge rules
 
-Manual conflicted transactions remain active. The scoped convenience commits on success and discards on failure or conflict:
+The merge compares nodes path by path. A node is a path's kind, permissions and content (file bytes or symlink target), not a directory's children.
+
+| Parent since begin | Transaction | Outcome |
+| --- | --- | --- |
+| Unchanged | Changed | Transaction's version |
+| Changed | Unchanged | Parent's version |
+| Same change | Same change | Converges |
+| Modified | Modified differently | `bothModified` |
+| Created | Created differently | `bothCreated` |
+| Deleted | Modified, or the reverse | `modifiedAndDeleted` |
+| Removed or replaced a directory | Changed something inside it, or the reverse | `structural`, once, at the outermost such directory |
+
+So a permission change on a directory merges with edits inside it, and deleting files under a directory the other side removed converges. A move is a delete plus a create: if both sides move the same file to different paths, both copies survive. Node conflicts carry `parentDiff` and `transactionDiff` when both sides are text.
+
+`commit(strategy: .strict)` instead rejects the commit if anything in the parent changed, including root metadata, reporting each changed path as `parentChanged`.
+
+### Lifecycle
+
+A conflicted commit applies nothing and leaves the transaction active, so you can edit the draft and commit again, or discard it. During a commit, edits, `discard()` and another `commit` throw `TransactionError.committing`; reads keep working. After a successful commit or a discard, calls throw `.inactive`. If a commit fails and the parent is restored, the transaction stays active; if the restore also fails, it throws `WorkspaceRollbackError` and the transaction closes.
+
+The scoped form commits when the body returns and discards when it throws or conflicts. Conflicts throw `TransactionError.conflicts`.
 
 ```swift
-let result = try await workspace.transaction { transaction in
+let result = try await workspace.transaction(label: "agent run") { transaction in
     try await transaction.writeText("/result.txt", "done\n")
     return "agent result"
 }
+print(result.value, result.commit.appliedChanges.touchedPaths)
 ```
 
-Transactions use a copy-on-write draft over a frozen base. The first transaction on an instance
-reads the tree, including after reopening a Workspace. Memory persistence retains the initial bytes.
-A cold directory-backed base retains up to 256 MiB of file contents in memory; files that do not fit
-use private temporary blobs until a checkpoint supplies immutable content. Live transaction handles
-own the cold base. Discarding or releasing the last handle releases its bytes; successful commit
-releases the completed handle's base and re-seeds the parent from the checkpoint. Other active handles
-retain their frozen contents. A later begin without a live cold base or checkpoint base reads anew.
-Beginning or discarding a transaction adds no public checkpoint. Subsequent begins and commits walk
-metadata and read changed or unverifiable files; previews and merges materialize affected paths.
-Metadata capture uses bulk traversal when available and per-path enumeration otherwise, including
-scoped subtree refreshes. Mounted traversal preserves virtual paths and shadowing; authorized
-traversal retains per-entry permission checks.
-Snapshot capture likewise stats each entry on its per-path route. InMemoryFileSystem has a native
-actor-owned traversal; after reentrant mutations it resolves pending paths and reads again.
-Checkpoint persistence still requires the store's metadata and manifest work. Checkpoints prime a
-transaction base only after that instance has begun a transaction. Directory commits replace the base
-with the new revision index, without retaining changed-file contents or revision read caches.
+Begin and commit walk the parent's metadata, and the first transaction on a Workspace instance reads every file to build its base:
 
-With `checkpointCapture: .trustMetadata`, transactions reuse contents when size and mtime match
-and the previous mtime is more than two seconds older than the start of the previous metadata
-capture. Identity must also match when both entries provide it. Missing mtimes and recent timestamps
-require reads; InMemoryFileSystem's exact timestamps skip this racy window. Writes that preserve
-safely old metadata can evade the check. Use `.verifyContents` to read and compare every file during
-transaction begin and commit, checkpoint-to-current diff and restore, and to read and hash every
-file during directory checkpoint capture.
+- With `.memory` persistence, the base stays in memory and later begins read only files whose metadata changed.
+- With `.directory` persistence, up to 256 MiB stays in memory and the rest goes to temporary files. After a commit or checkpoint, later transactions start from that checkpoint. Otherwise, a begin after every handle has been discarded reads every file again.
 
-Checkpoint-to-current diffs and `restore(to:)` use one bulk metadata walk and compare against the
-checkpoint's persisted capture hints and revision hashes. They read only suspect files (changed
-metadata, missing hints, or timestamps inside the same two-second window). Identity is compared
-when both captures provide it; exact-timestamp backends skip the window. Revisions without
-capture hints conservatively require content reads. Memory persistence retains hints for only the
-four most recently captured or restored revisions; older revisions also fall back to content reads.
-As with transactions, writes that preserve
-safely old metadata can evade `.trustMetadata`; use `.verifyContents` when those writes must be
-detected and restored.
-
-Restore applies and recaptures only differing entries and necessary ancestor permissions. Its
-failure recovery and recorded changes use the same sparse scope. The new checkpoint reuses existing
-blobs and directory trees through the store's normal locked, durable publication path. Archive
-restore continues to capture its selected subtree in full.
-
-Transactions are logically atomic within cooperative workspace use. They are not crash-safe against
-an external process racing the commit. In-process `Workspace.compact` protects revisions referenced
-by transaction handles and other Workspace instances. This instance's reusable base does not override
-retention: it survives dry runs and real compaction that retains its checkpoint, and is discarded
-when that checkpoint is removed. Coordinate compaction across processes: the store protocol has no
-cross-process revision lease.
-
-## Events and History
+## Events and history
 
 ```swift
-let events = await workspace.events()
-Task {
+let events = await workspace.events(.init(path: "/Sources"))
+let watcher = Task {
     for await event in events {
-        print(event)
+        switch event {
+        case let .changes(changes):
+            print("changed:", changes.touchedPaths)
+        case let .checkpoint(checkpoint):
+            print("checkpoint:", checkpoint.id)
+        }
     }
 }
 
 let mutations = try await workspace.history()
 ```
 
-Change events, returned edit results, and mutation history all carry the same `ChangeSet` representation. Checkpoint events share the same stream.
+`.changes` events cover edits, restores, archive restores and commits made through this Workspace, plus external changes the filesystem reports. Events don't say which. `.checkpoint` events cover this instance's checkpoints and, with `.directory` persistence, those of other instances sharing the store. Cancel the consuming task to end a stream.
 
-`LocalFileSystem` also pushes out-of-band filesystem invalidations through FSEvents on macOS and
-inotify on Linux. `events(_:)`, with an optional path filter, turns those
-invalidations into structured `ChangeSet` values. External changes remain unrecorded in mutation
-history, matching the direct-filesystem contract above. Directory-backed checkpoint stores use the
-same push model for cross-instance checkpoint events; there is no periodic polling loop.
+`history()` returns `Mutation` records for edits, rollbacks, transactions and archive restores from every Workspace sharing the store. It waits for this instance's in-flight mutations. External changes never enter history.
 
-Filesystem observation keeps a metadata index and a bounded least-recently-used content cache.
-`observation: .init(contentCacheBytes: 32 * 1024 * 1024)` configures the cache on `Workspace`; 32 MiB is
-the default, zero disables it, and negative budgets are treated as zero. Initial observation reads
-at most that budget, excluding files above the text-diff size limit. A change whose old or new bytes
-are uncached has no text diff and reports `.observationCacheMiss` in `textDiffOmissions`.
-`.sizeLimitExceeded` identifies files above the text-diff limit. Failed content reads report the
-metadata change with `.contentReadFailed`, without blocking other changes.
+### External changes
 
-Full and recursive metadata rescans verify cached contents within the same two-second racy window
-used by transactions, and whenever mtime is unavailable. Exact-timestamp backends skip that window.
-Explicit path signals compare cached regular-file contents even when metadata matches. Rescans can
-miss writes that preserve safely old metadata. Without cached contents, observation relies on
-metadata and can report an identical rewrite as changed or miss a rewrite that preserves metadata.
-Observation is not an atomic snapshot of external activity: a mutation between a Workspace write
-and its metadata reconciliation can be absorbed into that write, particularly for uncached files
-or structural changes. Coordinate concurrent writers when every intermediate change must be recorded.
+`LocalFileSystem` reports external writes through FSEvents on macOS and inotify on Linux, and the wrappers over it forward those reports. `AuthorizedFileSystem` forwards only paths the authorizer lets you `stat`. `InMemoryFileSystem` and `OverlayFileSystem` report nothing. Custom backends can adopt `FileSystemChangeSource`.
 
-`FileSystemChangeSource.changeSignals()` emits `.paths([WorkspacePath: Scope])` in the source's
-filesystem namespace. `.entry` checks one entry's contents and metadata; `.shallow` also checks a
-directory's immediate listing without traversing existing child directories; `.recursive` checks
-the whole subtree. Added, removed or replaced directories include their current or former descendants.
-Sources must name deleted or replaced ancestors, use recursive scopes for directory renames, and emit
-`.rescan` when coverage is uncertain. Coalescing keeps the strongest scope at each path without letting
-a shallow ancestor suppress descendant signals. The default maps `changes()` Void signals to `.rescan`;
-wrappers should forward richer signals when available. FSEvents and inotify provide scoped signals,
-coalesced over 40 ms, with full metadata rescans for dropped or unknown events. Native watchers exclude
-LocalFileSystem's atomic-replace temporary names in this process's private random namespace; similarly
-named user files and temporary files from other processes remain visible.
-Metadata failures retain their invalidations and retry with exponential backoff for at most three
-attempts. After that, observation waits for a new native signal before resuming the pending work.
+On a filesystem that reports changes, the first `events` call walks the tree's metadata and fills a content cache. A text diff for an external change needs the file's previous contents from that cache. It's least-recently-used and sized by `ObservationPolicy(contentCacheBytes:)`: 32 MiB by default, 0 to disable. Files over 1,000,000 bytes are never cached. When the diff can't be computed, the change is still reported, with an omission reason: `.observationCacheMiss`, `.sizeLimitExceeded` or `.contentReadFailed`.
 
-## Path Identity
+Without cached contents, observation relies on metadata: an identical rewrite can show as modified, and a rewrite that keeps size and an old modification time can be missed. An external write that races a Workspace edit can be folded into that edit's event, so coordinate writers if every intermediate change matters.
 
-A `WorkspacePath` is a normalized absolute path whose identity is the exact UTF-8
-bytes of each component. Equality, hashing, ordering, containment, permission
-rules, and quota accounting do not fold case or Unicode normalization. For example,
-`/café` (NFC) and `/cafe\u{301}` (NFD) are different paths. This deliberately changes
-previous releases' use of Swift canonical-equivalence equality. Names and symlink
-targets must be valid UTF-8; undecodable host entries are rejected, not repaired
-into a different name. In-memory storage
-and byte-exact host filesystems can hold both names.
+## Filesystems and safety wrappers
 
-`LocalFileSystem` requires the requested spelling to match the stored directory
-entry. On APFS, including case-sensitive APFS, case or normalization aliases are
-rejected: lookups and reads report `ENOENT`; creates, writes, and rename/copy
-destinations report `EEXIST` when an equivalent entry exists. Renaming an entry
-to an equivalent spelling is rejected too; move through a distinct temporary
-name if a spelling change is needed. Case-only renames remain possible on
-case-sensitive filesystems. Removing a missing/aliased spelling remains
-a no-op. Symlink targets must use the stored spelling, and `resolveRealPath`
-returns that spelling. Directory listings and bulk traversal use names
-emitted by `readdir`, so they already carry the stored identity.
-
-On Darwin, volume policy is cached by device. APFS and HFS+ use
-`getattrlistat(ATTR_CMN_NAME, FSOPT_NOFOLLOW)` to verify stored names. For APFS,
-an `F_GETPATH` check on the held parent **directory** can verify its components
-together, against the root descriptor's own path plus the resolved physical
-components; the final name still uses `getattrlistat` so hard links remain valid.
-Unavailable, overlong, or mismatched directory paths fall back to per-component
-checks, so relocating the pinned root or an ancestor remains supported.
-No final file descriptor is checked with `F_GETPATH`.
-
-HFS+ and macOS's exFAT driver store Unicode names in decomposed form (NFD).
-Creating a precomposed (NFC) name that decomposes there fails with `EILSEQ` and
-the new entry is removed; use the NFD spelling reported by directory listings.
-New entries are checked before use on rewriting volumes. A rewritten rename is
-rolled back to preserve its source. Other Darwin
-filesystems (including exFAT/FSKit, network and unknown types) verify spelling by
-an exact byte match in the parent directory's `readdir` listing instead of trusting
-name-cache-sensitive attribute APIs. Their new entries are also checked for name
-rewriting. Listings are never cached, including on filesystems with coarse mtimes.
-
-On Linux, ext4/f2fs/bcachefs/overlayfs/tmpfs directory flags are inspected with
-`FS_IOC_GETFLAGS`. Directories with `FS_CASEFOLD_FL` use listing verification;
-others skip spelling verification. Flags are cached per `(device, inode)` in a
-bounded 4,096-entry cache under the existing exclusion of external host namespace
-and flag changes. A full cache is cleared before adding a new entry. Workspace
-creation/removal invalidates directory entries to prevent stale flags on inode
-reuse. Changing casefold requires ownership and an empty directory and is not
-exposed by the workspace API. Inspecting flags requires read permission;
-unavailable inspection falls back to listing verification, which also requires
-read access. While its policy remains cached, a byte-exact directory can still
-be traversed with search-only access.
-
-XFS volume geometry (`XFS_IOC_FSGEOMETRY`) is queried once per device: ascii-ci
-volumes use listing verification and ordinary XFS skips it. Known byte-exact btrfs
-and ramfs also skip it. Unknown filesystems, and unavailable sensitivity queries,
-use listing verification rather than being refused. An existing kernel lookup
-without an exact listing match is `ENOENT` for reads or `EEXIST` for creation;
-missing creations use exclusive creation. Errors do not disclose the stored name.
-
-These checks do not make metadata checks and later mutations atomic against an
-external process renaming entries; the existing concurrent-host mutation
-limitations still apply. Directory names emitted by `readdir` are already verified
-spelling and are not looked up a second time solely to check their spelling.
-
-## Filesystems and Safety Layers
-
-Built-in filesystems use consistent names and constructor-driven configuration:
-
-- `InMemoryFileSystem`
-- `LocalFileSystem`
-- `OverlayFileSystem`
-- `MountedFileSystem`
-- `SandboxFileSystem`
-- `SecurityScopedFileSystem`
-- `AuthorizedFileSystem`
-- `LimitedFileSystem`
-
-Compose wrappers explicitly:
+| Type | Role |
+| --- | --- |
+| `InMemoryFileSystem()` | Default backend for tests, previews and scratch trees. |
+| `LocalFileSystem(root:)` | A host directory, confined to its root. Reports external changes on macOS and Linux. |
+| `SandboxFileSystem(root:)` | A local filesystem at `.documents`, `.caches`, `.temporary`, `.appGroup(_:)` or `.url(_:)`. |
+| `SecurityScopedFileSystem(url:mode:)` | A security-scoped URL, read-only or read-write, with bookmarks kept in a `BookmarkStore`. |
+| `OverlayFileSystem(over:)` | Copy-on-write: reads pass through, writes stay in memory until `discardChanges()`. |
+| `MountedFileSystem(base:mounts:)` | Several filesystems as one tree. A move between mounts copies, then removes. |
+| `AuthorizedFileSystem(base:authorizer:)` | Checks every operation against a policy. |
+| `LimitedFileSystem(base:limits:)` | Rejects mutations that would exceed byte, entry or per-write limits. |
 
 ```swift
 let local = try LocalFileSystem(root: projectURL)
@@ -468,130 +292,147 @@ let limited = LimitedFileSystem(
     )
 )
 
-let rules = RuleBasedPermissionAuthorizer(
-    rules: [
-        PermissionRule(
-            operations: [.readFile, .listDirectory, .stat],
-            pathPrefix: "/Sources",
-            effect: .allow
-        )
-    ]
-)
+let reads: Set<PermissionOperation> = [
+    .stat, .exists, .listDirectory, .readFile, .readSymlink, .resolveRealPath, .glob,
+]
+let writes: Set<PermissionOperation> = [
+    .writeFile, .createDirectory, .remove, .move, .copy,
+    .createSymlink, .createHardLink, .setPermissions,
+]
+let authorizer = RuleBasedPermissionAuthorizer(rules: [
+    PermissionRule(operations: reads, pathPrefix: "/", effect: .allow),
+    PermissionRule(operations: writes, pathPrefix: "/Sources", effect: .allow),
+])
 
-let authorized = AuthorizedFileSystem(base: limited, authorizer: rules)
-let workspace = Workspace(fileSystem: authorized)
+let workspace = Workspace(
+    fileSystem: AuthorizedFileSystem(base: limited, authorizer: authorizer)
+)
 ```
 
-`LimitedFileSystem` serializes its own preflight and mutation with a FIFO gate. Quotas
-count logical regular-file bytes per visible path (including hard-link aliases), and
-all non-root entries, including dangling symlinks. Appends charge aliases by identity
-and link count; unknown aliases are charged conservatively. Already over-quota trees
-may shrink or preserve usage, but cannot increase an exceeded quota. Accounting reads
-metadata only and resolves symlinks in the backend's namespace, including mounts.
+Put `LimitedFileSystem` directly over the storage backend and `AuthorizedFileSystem` outside it. Over an `AuthorizedFileSystem` base, `LimitedFileSystem` can't reuse its accounting and walks the whole tree before every mutation.
 
-When the base declares complete change-signal coverage, Limited caches totals, compact
-per-path accounting metadata (kind, size, identity and link count), children,
-and alias indexes. Successful mutations refresh their affected metadata under the gate;
-a failed or uncertain mutation discards the cache. File and directory identities are
-needed to rule out unrecognized aliases through compositions (even for single-link
-files); missing identities make the mutation uncertain and force a fresh walk on the
-next preflight. External `.entry`, `.shallow`, and
-`.recursive` signals invalidate those scopes for lazy reconciliation on the next
-preflight. Removed/replaced directories invalidate their former descendants; hard-link
-aliases are refreshed together. `.rescan` discards all cached accounting. A failed or
-ended subscription falls back to a full metadata walk on every preflight, unless an
-exact mutation generation is available. Coverage is checked at every preflight; Mounted
-declares complete coverage only when its base and every mount do, including later mounts.
-Incomplete or undeclared coverage uses full walks (or the exact generation capability).
-Each Limited over Local registers its own recursive inotify watcher on Linux; large trees
-can exhaust the watch limit (ENOSPC), at which point accounting safely falls back to walks.
-`LimitedFileSystem(base:limits:accountingCacheEntryLimit:)` caps retained accounting entries,
-including the root. Pass `nil` (the default) for 250,000 entries (25,000 on iOS/watchOS),
-or an explicit entry count to tune memory retention. `0` (or a negative value) disables
-retention, so every preflight walks the tree. Above the cap, accounting is discarded
-after the operation. This bounds retained entries, not peak memory during a walk.
+### Authorization
 
-**Consistency:** a quota decision incorporates signals processed by this Limited actor
-before its projection finishes. Signals buffered in the backend or stream, or queued
-for actor processing, may arrive after a decision, so external writes can temporarily make accounting stale and
-can exceed quotas. `try await limited.revalidate()` forces a fresh metadata walk under
-the gate without waiting for signals. With external writers quiescent, it closes the
-notification-delivery gap. Neither revalidation nor the gate makes preflight atomic
-with writers using another wrapper or the base directly. The package-level `changeSignalsAreComplete`
-capability is an explicit guarantee of coverage for all visible children; sources that
-only provide a partial stream cannot enable notification-based accounting reuse.
+Each call becomes a `PermissionRequest`. A path through a symbolic link is checked a second time at its resolved target, and both checks must pass. Denials throw `WorkspaceError.accessDenied`.
 
-Without complete change signals, each preflight walks the whole tree. The package's optional
-exact mutation-generation capability lets InMemoryFileSystem reuse accounting when
-unchanged; direct mutations, reset, and partial failures change its generation and
-force a new walk. Generation changes during a scan or this wrapper's mutation prevent
-reuse of that potentially inconsistent snapshot.
-Accounting retains strict bulk-walk semantics: a listed entry vanishing before metadata
-lookup fails the preflight and invalidates partial accounting; the next preflight scans anew.
+`RuleBasedPermissionAuthorizer` uses the first rule that names the operation and matches the paths, falling back to `defaultEffect`, which denies by default. Prefixes match whole components, so `/Src` doesn't match `/Sources`. An allow rule must cover every path in a request, including both ends of a copy or move; a deny rule applies if any path matches. Workspace edits also make `stat`, `exists`, `resolveRealPath`, `listDirectory` and `glob` calls, so allow those wherever edits are allowed.
 
-Authorization supports one-shot, duration-limited, and session approvals plus bounded audit records. Prefix rules use path-component boundaries and require both paths to match for copy and move.
+For interactive approval, `PermissionAuthorizer` wraps a handler. It can return `.allow` for one request, `.allowForSession`, `.allowFor(_:)` a `Duration`, or `.deny(message:)`. Both authorizers keep a bounded audit log.
 
-Local scans record symlinks without descending into them and retain per-entry authorization
-checks when using an authorized filesystem. Scans are live reads, not atomic snapshots:
-concurrent changes can affect the result or cause an error. Snapshot capture fails when a
-listed child disappears before it can be inspected or read. Directory-backed checkpoints omit
-listed children that vanish before their metadata lookup (ENOENT/ENOTDIR); failures after metadata,
-including content reads, still abort the checkpoint. Scoped no-follow opens reject
-substituted symlinks even when they point inside the root. Deep scans bound open directory
-handles by falling back to ordinary per-path operations; no handles are cached between calls.
-As with other local operations, host processes can relocate open directories or mutate
-hard-linked data.
+```swift
+let approvals = PermissionAuthorizer { request in
+    switch request.operation {
+    case .stat, .exists, .listDirectory, .readFile, .glob, .resolveRealPath:
+        return .allowForSession
+    default:
+        return .deny(message: "ask the user before \(request.operation)")
+    }
+}
+```
 
-## LLM Tool Adapters
+### Limits
 
-`WorkspaceToolAdapter` exposes dependency-free function definitions for read, glob, search, apply,
-diff, and checkpoint operations. Each definition contains an ordinary JSON Schema object, so an
-integration can translate it into its model provider's tool format without adding a provider SDK to
-Workspace:
+- `maxTotalBytes` caps the sum of regular-file sizes, counted per path, so each hard link counts.
+- `maxEntryCount` caps entries other than the root, including dangling symbolic links.
+- `maxWriteBytes` caps the data in one write or append.
+
+Violations throw `FileSystemLimitError`. A tree already over a limit can shrink but not grow. Accounting reads metadata only. Mutations through one `LimitedFileSystem` run one at a time.
+
+**Consistency rule.** A quota decision includes every change notification the `LimitedFileSystem` has processed before it finishes projecting the mutation. Notifications still in flight can arrive later, so external writes can leave accounting briefly stale and push usage past a limit. `try await limited.revalidate()` re-walks the metadata without waiting for notifications, which closes that gap while external writers are quiet. Neither makes the check atomic with writes that bypass this instance.
+
+Accounting is reused between mutations over `InMemoryFileSystem`, and over `LocalFileSystem` on macOS and Linux, including through `SandboxFileSystem`, `SecurityScopedFileSystem` or a `MountedFileSystem` whose parts all qualify. Otherwise each mutation walks the tree first. On Linux each instance holds its own recursive inotify watch and falls back to walks if the system's watch limit runs out.
+
+Retained accounting is capped by `accountingCacheEntryLimit` on `LimitedFileSystem.init`. The default (`nil`) keeps up to 250,000 entries, or 25,000 on iOS and watchOS; `0` keeps nothing between mutations, so every mutation walks the tree. Larger trees still work, they just walk the tree before each mutation.
+
+## LLM tool adapter
 
 ```swift
 let adapter = WorkspaceToolAdapter(workspace: workspace)
-let definitions = WorkspaceToolAdapter.definitions
+let definitions = WorkspaceToolAdapter.definitions  // name, description, inputSchema
 
-let resultJSON = try await adapter.call(
-    name: "workspace_diff",
-    arguments: Data(#"{"from_checkpoint_id":"...","unified_patch":true}"#.utf8)
+let output: Data = try await adapter.call(
+    name: "workspace_read",
+    arguments: Data(#"{"path":"/README.md"}"#.utf8)
 )
 ```
 
-All mutating adapter calls use the Workspace edit/checkpoint APIs, so they retain the same history,
-event, transaction, authorization, and limit behavior as direct callers. The diff result carries the
-structured `ChangeSet` and can optionally include unified-patch text for prompt or CLI interop.
+Each definition's `inputSchema` is a `JSONValue` holding a plain JSON Schema object, ready to translate into a provider's tool format. Arguments are snake_case JSON; results are camelCase JSON. Mutating calls go through the Workspace, so history, events, authorization and limits apply.
 
-Tool arguments use snake_case and results use camelCase. Output budgets for glob, diff, and apply
-count **encoded JSON bytes**, including escaping and metadata: `max_bytes` defaults to 65,536,
-has a minimum of 1,024, and clamps to 262,144. Diff and apply also accept `max_file_bytes` for each
-file's encoded text diff plus optional patch; it defaults to 8,192, clamps to 65,536, and accepts 0
-to omit all text detail. Returned patch sections are complete; text that cannot fit is omitted
-with `textDiffOmissions.reason = "outputBudgetExceeded"`.
-
-| Tool | Additional arguments | Result |
+| Tool | Purpose | Paging and size arguments |
 | --- | --- | --- |
-| `workspace_glob` | `match_offset` (default 0), `max_matches` (default 1,000, cap 10,000), `max_bytes` | `{matches, totalMatches, matchOffset, nextMatchOffset?, omittedMatches, truncated}` |
-| `workspace_diff` | `change_offset` (default 0), `paths` (optional exact paths), `max_bytes`, `max_file_bytes` | `{changes, statistics, totalChanges, changeOffset, nextChangeOffset?, omittedFiles, omittedTextDiffs, truncated, unifiedPatch?}` |
-| `workspace_apply` | `max_bytes`, `max_file_bytes` | `{changes, failures, statistics, totalChanges, changeOffset: 0, omittedFiles, omittedTextDiffs, truncated}` |
+| `workspace_read` | Read UTF-8 text, current or from a checkpoint | `offset`; `max_bytes` of content (default 65,536, minimum 4, clamped to 262,144). Continue at `nextOffset`. |
+| `workspace_glob` | List matching paths | `match_offset`; `max_matches` (default 1,000, clamped to 10,000); `max_bytes`. Continue at `nextMatchOffset`. |
+| `workspace_search` | Literal or regex search | `match_offset`; `context_lines` (clamped to 100); `max_bytes`. Continue at `nextMatchOffset`. |
+| `workspace_apply` | Apply `write_text`, `append_text`, `create_directory`, `remove`, `copy` and `move` edits atomically | `max_bytes`; `max_file_bytes` |
+| `workspace_diff` | Compare checkpoints or the current state, optionally with a unified patch | `change_offset`; `paths`; `max_text_bytes`; `max_bytes`; `max_file_bytes`. Continue at `nextChangeOffset`. |
+| `workspace_checkpoint` | Create a checkpoint | None |
 
-Continue glob/diff at the returned offset, keeping the same pattern/paths and revisions. Pin both
-diff revisions to checkpoints for stable paging while the workspace changes. Narrow glob patterns
-or diff `paths`, or raise `max_file_bytes`, to retrieve detail; use `workspace_read` for full text.
-`max_text_bytes` skips text diffing for files larger than its source-byte limit (default and cap
-1,000,000 bytes per input file); `max_file_bytes` bounds encoded diff bytes per file in the result.
-The nested `changes` contains only returned detail; top-level `statistics` describes all selected
-changes using available computed text diffs. `omittedFiles` counts change entries at/after the
-requested offset that are absent from this response, including entries on subsequent pages.
-`omittedTextDiffs` counts returned entries whose computed diff was removed by the output budget.
-Glob skips a single path too large for a page and increments `omittedMatches`; diff similarly
-counts oversized path metadata in `omittedFiles`. Offsets still advance past those entries.
+- `max_bytes` bounds the encoded JSON result of glob, search, diff and apply, including escaping: default 65,536, minimum 1,024, clamped to 262,144.
+- `max_file_bytes` bounds each file's diff and patch text: default 8,192, clamped to 65,536; 0 omits all text. Omitted text has reason `outputBudgetExceeded` and is counted in `omittedTextDiffs`. `statistics` always describe the full change.
+- `max_text_bytes` (default and maximum 1,000,000) skips text diffs for larger files.
 
-Apply always completes the full atomic edit operation before bounding its response. Do not repeat
-an apply call to retrieve omitted detail. Use `workspace_read` to inspect omitted files, or create
-a checkpoint before applying and diff from it. If response encoding fails after commit, apply
-returns a minimal success envelope with empty `changes`, full statistics, and `truncated: true`.
+`workspace_apply` finishes the whole edit before trimming its response, so never repeat an apply to recover detail; read the files, or diff from a checkpoint taken first. Diff between checkpoints for stable paging while the tree changes.
+
+`call` throws `WorkspaceToolError` for an unknown tool or invalid arguments. Workspace and filesystem errors, such as a missing file or a denial, propagate unchanged. Turn both into tool-error results for the model.
+
+## Guarantees and limits
+
+### Atomicity and the operation gate
+
+An atomic `apply` snapshots every path an edit touches, including parents it creates, and restores them if an edit or the history write fails. If the restore also fails, it throws `WorkspaceRollbackError` carrying both errors. Commits and `restore(to:)` recover the same way. Recovery doesn't cover hard links to an edited file outside those paths, permission changes on symbolic links themselves, or a crash: recovery runs in the process.
+
+Operations that mutate or capture the tree run one at a time per Workspace instance, in arrival order. This operation gate covers `apply` and its conveniences, `preview`, `createCheckpoint`, `restore`, `beginTransaction`, commits, `compact`, `history()` and diffs against `.current`. In practice:
+
+- An edit never interleaves with another edit, checkpoint or commit on the same instance.
+- A slow operation, such as the first checkpoint of a large tree, delays everything queued behind it.
+- Reads of the current state aren't queued and can see an edit partly applied.
+- Other instances, writes through `workspace.fileSystem` and other processes aren't serialized. A failed atomic apply restores its paths over any concurrent change to them.
+
+### Path identity
+
+A `WorkspacePath` is absolute and normalized: `.` is dropped, and `..` removes a component but can't climb above the root. Its identity is the exact UTF-8 bytes of its components. Equality, hashing, ordering, permission rules and quotas don't fold case or Unicode normalization, so precomposed and decomposed `/café` are different paths.
+
+`LocalFileSystem` requires the spelling you use to match the stored name byte for byte, even on volumes that treat other spellings as the same file. On case-insensitive APFS with `/Readme.md` stored:
+
+- reading `/readme.md` fails with `ENOENT`;
+- writing or creating `/readme.md`, or renaming `/Readme.md` to `/README.md`, fails with `EEXIST` (rename through a temporary name instead);
+- removing `/readme.md` does nothing.
+
+HFS+ and macOS's exFAT driver store names in decomposed form (NFD). Creating a precomposed (NFC) name that the volume would decompose fails with `EILSEQ`, and the entry is removed. Use the spelling a directory listing reports. Linux case-folding directories and case-insensitive XFS follow the same alias rules. Listing a directory that contains a name that isn't valid UTF-8 throws `WorkspaceError.invalidPath`.
+
+### Safety layer, not a sandbox
+
+What the wrappers do:
+
+- `LocalFileSystem` holds a descriptor for its root, opens each component without following links, and resolves links itself, up to 40 hops. An access that would leave the root fails with `WorkspaceError.invalidPath`. A link pointing outside can exist and be read with `readSymlink`, but not followed.
+- `AuthorizedFileSystem` checks the path you named and the path it resolves to.
+- `LimitedFileSystem` rejects a mutation before it runs.
+
+What they don't do:
+
+- Confine your process. Code in it, and anything it launches, can reach any file the user can.
+- Stop other processes. A host process can move an open directory out of the root, change a file through a hard link from outside, or rename entries between an authorization check and the operation.
+- Enforce quotas against writers that bypass the `LimitedFileSystem`.
+
+Run untrusted code in an OS sandbox or container, and use these wrappers inside it for policy and bookkeeping.
+
+### History store and durability
+
+`.memory` persistence keeps checkpoints, including file contents, and history in process memory until the process exits.
+
+`.directory(url)` keeps each workspace in `url/<workspaceID>/`, in a single on-disk format marked by `format.json`. An existing directory whose marker is missing or different fails with `WorkspaceError.storageCorrupted`, and the message names the history directory to delete. There's no migration; deleting it discards that workspace's checkpoints and history, not its files.
+
+Several instances and processes can share a store. Compaction only protects checkpoints in use within its own process, so coordinate compaction across processes.
+
+A checkpoint becomes visible only after its files and directories are synced with `fsync`. On Apple platforms the snapshot root and checkpoint record also use `F_FULLFSYNC` to flush the drive cache; volumes that don't support it keep the `fsync` guarantee. A published checkpoint survives a crash or power loss on storage that honors these requests, and a failed capture never publishes a checkpoint with missing content. Mutation history is appended without `fsync`, so its latest records can be lost on power failure.
+
+### Change detection
+
+With the default `checkpointCapture: .trustMetadata`, a file whose size, modification time and identity (when known) match the previous capture isn't re-read. This applies to directory-store checkpoints, transactions, and checkpoint-to-current diffs and restores.
+
+Reuse also requires the modification time to be more than two seconds older than the start of the previous capture, because coarse timestamps can hide a second write in the same tick. Files modified inside that window, and files without a modification time, are re-read. The cost is an extra read of recently written files, not a correctness risk. `InMemoryFileSystem` has exact timestamps and skips the window.
+
+The check can't see a write that keeps the size and restores an old modification time, as some sync and archive tools do, or clock skew on a network filesystem. Use `.verifyContents` to read every file instead.
 
 ## Testing
 
@@ -600,61 +441,16 @@ swift build
 swift test --disable-xctest --enable-swift-testing
 ```
 
-CI runs Swift 6.2 tests on macOS and Linux.
+CI runs the tests with Swift 6.2 on macOS and Linux.
 
 ## Benchmarks
 
-The separate executable does not run in `swift test`. Run in release mode:
+`WorkspaceBenchmarks` is a separate executable for macOS and Linux, not part of `swift test`. Run it in release mode and compare later runs against a saved report:
 
 ```sh
-swift run -c release WorkspaceBenchmarks --preset small --json Benchmarks/Results/small.json
+swift run -c release WorkspaceBenchmarks --preset small --json Benchmarks/Results/before.json
 swift run -c release WorkspaceBenchmarks --preset small --json Benchmarks/Results/after.json \
-  --compare Benchmarks/Results/small.json
-swift run -c release WorkspaceBenchmarks --preset medium --filter transaction,limitedWrite
+  --compare Benchmarks/Results/before.json
 ```
 
-Defaults: one warmup, five measured samples, a fresh child per scenario. Fast operations
-use inner repetitions with per-operation times/counts; writes use independent prepared
-stores (each `write1001` is exactly the 1,001st mutation). Fixtures have 1k/10k/100k
-regular files: small ~20 MiB, medium ~200 MiB, large ~98 MiB with deep dependency nesting.
-Allow roughly **2–5 minutes for small**, **10–30 minutes for medium**, and **well over
-an hour for large** at defaults, depending on filesystem and watcher availability.
-Fixture generation is excluded. `--fixture-dir PATH` generates/validates/reuses a
-preserved fixture; otherwise temporary trees/stores are removed on completion or SIGINT.
-`Benchmarks/Results/` is ignored. Use `--help` for filters, iteration counts and
-deadlines (30 minutes per child by default).
-
-| Scenario | What's timed | Setup excluded | Counter blind spots |
-| --- | --- | --- | --- |
-| `writeText`, `apply50`, `limitedWrite` | One recorded write, 50 edits, quota-limited write with warm accounting | No-op preparation, file reset, Limited accounting priming | Checkpoint store; Limited metadata traversal is visible |
-| `transaction` / `transactionFirst` | Begin, one draft write, commit | Preparation; initial begin/discard and baseline checkpoint for steady-state `transaction` only | Draft filesystem, checkpoint store |
-| `preview` | One edit preview | Preparation | Draft filesystem |
-| `checkpointFirst` / `checkpointIncremental` | First capture / capture after one change | Preparation; baseline and change for incremental | Checkpoint store |
-| `diff`, `restore` | Checkpoint-to-current diff / restore after one change | Preparation, baseline, change | Checkpoint store |
-| `readCheckpoint` / `readCheckpointWarm`, `readCurrent` | Cold / primed checkpoint index read; direct current read | Baseline; first read for warm variant | Checkpoint store |
-| `search`, `glob` | Full absent-literal search / `**/*` glob | Preparation | Glob internals; returned `globMatches` is visible |
-| `history1000` / `history1000Cached` | Fresh directory Workspace log load/decode / cached memory history | Seed 1,000 mutations; new reader for cold variant | Checkpoint store |
-| `write1001` | Exactly the 1,001st recorded directory write | Preparation and 1,000 mutations | Checkpoint store |
-| `eventsInitial`, `eventsExternal` | Enable observation / direct external write until its event arrives | Preparation; initial observation and drain for external | External write bypasses counter; recaptures are visible |
-
-The table shows median/p90 wall time, backend read bytes/calls, stat/list calls, entries,
-glob matches, logical store bytes/files written, setup RSS high-water, operation increase
-in that high-water, and held RSS delta. Held RSS is sampled with the result live. The
-first-run column is the live-footprint figure: after the first run, allocator reuse hides
-most of a result's memory, so the measured-sample summary (which excludes warmups) can be
-near zero or slightly negative. Zero high-water growth can likewise mean allocator reuse.
-Percentiles use linear interpolation between samples. Setup high-water includes preceding
-samples in the same child; JSON retains each sample's values and process peak.
-Darwin/Linux RSS units are normalized to bytes. Store write counts include newly created
-empty lock files.
-
-Counters observe the `FileSystem` boundary, not syscalls. Store writes are estimated
-outside timing from directory metadata: append growth or final size of new/replaced
-files; transient/deleted files, repeated overwrites and OS write amplification are
-invisible. Compare identical presets for regressions: timing ratios and exact backend
-count deltas are printed. Watcher errors produce a nonzero exit while retaining successful
-results; run outside a restrictive macOS sandbox to measure FSEvents.
-
-Scoped walks report `walk` and `walkEntry` counters; their content callbacks still count as
-`readFile`, `readRange`, or `readSymlink`. `directoryEntries` includes visited descendants.
-These are logical visits, not POSIX syscall counts; backend-internal glob walks remain opaque.
+Compare the same preset on the same machine. `--compare` prints timing ratios and exact I/O count differences, `--filter` selects scenarios, and `--help` lists the options. `Benchmarks/Results/` is git-ignored. See [Benchmarks/README.md](Benchmarks/README.md) for presets, scenarios and counters.
