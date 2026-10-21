@@ -2689,27 +2689,19 @@ actor FileCheckpointStore: CheckpointStore {
             guard error == EWOULDBLOCK else {
                 throw LockFileError(message: "could not acquire lock at \(path)")
             }
-            try await Self.waitForOSLock(fd, operation: operation, path: path)
-            break
+            // Dispatch's global workers are also finite (and shared with Swift on
+            // Linux). Blocking flock there can starve the async holder just as
+            // blocking this actor would. Suspend without occupying any worker.
+            // Deliberately ignore task cancellation: callers may already have
+            // changed the filesystem and must finish persisting that mutation.
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(10)) {
+                    continuation.resume()
+                }
+            }
         }
 #endif
         return try await body()
     }
 
-#if canImport(Darwin) || canImport(Glibc)
-    // flock may wait for another store or process. Never park a cooperative executor thread.
-    private nonisolated static func waitForOSLock(_ fd: Int32, operation: Int32, path: String) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            DispatchQueue.global().async {
-                while flock(fd, operation) != 0 {
-                    if errno != EINTR {
-                        continuation.resume(throwing: LockFileError(message: "could not acquire lock at \(path)"))
-                        return
-                    }
-                }
-                continuation.resume()
-            }
-        }
-    }
-#endif
 }

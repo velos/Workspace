@@ -647,6 +647,8 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
             records = try names(in: directory, consumingOffset: !consumedOffset).map { ($0, nil) }
         }
         return try (records ?? []).compactMap { name, suppliedInfo in
+            // In-flight atomic writes are this process's own; they surface only as their destination.
+            if LocalAtomicTemporaryName.matches(name) { return nil }
             let child = try Entry(parent: directory, storedName: name, path: path.appending(name))
             let info: LocalStat
             do { info = try suppliedInfo ?? self.metadata(child) }
@@ -764,7 +766,7 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
     /// See ``FileSystem/listDirectory(path:)``.
     public func listDirectory(path: WorkspacePath) async throws -> [DirectoryEntry] {
         let directory = try openEntry(resolve(path, followFinal: true), flags: O_RDONLY | O_DIRECTORY)
-        return try names(in: directory).map { name in
+        return try names(in: directory).filter { !LocalAtomicTemporaryName.matches($0) }.map { name in
             let child = path.appending(name)
             return DirectoryEntry(
                 name: name, info: fileInfo(try metadata(Entry(parent: directory, storedName: name, path: child)), path: child)
@@ -1016,7 +1018,8 @@ public final class LocalFileSystem: FileSystem, TraversingFileSystem, PreviewSem
             try check(mkdirat(destination.parent.value, destination.name, 0o755))
             try validateCreated(destination, directory: true)
             let output = try openEntry(destination, flags: O_RDONLY | O_DIRECTORY)
-            for name in try names(in: input) {
+            // Another write's in-flight temporary is not part of the source tree.
+            for name in try names(in: input) where !LocalAtomicTemporaryName.matches(name) {
                 try copyEntry(
                     Entry(parent: input, storedName: name, path: source.path.appending(name)),
                     to: Entry(parent: output, name: name, path: destination.path.appending(name)), recursive: true)

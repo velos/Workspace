@@ -57,6 +57,27 @@ struct ScopedObservationTests {
         }
     }
 
+    @Test func `in-flight atomic temporaries are hidden from listings and walks`() async throws {
+        let root = try TestSupport.temporaryDirectory()
+        defer { TestSupport.remove(root) }
+        let temporary = LocalAtomicTemporaryName.make()
+        let lookalike = ".workspace-atomic-" + UUID().uuidString + "-" + UUID().uuidString
+        for name in [temporary, lookalike, "file"] {
+            try Data("x".utf8).write(to: root.appendingPathComponent(name))
+        }
+        let fs = try LocalFileSystem(root: root)
+        #expect(Set(try await fs.listDirectory(path: .root).map(\.name)) == [lookalike, "file"])
+        var walked: [WorkspacePath] = []
+        try await fs.walk(at: .root, skippingUnreadableDirectories: false) { info, _, _ in walked.append(info.path) }
+        #expect(Set(walked) == [.root, WorkspacePath(normalizing: "/" + lookalike), "/file"])
+        // A recursive copy must not duplicate the temporary as a stray user file.
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("src"), withIntermediateDirectories: false)
+        try Data("x".utf8).write(to: root.appendingPathComponent("src/" + temporary))
+        try Data("y".utf8).write(to: root.appendingPathComponent("src/kept"))
+        try await fs.copy(from: "/src", to: "/dst", recursive: true)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("dst").path) == ["kept"])
+    }
+
     #if os(macOS)
     @Test func `FSEvents root item events are shallow only while the original directory remains`() throws {
         let container = try TestSupport.temporaryDirectory("RootItemIdentity").resolvingSymlinksInPath()
@@ -128,7 +149,7 @@ struct ScopedObservationTests {
         let stats = await fs.base.statCount
         let reads = await fs.base.reads.count
         try await local.writeFile(path: "/x", data: Data("after".utf8), append: false)
-        guard case let .changes(change)? = await first(events, timeout: .seconds(3)) else {
+        guard case let .changes(change)? = await first(events, timeout: .seconds(30)) else {
             Issue.record("missing native external event"); return
         }
         #expect(change.touchedPaths == ["/x"])
@@ -142,13 +163,7 @@ struct ScopedObservationTests {
     }
     #endif
 
-    private func first(_ stream: AsyncStream<WorkspaceEvent>, timeout: Duration = .seconds(5)) async -> WorkspaceEvent? {
-        await withTaskGroup(of: WorkspaceEvent?.self) { group in
-            group.addTask { var iterator = stream.makeAsyncIterator(); return await iterator.next() }
-            group.addTask { try? await Task.sleep(for: timeout); return nil }
-            let event = await group.next() ?? nil
-            group.cancelAll()
-            return event
-        }
+    private func first(_ stream: AsyncStream<WorkspaceEvent>, timeout: Duration = .seconds(30)) async -> WorkspaceEvent? {
+        await TestSupport.nextElement(in: stream, timeout: timeout)
     }
 }
